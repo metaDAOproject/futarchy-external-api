@@ -1,0 +1,11 @@
+node_modules/
+.git/
+.gitignore
+.env*
+*.md
+.DS_Store
+.idea/
+.vscode/
+tests/
+scripts/
+dist/

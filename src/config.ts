@@ -1,14 +1,10 @@
 import { PublicKey } from '@solana/web3.js';
-import dotenv from 'dotenv';
-
-dotenv.config();
-
 export const config = {
   // Development mode - disables external Dune API calls
   devMode: process.env.DEV_MODE === 'true',
   solana: {
-    rpcUrl: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
-    wsUrl: process.env.SOLANA_WS_URL || 'wss://api.mainnet-beta.solana.com',
+    rpcUrl: process.env.RPCPOOL_RPC_URL || process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+    wsUrl: process.env.RPCPOOL_WS_URL || process.env.SOLANA_WS_URL || 'wss://api.mainnet-beta.solana.com',
   },
   server: {
     port: parseInt(process.env.PORT || '3000'),
@@ -50,7 +46,7 @@ export const config = {
   },
   database: {
     // PostgreSQL connection - can use either connection string or individual params
-    connectionString: process.env.DATABASE_URL || '',
+    connectionString: process.env.COINGECKO_PG_URL || process.env.DATABASE_URL || '',
     host: process.env.DATABASE_HOST || '',
     port: parseInt(process.env.DATABASE_PORT || '5432'),
     database: process.env.DATABASE_NAME || 'futarchy_volumes',
