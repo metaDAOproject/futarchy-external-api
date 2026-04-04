@@ -3,6 +3,7 @@ import type { CoinGeckoTicker } from '../types/coingecko.js';
 import type { ServiceGetters } from './types.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
+import { sendAlert } from '../utils/alerts.js';
 
 export function createCoinGeckoRouter(services: ServiceGetters): Router {
   const router = Router();
@@ -90,6 +91,10 @@ export function createCoinGeckoRouter(services: ServiceGetters): Router {
       
       if (duneMetricsMap.size === 0) {
         logger.warn('No volume metrics available', { requestId: req.requestId });
+        sendAlert(
+          'No volume metrics available — all sources (10-min DB, hourly DB, Dune cache) returned empty',
+          { cooldownKey: 'no-volume-data', cooldownMs: 10 * 60 * 1000 }
+        );
       } else {
         logger.debug('Volume source selected', { volumeSource, daoCount: duneMetricsMap.size, requestId: req.requestId });
       }

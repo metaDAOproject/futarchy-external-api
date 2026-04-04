@@ -44,6 +44,10 @@ export const config = {
     // ACTIVE: Meteora daily volumes query - tracks Meteora pool fees per owner (service currently disabled)
     meteoraVolumeQueryId: process.env.DUNE_METEORA_VOLUME_QUERY_ID ? parseInt(process.env.DUNE_METEORA_VOLUME_QUERY_ID) : undefined,
   },
+  alerts: {
+    webhookUrl: process.env.ALERT_WEBHOOK_URL || 'https://telegram-webhook-relay.themetadao-org.workers.dev',
+    webhookSecret: process.env.ALERT_WEBHOOK_SECRET || '',
+  },
   database: {
     // PostgreSQL connection - can use either connection string or individual params
     connectionString: process.env.COINGECKO_PG_URL || process.env.DATABASE_URL || '',

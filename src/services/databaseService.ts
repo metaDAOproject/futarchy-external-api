@@ -1,6 +1,7 @@
 import pg from 'pg';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { sendAlert } from '../utils/alerts.js';
 
 const { Pool } = pg;
 
@@ -155,23 +156,44 @@ export interface TokenVolumeAggregate {
 export class DatabaseService {
   public pool: pg.Pool | null = null;
   private isConnected: boolean = false;
+  private healthCheckInterval: NodeJS.Timeout | null = null;
+  private consecutiveFailures: number = 0;
+  private static readonly HEALTH_CHECK_INTERVAL_MS = 30_000;
+  private static readonly MAX_FAILURES_BEFORE_RECONNECT = 3;
 
   constructor() {
     // Only initialize if database config is provided
     if (config.database.connectionString || config.database.host) {
-      this.pool = new Pool({
-        connectionString: config.database.connectionString,
-        host: config.database.host,
-        port: config.database.port,
-        database: config.database.database,
-        user: config.database.user,
-        password: config.database.password,
-        ssl: config.database.ssl ? { rejectUnauthorized: false } : false,
-        max: 10, // Max connections in pool
-        idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 10000,
-      });
+      this.createPool();
     }
+  }
+
+  private getPoolConfig(): pg.PoolConfig {
+    return {
+      connectionString: config.database.connectionString,
+      host: config.database.host,
+      port: config.database.port,
+      database: config.database.database,
+      user: config.database.user,
+      password: config.database.password,
+      ssl: config.database.ssl ? { rejectUnauthorized: false } : false,
+      max: 10,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+    };
+  }
+
+  private createPool(): void {
+    this.pool = new Pool(this.getPoolConfig());
+
+    this.pool.on('error', (err: Error) => {
+      logger.error('[Database] Pool error — marking connection unhealthy', err);
+      this.isConnected = false;
+      sendAlert(
+        `DB Pool Error: ${err.message}`,
+        { cooldownKey: 'db-pool-error', cooldownMs: 5 * 60 * 1000 }
+      );
+    });
   }
 
   /**
@@ -196,11 +218,75 @@ export class DatabaseService {
       await this.createAggregationFunctions();
       
       this.isConnected = true;
+      this.consecutiveFailures = 0;
+      this.startHealthCheck();
       return true;
     } catch (error: any) {
       logger.error('[Database] Failed to connect:', error);
       this.isConnected = false;
       return false;
+    }
+  }
+
+  /**
+   * Periodic health check that pings the DB and manages connection state.
+   * If consecutive failures exceed threshold, destroys and recreates the pool.
+   */
+  private startHealthCheck(): void {
+    if (this.healthCheckInterval) return;
+
+    this.healthCheckInterval = setInterval(async () => {
+      try {
+        await this.pool!.query('SELECT 1');
+        if (!this.isConnected) {
+          logger.info('[Database] Connection recovered');
+        }
+        this.isConnected = true;
+        this.consecutiveFailures = 0;
+      } catch (error: any) {
+        this.consecutiveFailures++;
+        this.isConnected = false;
+        logger.error(`[Database] Health check failed (${this.consecutiveFailures}/${DatabaseService.MAX_FAILURES_BEFORE_RECONNECT})`, error);
+
+        sendAlert(
+          `DB Health Check Failed (${this.consecutiveFailures}/${DatabaseService.MAX_FAILURES_BEFORE_RECONNECT}): ${error.message || error}`,
+          { cooldownKey: 'db-health-check', cooldownMs: 5 * 60 * 1000 }
+        );
+
+        if (this.consecutiveFailures >= DatabaseService.MAX_FAILURES_BEFORE_RECONNECT) {
+          logger.error('[Database] Max consecutive failures reached — recreating connection pool');
+          await this.reconnect();
+        }
+      }
+    }, DatabaseService.HEALTH_CHECK_INTERVAL_MS);
+  }
+
+  /**
+   * Destroy the current pool and create a fresh one.
+   */
+  private async reconnect(): Promise<void> {
+    try {
+      if (this.pool) {
+        await this.pool.end().catch(() => {}); // best-effort cleanup
+      }
+    } catch {
+      // ignore — pool may already be dead
+    }
+
+    this.createPool();
+
+    try {
+      await this.pool!.query('SELECT 1');
+      this.isConnected = true;
+      this.consecutiveFailures = 0;
+      logger.info('[Database] Reconnected successfully after pool recreation');
+      sendAlert('DB Reconnected — pool recreated, connection healthy', { cooldownKey: 'db-reconnected' });
+    } catch (error: any) {
+      logger.error('[Database] Reconnection attempt failed — will retry on next health check', error);
+      sendAlert(
+        `DB Reconnection Failed — pool recreated but still can't connect: ${error.message || error}`,
+        { cooldownKey: 'db-reconnect-failed', cooldownMs: 5 * 60 * 1000 }
+      );
     }
   }
 
@@ -3142,7 +3228,11 @@ export class DatabaseService {
    * Close the database connection
    */
   async close(): Promise<void> {
-    if (this.pool && this.isConnected) {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
+    if (this.pool) {
       this.isConnected = false;
       await this.pool.end();
       this.pool = null;
