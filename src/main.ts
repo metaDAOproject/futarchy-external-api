@@ -6,10 +6,12 @@ import { DuneCacheService } from './services/duneCacheService.js';
 import { SolanaService } from './services/solanaService.js';
 import { LaunchpadService } from './services/launchpadService.js';
 import { DatabaseService } from './services/databaseService.js';
+import { ExternalDatabaseService } from './services/externalDatabaseService.js';
 import { HourlyAggregationService } from './services/hourlyAggregationService.js';
 import { TenMinuteVolumeFetcherService } from './services/tenMinuteVolumeFetcherService.js';
 import { DailyAggregationService } from './services/dailyAggregationService.js';
 import { MeteoraVolumeFetcherService } from './services/meteoraVolumeFetcherService.js';
+import { V06ReconciliationService } from './services/v06ReconciliationService.js';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { scheduleWithoutPileup, scheduleDailyAtUTC, type ScheduledTask } from './utils/scheduling.js';
@@ -21,6 +23,7 @@ function initializeServices(): Services {
   const futarchyService = new FutarchyService();
   const priceService = new PriceService();
   const databaseService = new DatabaseService();
+  const externalDatabaseService = new ExternalDatabaseService();
   const solanaService = new SolanaService();
   const launchpadService = new LaunchpadService();
 
@@ -43,10 +46,13 @@ function initializeServices(): Services {
     meteoraVolumeFetcherService = new MeteoraVolumeFetcherService(duneService, databaseService);
   }
 
+  const v06ReconciliationService = new V06ReconciliationService(databaseService, externalDatabaseService);
+
   return {
     futarchyService,
     priceService,
     databaseService,
+    externalDatabaseService,
     duneService,
     duneCacheService,
     solanaService,
@@ -55,6 +61,7 @@ function initializeServices(): Services {
     tenMinuteVolumeFetcherService,
     dailyAggregationService,
     meteoraVolumeFetcherService,
+    v06ReconciliationService,
   };
 }
 
@@ -118,6 +125,16 @@ async function startServices(services: Services): Promise<void> {
       logger.error('Failed to start Meteora Volume Fetcher service', error);
     }
   }
+
+  // Initialize external indexer DB and start v0.6 reconciliation
+  if (services.externalDatabaseService) {
+    const extConnected = await services.externalDatabaseService.initialize();
+    if (extConnected && services.v06ReconciliationService) {
+      logger.info('Starting v0.6 Reconciliation service');
+      services.v06ReconciliationService.start();
+      logger.info('v0.6 Reconciliation service started');
+    }
+  }
 }
 
 async function stopServices(services: Services, scheduledTasks: ScheduledTask[]): Promise<void> {
@@ -127,6 +144,8 @@ async function stopServices(services: Services, scheduledTasks: ScheduledTask[])
   services.tenMinuteVolumeFetcherService?.stop();
   services.dailyAggregationService?.stop();
   services.meteoraVolumeFetcherService?.stop();
+  services.v06ReconciliationService?.stop();
+  await services.externalDatabaseService?.close();
   await services.databaseService.close();
 }
 

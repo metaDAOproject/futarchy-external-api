@@ -369,10 +369,8 @@ export class LaunchpadService {
 
     try {
       // Try v0.7 first, then v0.6
-      let pkg = await this.clientV07.priceBasedUnlock.getPerformancePackage(performancePackageAddress);
-      if (!pkg) {
-        pkg = await this.clientV06.priceBasedUnlock.getPerformancePackage(performancePackageAddress);
-      }
+      const pkgV07 = await this.clientV07.priceBasedUnlock.getPerformancePackage(performancePackageAddress);
+      const pkg = pkgV07 ?? await this.clientV06.priceBasedUnlock.getPerformancePackage(performancePackageAddress);
       if (!pkg) {
         return null;
       }

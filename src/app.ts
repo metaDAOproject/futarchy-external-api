@@ -14,15 +14,18 @@ import type { DuneCacheService } from './services/duneCacheService.js';
 import type { SolanaService } from './services/solanaService.js';
 import type { LaunchpadService } from './services/launchpadService.js';
 import type { DatabaseService } from './services/databaseService.js';
+import type { ExternalDatabaseService } from './services/externalDatabaseService.js';
 import type { HourlyAggregationService } from './services/hourlyAggregationService.js';
 import type { TenMinuteVolumeFetcherService } from './services/tenMinuteVolumeFetcherService.js';
 import type { DailyAggregationService } from './services/dailyAggregationService.js';
 import type { MeteoraVolumeFetcherService } from './services/meteoraVolumeFetcherService.js';
+import type { V06ReconciliationService } from './services/v06ReconciliationService.js';
 
 export interface Services {
   futarchyService: FutarchyService;
   priceService: PriceService;
   databaseService: DatabaseService;
+  externalDatabaseService?: ExternalDatabaseService;
   duneService?: DuneService | null;
   duneCacheService?: DuneCacheService | null;
   solanaService?: SolanaService;
@@ -31,6 +34,7 @@ export interface Services {
   tenMinuteVolumeFetcherService?: TenMinuteVolumeFetcherService | null;
   dailyAggregationService?: DailyAggregationService | null;
   meteoraVolumeFetcherService?: MeteoraVolumeFetcherService | null;
+  v06ReconciliationService?: V06ReconciliationService | null;
 }
 
 export interface AppOptions {

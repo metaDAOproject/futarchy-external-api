@@ -34,8 +34,8 @@ export const config = {
     .filter(addr => addr.length > 0)
     .map(addr => new PublicKey(addr)),
   fees: {
-    // Protocol fee rate (e.g., 0.0025 = 0.25%)
-    protocolFeeRate: parseFloat(process.env.PROTOCOL_FEE_RATE || '0.0025'),
+    // Protocol fee rate (0.005 = 0.5%)
+    protocolFeeRate: parseFloat(process.env.PROTOCOL_FEE_RATE || '0.005'),
   },
   dune: {
     apiKey: process.env.DUNE_API_KEY || '',
@@ -57,5 +57,10 @@ export const config = {
     user: process.env.DATABASE_USER || '',
     password: process.env.DATABASE_PASSWORD || '',
     ssl: process.env.DATABASE_SSL === 'true',
+  },
+  externalDatabase: {
+    // Read-only connection to the external indexer DB (v0_6_* tables)
+    connectionString: process.env.EXTERNAL_DATABASE_URL || '',
+    ssl: process.env.EXTERNAL_DATABASE_SSL === 'true',
   },
 };

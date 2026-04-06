@@ -3,6 +3,10 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { sendAlert } from '../utils/alerts.js';
 
+// Force pg to serialize Date parameters as ISO-8601 UTC strings so PostgreSQL
+// doesn't receive un-parseable local-timezone names like "GMT-0700".
+pg.defaults.parseInputDatesAsUTC = true;
+
 const { Pool } = pg;
 
 export interface DailyVolumeRecord {
@@ -504,9 +508,150 @@ export class DatabaseService {
 
     await this.pool.query(createTableSQL);
     logger.info('[Database] Tables created/verified');
+
+    // Create v0.6 OHLCV + fee volume tables
+    await this.createV06Tables();
     
     // Run migration to add new columns to existing tables
     await this.migrateTables();
+  }
+
+  /**
+   * Create v0.6 OHLCV and fee volume tables (app DB).
+   * Mirrors src/schema/v06-ohlcv-tables.sql.
+   */
+  private async createV06Tables(): Promise<void> {
+    if (!this.pool) return;
+
+    const sql = `
+      -- Spot OHLCV 1-minute
+      CREATE TABLE IF NOT EXISTS v06_spot_ohlcv_1m (
+        id SERIAL PRIMARY KEY,
+        token VARCHAR(64) NOT NULL,
+        bucket TIMESTAMPTZ NOT NULL,
+        open NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        high NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        low NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        close NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        average_price NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        base_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        target_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        buy_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        sell_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        trade_count INT NOT NULL DEFAULT 0,
+        is_complete BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(token, bucket)
+      );
+      CREATE INDEX IF NOT EXISTS idx_v06_spot_ohlcv_1m_token_bucket ON v06_spot_ohlcv_1m(token, bucket DESC);
+      CREATE INDEX IF NOT EXISTS idx_v06_spot_ohlcv_1m_bucket ON v06_spot_ohlcv_1m(bucket DESC);
+
+      -- Spot OHLCV daily
+      CREATE TABLE IF NOT EXISTS v06_spot_ohlcv_1d (
+        id SERIAL PRIMARY KEY,
+        token VARCHAR(64) NOT NULL,
+        bucket TIMESTAMPTZ NOT NULL,
+        open NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        high NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        low NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        close NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        average_price NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        base_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        target_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        buy_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        sell_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        trade_count INT NOT NULL DEFAULT 0,
+        is_complete BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(token, bucket)
+      );
+      CREATE INDEX IF NOT EXISTS idx_v06_spot_ohlcv_1d_token_bucket ON v06_spot_ohlcv_1d(token, bucket DESC);
+      CREATE INDEX IF NOT EXISTS idx_v06_spot_ohlcv_1d_bucket ON v06_spot_ohlcv_1d(bucket DESC);
+
+      -- Fee breakdown: spot daily
+      CREATE TABLE IF NOT EXISTS v06_fee_volume_daily_spot (
+        id SERIAL PRIMARY KEY,
+        token VARCHAR(64) NOT NULL,
+        date DATE NOT NULL,
+        buy_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        sell_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        base_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        target_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        trade_count INT NOT NULL DEFAULT 0,
+        usdc_fees NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        token_fees NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        token_fees_usdc NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        sell_volume_usdc NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(token, date)
+      );
+      CREATE INDEX IF NOT EXISTS idx_v06_fee_spot_token_date ON v06_fee_volume_daily_spot(token, date DESC);
+
+      -- Fee breakdown: conditional daily (nullable until reconciled)
+      CREATE TABLE IF NOT EXISTS v06_fee_volume_daily_conditional (
+        id SERIAL PRIMARY KEY,
+        token VARCHAR(64) NOT NULL,
+        date DATE NOT NULL,
+        buy_volume NUMERIC(40, 12),
+        sell_volume NUMERIC(40, 12),
+        base_volume NUMERIC(40, 12),
+        target_volume NUMERIC(40, 12),
+        trade_count INT,
+        usdc_fees NUMERIC(40, 12),
+        token_fees NUMERIC(40, 12),
+        token_fees_usdc NUMERIC(40, 12),
+        sell_volume_usdc NUMERIC(40, 12),
+        conditional_reconciled BOOLEAN NOT NULL DEFAULT false,
+        pending_open_proposals INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(token, date)
+      );
+      CREATE INDEX IF NOT EXISTS idx_v06_fee_cond_token_date ON v06_fee_volume_daily_conditional(token, date DESC);
+
+      -- Fee aggregate (accountant primary)
+      CREATE TABLE IF NOT EXISTS v06_fee_volume_daily_aggregate (
+        id SERIAL PRIMARY KEY,
+        token VARCHAR(64) NOT NULL,
+        date DATE NOT NULL,
+        spot_buy_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        spot_sell_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        spot_base_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        spot_target_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        spot_trade_count INT NOT NULL DEFAULT 0,
+        spot_usdc_fees NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        spot_token_fees NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        spot_token_fees_usdc NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        conditional_buy_volume NUMERIC(40, 12),
+        conditional_sell_volume NUMERIC(40, 12),
+        conditional_base_volume NUMERIC(40, 12),
+        conditional_target_volume NUMERIC(40, 12),
+        conditional_trade_count INT,
+        conditional_usdc_fees NUMERIC(40, 12),
+        conditional_token_fees NUMERIC(40, 12),
+        conditional_token_fees_usdc NUMERIC(40, 12),
+        total_buy_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        total_sell_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        total_base_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        total_target_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        total_trade_count INT NOT NULL DEFAULT 0,
+        total_usdc_fees NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        total_token_fees NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        total_token_fees_usdc NUMERIC(40, 12) NOT NULL DEFAULT 0,
+        conditional_reconciled BOOLEAN NOT NULL DEFAULT false,
+        pending_open_proposals INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(token, date)
+      );
+      CREATE INDEX IF NOT EXISTS idx_v06_fee_agg_token_date ON v06_fee_volume_daily_aggregate(token, date DESC);
+    `;
+
+    await this.pool.query(sql);
+    logger.info('[Database] v0.6 tables created/verified');
   }
 
   /**
@@ -3221,6 +3366,122 @@ export class DatabaseService {
     } catch (error: any) {
       logger.error('[Database] Error pruning old metrics:', error);
       return { metricsDeleted: 0, healthDeleted: 0 };
+    }
+  }
+
+  /**
+   * Get daily trading activity from the v06_fee_volume_daily_aggregate table.
+   * Returns spot + conditional breakdown with a has_conditional_volume flag per row.
+   */
+  async getDailyTradingActivity(options?: {
+    token?: string;
+    tokens?: string[];
+    startDate?: string;
+    endDate?: string;
+  }): Promise<{
+    token: string;
+    date: string;
+    has_conditional_volume: boolean;
+    spot_buy_volume: string;
+    spot_sell_volume: string;
+    spot_base_volume: string;
+    spot_target_volume: string;
+    spot_trade_count: number;
+    spot_usdc_fees: string;
+    spot_token_fees: string;
+    spot_token_fees_usdc: string;
+    conditional_buy_volume: string | null;
+    conditional_sell_volume: string | null;
+    conditional_base_volume: string | null;
+    conditional_target_volume: string | null;
+    conditional_trade_count: number | null;
+    conditional_usdc_fees: string | null;
+    conditional_token_fees: string | null;
+    conditional_token_fees_usdc: string | null;
+    total_buy_volume: string;
+    total_sell_volume: string;
+    total_base_volume: string;
+    total_target_volume: string;
+    total_trade_count: number;
+    total_usdc_fees: string;
+    total_token_fees: string;
+    total_token_fees_usdc: string;
+    conditional_reconciled: boolean;
+    pending_open_proposals: number;
+  }[]> {
+    if (!this.pool || !this.isConnected) return [];
+
+    try {
+      const conditions: string[] = [];
+      const params: any[] = [];
+      let paramIndex = 1;
+
+      if (options?.tokens && options.tokens.length > 0) {
+        const placeholders = options.tokens.map((_, i) => `LOWER($${paramIndex + i})`).join(', ');
+        conditions.push(`LOWER(token) IN (${placeholders})`);
+        params.push(...options.tokens);
+        paramIndex += options.tokens.length;
+      } else if (options?.token) {
+        conditions.push(`LOWER(token) = LOWER($${paramIndex})`);
+        params.push(options.token);
+        paramIndex++;
+      }
+
+      if (options?.startDate) {
+        conditions.push(`date >= $${paramIndex}`);
+        params.push(options.startDate);
+        paramIndex++;
+      }
+
+      if (options?.endDate) {
+        conditions.push(`date <= $${paramIndex}`);
+        params.push(options.endDate);
+        paramIndex++;
+      }
+
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+      const result = await this.pool.query(
+        `SELECT
+          token,
+          date::text,
+          (conditional_buy_volume IS NOT NULL) AS has_conditional_volume,
+          (spot_buy_volume / 1e6)::text AS spot_buy_volume,
+          (spot_sell_volume / 1e6)::text AS spot_sell_volume,
+          (spot_base_volume / 1e6)::text AS spot_base_volume,
+          (spot_target_volume / 1e6)::text AS spot_target_volume,
+          spot_trade_count,
+          (spot_usdc_fees / 1e6)::text AS spot_usdc_fees,
+          (spot_token_fees / 1e6)::text AS spot_token_fees,
+          (spot_token_fees_usdc / 1e6)::text AS spot_token_fees_usdc,
+          (conditional_buy_volume / 1e6)::text AS conditional_buy_volume,
+          (conditional_sell_volume / 1e6)::text AS conditional_sell_volume,
+          (conditional_base_volume / 1e6)::text AS conditional_base_volume,
+          (conditional_target_volume / 1e6)::text AS conditional_target_volume,
+          conditional_trade_count,
+          (conditional_usdc_fees / 1e6)::text AS conditional_usdc_fees,
+          (conditional_token_fees / 1e6)::text AS conditional_token_fees,
+          (conditional_token_fees_usdc / 1e6)::text AS conditional_token_fees_usdc,
+          (total_buy_volume / 1e6)::text AS total_buy_volume,
+          (total_sell_volume / 1e6)::text AS total_sell_volume,
+          (total_base_volume / 1e6)::text AS total_base_volume,
+          (total_target_volume / 1e6)::text AS total_target_volume,
+          total_trade_count,
+          (total_usdc_fees / 1e6)::text AS total_usdc_fees,
+          (total_token_fees / 1e6)::text AS total_token_fees,
+          (total_token_fees_usdc / 1e6)::text AS total_token_fees_usdc,
+          conditional_reconciled,
+          pending_open_proposals
+         FROM v06_fee_volume_daily_aggregate
+         ${whereClause}
+         ORDER BY token, date ASC`,
+        params
+      );
+
+      return result.rows;
+    } catch (error: any) {
+      logger.error('[Database] Error getting daily trading activity:', error);
+      return [];
     }
   }
 
