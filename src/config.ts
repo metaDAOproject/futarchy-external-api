@@ -37,6 +37,9 @@ export const config = {
     // Protocol fee rate (0.005 = 0.5%)
     protocolFeeRate: parseFloat(process.env.PROTOCOL_FEE_RATE || '0.005'),
   },
+  // When true (default), use Dune-sourced volume data (10-min/hourly/cache) for FutarchyAMM 24h metrics.
+  // Set USE_DUNE_DATA=false to use v0.6 indexer data (v06_spot_ohlcv_1m) instead.
+  useDuneData: process.env.USE_DUNE_DATA !== 'false',
   dune: {
     apiKey: process.env.DUNE_API_KEY || '',
     // ACTIVE: 10-minute query - single source of truth, all other data aggregated from this

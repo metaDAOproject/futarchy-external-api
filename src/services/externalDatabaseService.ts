@@ -16,6 +16,11 @@ const { Pool } = pg;
 export class ExternalDatabaseService {
   private pool: pg.Pool | null = null;
   private isConnected: boolean = false;
+  private healthCheckInterval: NodeJS.Timeout | null = null;
+  private consecutiveFailures: number = 0;
+
+  private static readonly HEALTH_CHECK_INTERVAL_MS = 60_000;
+  private static readonly MAX_FAILURES_BEFORE_RECONNECT = 3;
 
   async initialize(): Promise<boolean> {
     if (!config.externalDatabase.connectionString) {
@@ -24,23 +29,13 @@ export class ExternalDatabaseService {
     }
 
     try {
-      this.pool = new Pool({
-        connectionString: config.externalDatabase.connectionString,
-        ssl: config.externalDatabase.ssl ? { rejectUnauthorized: false } : false,
-        max: 5,
-        idleTimeoutMillis: 30_000,
-        connectionTimeoutMillis: 10_000,
-      });
+      this.createPool();
 
-      this.pool.on('error', (err: Error) => {
-        logger.error('[ExternalDB] Pool error', err);
-        this.isConnected = false;
-      });
-
-      const client = await this.pool.connect();
+      const client = await this.pool!.connect();
       client.release();
       this.isConnected = true;
       logger.info('[ExternalDB] Connected to external indexer database (read-only)');
+      this.startHealthCheck();
       return true;
     } catch (error: any) {
       logger.error('[ExternalDB] Failed to connect:', error);
@@ -61,10 +56,77 @@ export class ExternalDatabaseService {
   }
 
   async close(): Promise<void> {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
     if (this.pool) {
       await this.pool.end();
       this.isConnected = false;
       logger.info('[ExternalDB] Connection closed');
     }
+  }
+
+  private startHealthCheck(): void {
+    if (this.healthCheckInterval) return;
+
+    this.healthCheckInterval = setInterval(async () => {
+      try {
+        await this.pool!.query('SELECT 1');
+        if (!this.isConnected) {
+          logger.info('[ExternalDB] Connection recovered');
+        }
+        this.isConnected = true;
+        this.consecutiveFailures = 0;
+      } catch (error: any) {
+        this.consecutiveFailures++;
+        this.isConnected = false;
+        logger.error(
+          `[ExternalDB] Health check failed (${this.consecutiveFailures}/${ExternalDatabaseService.MAX_FAILURES_BEFORE_RECONNECT})`,
+          error
+        );
+
+        if (this.consecutiveFailures >= ExternalDatabaseService.MAX_FAILURES_BEFORE_RECONNECT) {
+          logger.error('[ExternalDB] Max consecutive failures reached — recreating connection pool');
+          await this.reconnect();
+        }
+      }
+    }, ExternalDatabaseService.HEALTH_CHECK_INTERVAL_MS);
+  }
+
+  private async reconnect(): Promise<void> {
+    try {
+      if (this.pool) {
+        await this.pool.end().catch(() => {});
+      }
+    } catch {
+      // ignore — pool may already be dead
+    }
+
+    this.createPool();
+
+    try {
+      await this.pool!.query('SELECT 1');
+      this.isConnected = true;
+      this.consecutiveFailures = 0;
+      logger.info('[ExternalDB] Reconnected successfully after pool recreation');
+    } catch (error: any) {
+      logger.error('[ExternalDB] Reconnection attempt failed — will retry on next health check', error);
+    }
+  }
+
+  private createPool(): void {
+    this.pool = new Pool({
+      connectionString: config.externalDatabase.connectionString,
+      ssl: config.externalDatabase.ssl ? { rejectUnauthorized: false } : false,
+      max: 5,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 10_000,
+    });
+
+    this.pool.on('error', (err: Error) => {
+      logger.error('[ExternalDB] Pool error', err);
+      this.isConnected = false;
+    });
   }
 }

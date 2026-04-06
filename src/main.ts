@@ -16,7 +16,7 @@ import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { scheduleWithoutPileup, scheduleDailyAtUTC, type ScheduledTask } from './utils/scheduling.js';
 import { saveHealthSnapshots } from './routes/health.js';
-import type { ServiceGetters } from './routes/types.js';
+import { createServiceGetters, type ServiceGetters } from './routes/types.js';
 import type { Server } from 'http';
 
 function initializeServices(): Services {
@@ -147,28 +147,6 @@ async function stopServices(services: Services, scheduledTasks: ScheduledTask[])
   services.v06ReconciliationService?.stop();
   await services.externalDatabaseService?.close();
   await services.databaseService.close();
-}
-
-function createServiceGetters(services: Services): ServiceGetters {
-  return {
-    getFutarchyService: () => services.futarchyService,
-    getPriceService: () => services.priceService,
-    getDuneService: () => services.duneService ?? null,
-    getDuneCacheService: () => services.duneCacheService ?? null,
-    getSolanaService: () => {
-      if (!services.solanaService) throw new Error('Solana service not available');
-      return services.solanaService;
-    },
-    getLaunchpadService: () => {
-      if (!services.launchpadService) throw new Error('Launchpad service not available');
-      return services.launchpadService;
-    },
-    getDatabaseService: () => services.databaseService,
-    getHourlyAggregationService: () => services.hourlyAggregationService ?? null,
-    getTenMinuteVolumeFetcherService: () => services.tenMinuteVolumeFetcherService ?? null,
-    getDailyAggregationService: () => services.dailyAggregationService ?? null,
-    getMeteoraVolumeFetcherService: () => services.meteoraVolumeFetcherService ?? null,
-  };
 }
 
 function startScheduledTasks(services: Services): ScheduledTask[] {

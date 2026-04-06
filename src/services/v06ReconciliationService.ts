@@ -112,109 +112,97 @@ export class V06ReconciliationService {
   // ------------------------------------------------------------------
 
   private async reconcileSpotOhlcv1m(since: string, until: string): Promise<void> {
-    logger.info('[V06Reconciliation] Spot OHLCV 1m: querying aggregates...');
+    // #12: Single CTE query replaces 3 separate scans (aggregate + open + close).
+    // #10: Compare unix_timestamp directly against epoch seconds to allow index use.
+    const sinceEpoch = Math.floor(new Date(since).getTime() / 1000);
+    const untilEpoch = Math.floor(new Date(until).getTime() / 1000);
+
+    logger.info('[V06Reconciliation] Spot OHLCV 1m: querying (single CTE)...');
     const rows = await this.extDb.query(`
+      WITH priced AS (
+        SELECT
+          d.base_mint_acct                                       AS token,
+          date_trunc('minute', to_timestamp(s.unix_timestamp))   AS bucket,
+          s.unix_timestamp,
+          s.id,
+          CASE WHEN LOWER(TRIM(s.swap_type)) = 'buy'
+            THEN s.input_amount::numeric / NULLIF(s.output_amount::numeric, 0)
+            ELSE s.output_amount::numeric / NULLIF(s.input_amount::numeric, 0)
+          END                                                    AS price,
+          CASE WHEN LOWER(TRIM(s.swap_type)) = 'buy' THEN s.output_amount::numeric ELSE s.input_amount::numeric END AS base_amt,
+          CASE WHEN LOWER(TRIM(s.swap_type)) = 'buy' THEN s.input_amount::numeric  ELSE s.output_amount::numeric END AS target_amt,
+          CASE WHEN LOWER(TRIM(s.swap_type)) = 'buy' THEN s.input_amount::numeric  ELSE 0 END AS buy_amt,
+          CASE WHEN LOWER(TRIM(s.swap_type)) = 'sell' THEN s.input_amount::numeric ELSE 0 END AS sell_amt
+        FROM v0_6_spot_swaps s
+        JOIN v0_6_daos d ON d.dao_addr = s.dao_addr
+        WHERE s.unix_timestamp >= $1
+          AND s.unix_timestamp < $2
+          AND s.input_amount > 0 AND s.output_amount > 0
+          AND LOWER(TRIM(s.swap_type)) IN ('buy', 'sell')
+      ),
+      ranked AS (
+        SELECT *,
+          ROW_NUMBER() OVER (PARTITION BY token, bucket ORDER BY unix_timestamp ASC,  id ASC)  AS rn_first,
+          ROW_NUMBER() OVER (PARTITION BY token, bucket ORDER BY unix_timestamp DESC, id DESC) AS rn_last
+        FROM priced
+      )
       SELECT
-        d.base_mint_acct                                       AS token,
-        date_trunc('minute', to_timestamp(s.unix_timestamp))   AS bucket,
-        -- OHLC via first_value / last_value requires window; use subquery approach
-        MIN(CASE WHEN s.swap_type = 'Buy'
-              THEN s.input_amount::numeric / NULLIF(s.output_amount::numeric, 0)
-              ELSE s.output_amount::numeric / NULLIF(s.input_amount::numeric, 0)
-            END)                                               AS low,
-        MAX(CASE WHEN s.swap_type = 'Buy'
-              THEN s.input_amount::numeric / NULLIF(s.output_amount::numeric, 0)
-              ELSE s.output_amount::numeric / NULLIF(s.input_amount::numeric, 0)
-            END)                                               AS high,
-        AVG(CASE WHEN s.swap_type = 'Buy'
-              THEN s.input_amount::numeric / NULLIF(s.output_amount::numeric, 0)
-              ELSE s.output_amount::numeric / NULLIF(s.input_amount::numeric, 0)
-            END)                                               AS average_price,
-        SUM(CASE WHEN s.swap_type = 'Buy' THEN s.output_amount::numeric ELSE s.input_amount::numeric END) AS base_volume,
-        SUM(CASE WHEN s.swap_type = 'Buy' THEN s.input_amount::numeric  ELSE s.output_amount::numeric END) AS target_volume,
-        SUM(CASE WHEN s.swap_type = 'Buy' THEN s.input_amount::numeric  ELSE 0 END) AS buy_volume,
-        SUM(CASE WHEN s.swap_type = 'Sell' THEN s.input_amount::numeric ELSE 0 END) AS sell_volume,
-        COUNT(*)::int                                          AS trade_count
-      FROM v0_6_spot_swaps s
-      JOIN v0_6_daos d ON d.dao_addr = s.dao_addr
-      WHERE to_timestamp(s.unix_timestamp) >= $1
-        AND to_timestamp(s.unix_timestamp) < $2
-        AND s.input_amount > 0 AND s.output_amount > 0
-        AND LOWER(TRIM(s.swap_type)) IN ('buy', 'sell')
-      GROUP BY d.base_mint_acct, date_trunc('minute', to_timestamp(s.unix_timestamp))
-    `, [since, until]);
-    logger.info(`[V06Reconciliation] Spot OHLCV 1m: got ${rows.rows.length} aggregate rows`);
+        token,
+        bucket,
+        MAX(CASE WHEN rn_first = 1 THEN price END) AS open,
+        MAX(price)                                  AS high,
+        MIN(price)                                  AS low,
+        MAX(CASE WHEN rn_last  = 1 THEN price END) AS close,
+        AVG(price)                                  AS average_price,
+        SUM(base_amt)                               AS base_volume,
+        SUM(target_amt)                             AS target_volume,
+        SUM(buy_amt)                                AS buy_volume,
+        SUM(sell_amt)                               AS sell_volume,
+        COUNT(*)::int                               AS trade_count
+      FROM ranked
+      GROUP BY token, bucket
+    `, [sinceEpoch, untilEpoch]);
+    logger.info(`[V06Reconciliation] Spot OHLCV 1m: got ${rows.rows.length} rows`);
 
     if (rows.rows.length === 0) {
       logger.info('[V06Reconciliation] Spot OHLCV 1m: no rows');
       return;
     }
 
-    // We need open/close per bucket. Fetch them separately (first/last price per bucket).
-    logger.info('[V06Reconciliation] Spot OHLCV 1m: querying open prices...');
-    const openClose = await this.extDb.query(`
-      SELECT DISTINCT ON (d.base_mint_acct, date_trunc('minute', to_timestamp(s.unix_timestamp)))
-        d.base_mint_acct AS token,
-        date_trunc('minute', to_timestamp(s.unix_timestamp)) AS bucket,
-        CASE WHEN s.swap_type = 'Buy'
-          THEN s.input_amount::numeric / NULLIF(s.output_amount::numeric, 0)
-          ELSE s.output_amount::numeric / NULLIF(s.input_amount::numeric, 0)
-        END AS open_price
-      FROM v0_6_spot_swaps s
-      JOIN v0_6_daos d ON d.dao_addr = s.dao_addr
-      WHERE to_timestamp(s.unix_timestamp) >= $1
-        AND to_timestamp(s.unix_timestamp) < $2
-        AND s.input_amount > 0 AND s.output_amount > 0
-        AND LOWER(TRIM(s.swap_type)) IN ('buy', 'sell')
-      ORDER BY d.base_mint_acct, date_trunc('minute', to_timestamp(s.unix_timestamp)), s.unix_timestamp ASC, s.id ASC
-    `, [since, until]);
-
-    logger.info('[V06Reconciliation] Spot OHLCV 1m: querying close prices...');
-    const closeRows = await this.extDb.query(`
-      SELECT DISTINCT ON (d.base_mint_acct, date_trunc('minute', to_timestamp(s.unix_timestamp)))
-        d.base_mint_acct AS token,
-        date_trunc('minute', to_timestamp(s.unix_timestamp)) AS bucket,
-        CASE WHEN s.swap_type = 'Buy'
-          THEN s.input_amount::numeric / NULLIF(s.output_amount::numeric, 0)
-          ELSE s.output_amount::numeric / NULLIF(s.input_amount::numeric, 0)
-        END AS close_price
-      FROM v0_6_spot_swaps s
-      JOIN v0_6_daos d ON d.dao_addr = s.dao_addr
-      WHERE to_timestamp(s.unix_timestamp) >= $1
-        AND to_timestamp(s.unix_timestamp) < $2
-        AND s.input_amount > 0 AND s.output_amount > 0
-        AND LOWER(TRIM(s.swap_type)) IN ('buy', 'sell')
-      ORDER BY d.base_mint_acct, date_trunc('minute', to_timestamp(s.unix_timestamp)), s.unix_timestamp DESC, s.id DESC
-    `, [since, until]);
-
-    // Build lookup maps
-    const openMap = new Map<string, number>();
-    for (const r of openClose.rows) {
-      openMap.set(`${r.token}|${new Date(r.bucket).toISOString()}`, Number(r.open_price));
-    }
-    const closeMap = new Map<string, number>();
-    for (const r of closeRows.rows) {
-      closeMap.set(`${r.token}|${new Date(r.bucket).toISOString()}`, Number(r.close_price));
-    }
-
-    // Batch upsert into app DB
+    // Batch upsert into app DB using multi-value INSERT
     const pool = this.appDb.pool;
     if (!pool) return;
 
+    const BATCH_SIZE = 500;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      for (const row of rows.rows) {
-        const key = `${row.token}|${new Date(row.bucket).toISOString()}`;
-        const openPrice = openMap.get(key) ?? 0;
-        const closePrice = closeMap.get(key) ?? 0;
+      for (let i = 0; i < rows.rows.length; i += BATCH_SIZE) {
+        const batch = rows.rows.slice(i, i + BATCH_SIZE);
+        const values: any[] = [];
+        const placeholders: string[] = [];
+
+        batch.forEach((row: any, idx: number) => {
+          const offset = idx * 12;
+          placeholders.push(
+            `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, true, CURRENT_TIMESTAMP)`
+          );
+          values.push(
+            row.token, row.bucket,
+            Number(row.open), Number(row.high), Number(row.low), Number(row.close),
+            Number(row.average_price),
+            Number(row.base_volume), Number(row.target_volume),
+            Number(row.buy_volume), Number(row.sell_volume),
+            row.trade_count,
+          );
+        });
 
         await client.query(`
           INSERT INTO v06_spot_ohlcv_1m
             (token, bucket, open, high, low, close, average_price,
              base_volume, target_volume, buy_volume, sell_volume, trade_count, is_complete, updated_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, true, CURRENT_TIMESTAMP)
+          VALUES ${placeholders.join(', ')}
           ON CONFLICT (token, bucket) DO UPDATE SET
             open = EXCLUDED.open,
             high = EXCLUDED.high,
@@ -228,14 +216,7 @@ export class V06ReconciliationService {
             trade_count = EXCLUDED.trade_count,
             is_complete = true,
             updated_at = CURRENT_TIMESTAMP
-        `, [
-          row.token, row.bucket,
-          openPrice, Number(row.high), Number(row.low), closePrice,
-          Number(row.average_price),
-          Number(row.base_volume), Number(row.target_volume),
-          Number(row.buy_volume), Number(row.sell_volume),
-          row.trade_count,
-        ]);
+        `, values);
       }
 
       await client.query('COMMIT');
@@ -307,6 +288,11 @@ export class V06ReconciliationService {
   // ------------------------------------------------------------------
 
   private async reconcileFeeDailySpot(since: string, until: string): Promise<void> {
+    // #10: Use epoch-second comparison for index-friendly WHERE.
+    // #11: Compute fee columns in SQL to avoid JS numeric precision loss.
+    const sinceEpoch = Math.floor(new Date(since).getTime() / 1000);
+    const untilEpoch = Math.floor(new Date(until).getTime() / 1000);
+
     logger.info('[V06Reconciliation] Fee daily spot: querying...');
     const rows = await this.extDb.query(`
       SELECT
@@ -320,12 +306,12 @@ export class V06ReconciliationService {
         SUM(CASE WHEN LOWER(TRIM(s.swap_type)) = 'sell' THEN s.output_amount::numeric ELSE 0 END) AS sell_output_usdc
       FROM v0_6_spot_swaps s
       JOIN v0_6_daos d ON d.dao_addr = s.dao_addr
-      WHERE to_timestamp(s.unix_timestamp) >= $1
-        AND to_timestamp(s.unix_timestamp) < $2
+      WHERE s.unix_timestamp >= $1
+        AND s.unix_timestamp < $2
         AND s.input_amount > 0 AND s.output_amount > 0
         AND LOWER(TRIM(s.swap_type)) IN ('buy', 'sell')
       GROUP BY d.base_mint_acct, date_trunc('day', to_timestamp(s.unix_timestamp))::date
-    `, [since, until]);
+    `, [sinceEpoch, untilEpoch]);
 
     if (rows.rows.length === 0) {
       logger.info('[V06Reconciliation] Fee daily spot: no rows');
@@ -335,22 +321,47 @@ export class V06ReconciliationService {
     const pool = this.appDb.pool;
     if (!pool) return;
 
+    const BATCH_SIZE = 500;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      for (const r of rows.rows) {
-        const buyVol = Number(r.buy_volume);
-        const sellVol = Number(r.sell_volume);
-        const sellOutputUsdc = Number(r.sell_output_usdc) || 0;
-        const dateStr = r.swap_date instanceof Date
-          ? r.swap_date.toISOString().slice(0, 10)
-          : String(r.swap_date);
+
+      for (let i = 0; i < rows.rows.length; i += BATCH_SIZE) {
+        const batch = rows.rows.slice(i, i + BATCH_SIZE);
+        const values: any[] = [];
+        const placeholders: string[] = [];
+
+        batch.forEach((r: any, idx: number) => {
+          const dateStr = r.swap_date instanceof Date
+            ? r.swap_date.toISOString().slice(0, 10)
+            : String(r.swap_date);
+          const offset = idx * 8;
+          // #11: Pass raw volumes + fee rate; compute fees in SQL as NUMERIC arithmetic
+          placeholders.push(
+            `($${offset + 1}, $${offset + 2}, $${offset + 3}::numeric, $${offset + 4}::numeric, $${offset + 5}::numeric, $${offset + 6}::numeric, $${offset + 7}, $${offset + 8}::numeric)`
+          );
+          values.push(
+            r.token, dateStr,
+            r.buy_volume, r.sell_volume,
+            r.base_volume, r.target_volume,
+            r.trade_count,
+            r.sell_output_usdc,
+          );
+        });
 
         await client.query(`
           INSERT INTO v06_fee_volume_daily_spot
             (token, date, buy_volume, sell_volume, base_volume, target_volume, trade_count,
              usdc_fees, token_fees, token_fees_usdc, sell_volume_usdc, updated_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
+          SELECT
+            v.token, v.date, v.buy_volume, v.sell_volume, v.base_volume, v.target_volume, v.trade_count,
+            v.buy_volume * ${FEE_RATE}::numeric   AS usdc_fees,
+            v.sell_volume * ${FEE_RATE}::numeric  AS token_fees,
+            v.sell_output_usdc * ${FEE_RATE}::numeric AS token_fees_usdc,
+            v.sell_output_usdc,
+            CURRENT_TIMESTAMP
+          FROM (VALUES ${placeholders.join(', ')})
+            AS v(token, date, buy_volume, sell_volume, base_volume, target_volume, trade_count, sell_output_usdc)
           ON CONFLICT (token, date) DO UPDATE SET
             buy_volume = EXCLUDED.buy_volume,
             sell_volume = EXCLUDED.sell_volume,
@@ -362,17 +373,9 @@ export class V06ReconciliationService {
             token_fees_usdc = EXCLUDED.token_fees_usdc,
             sell_volume_usdc = EXCLUDED.sell_volume_usdc,
             updated_at = CURRENT_TIMESTAMP
-        `, [
-          r.token, dateStr,
-          buyVol, sellVol,
-          Number(r.base_volume), Number(r.target_volume),
-          r.trade_count,
-          buyVol * FEE_RATE,                   // usdc_fees
-          sellVol * FEE_RATE,                  // token_fees
-          sellOutputUsdc * FEE_RATE,           // token_fees_usdc
-          sellOutputUsdc,                      // sell_volume_usdc
-        ]);
+        `, values);
       }
+
       await client.query('COMMIT');
       logger.info(`[V06Reconciliation] Fee daily spot: upserted ${rows.rows.length} rows`);
     } catch (err) {
@@ -388,6 +391,12 @@ export class V06ReconciliationService {
   // ------------------------------------------------------------------
 
   private async reconcileFeeDailyConditional(since: string, until: string): Promise<void> {
+    // #9:  Batch upserts (multi-value INSERT) instead of row-by-row.
+    // #10: Use epoch-second comparison for index-friendly WHERE.
+    // #11: Compute fee columns in SQL to avoid JS numeric precision loss.
+    const sinceEpoch = Math.floor(new Date(since).getTime() / 1000);
+    const untilEpoch = Math.floor(new Date(until).getTime() / 1000);
+
     // Only include swaps where:
     //   - proposal is Passed → keep market = 'pass'
     //   - proposal is Failed → keep market = 'fail'
@@ -405,8 +414,8 @@ export class V06ReconciliationService {
       FROM v0_6_conditional_swaps c
       JOIN v0_6_proposals p ON p.proposal_addr = c.proposal_addr
       JOIN v0_6_daos d ON d.dao_addr = p.dao_addr
-      WHERE to_timestamp(c.unix_timestamp) >= $1
-        AND to_timestamp(c.unix_timestamp) < $2
+      WHERE c.unix_timestamp >= $1
+        AND c.unix_timestamp < $2
         AND c.input_amount > 0 AND c.output_amount > 0
         AND LOWER(TRIM(c.swap_type)) IN ('buy', 'sell')
         AND (
@@ -415,7 +424,7 @@ export class V06ReconciliationService {
           (p.state = 'Failed' AND LOWER(TRIM(c.market)) = 'fail')
         )
       GROUP BY d.base_mint_acct, date_trunc('day', to_timestamp(c.unix_timestamp))::date
-    `, [since, until]);
+    `, [sinceEpoch, untilEpoch]);
 
     // Also count how many open (non-terminal) proposals have swaps in this window
     logger.info('[V06Reconciliation] Fee daily conditional: querying pending proposals...');
@@ -427,11 +436,11 @@ export class V06ReconciliationService {
       FROM v0_6_conditional_swaps c
       JOIN v0_6_proposals p ON p.proposal_addr = c.proposal_addr
       JOIN v0_6_daos d ON d.dao_addr = p.dao_addr
-      WHERE to_timestamp(c.unix_timestamp) >= $1
-        AND to_timestamp(c.unix_timestamp) < $2
+      WHERE c.unix_timestamp >= $1
+        AND c.unix_timestamp < $2
         AND p.state NOT IN ('Passed', 'Failed')
       GROUP BY d.base_mint_acct, date_trunc('day', to_timestamp(c.unix_timestamp))::date
-    `, [since, until]);
+    `, [sinceEpoch, untilEpoch]);
 
     // Normalise swap_date coming from pg (Date objects) into YYYY-MM-DD strings
     // so that Bun's Date.toString() (which emits un-parseable "GMT-0700") never
@@ -442,6 +451,12 @@ export class V06ReconciliationService {
     const pendingMap = new Map<string, number>();
     for (const r of pendingRows.rows) {
       pendingMap.set(`${r.token}|${normDate(r.swap_date)}`, r.pending_count);
+    }
+
+    // Build a lookup map for winning-market rows (avoids O(n×m) find inside loop)
+    const winRowMap = new Map<string, any>();
+    for (const r of rows.rows) {
+      winRowMap.set(`${r.token}|${normDate(r.swap_date)}`, r);
     }
 
     const pool = this.appDb.pool;
@@ -456,59 +471,99 @@ export class V06ReconciliationService {
       for (const r of rows.rows) allKeys.add(`${r.token}|${normDate(r.swap_date)}`);
       for (const key of pendingMap.keys()) allKeys.add(key);
 
+      // Split into rows that have winning-market data vs pending-only
+      const winEntries: { token: string; date: string; row: any; pending: number; reconciled: boolean }[] = [];
+      const pendingOnlyEntries: { token: string; date: string; pending: number }[] = [];
+
       for (const key of allKeys) {
-        const [token, swapDateStr] = key.split('|');
-        const winRow = rows.rows.find((r: any) => r.token === token && normDate(r.swap_date) === swapDateStr);
+        const separatorIdx = key.indexOf('|');
+        const token = key.slice(0, separatorIdx);
+        const swapDateStr = key.slice(separatorIdx + 1);
+        const winRow = winRowMap.get(key);
         const pendingCount = pendingMap.get(key) ?? 0;
-        const reconciled = pendingCount === 0;
-
         if (winRow) {
-          const buyVol = Number(winRow.buy_volume);
-          const sellVol = Number(winRow.sell_volume);
-          const sellOutputUsdc = Number(winRow.sell_output_usdc) || 0;
-
-          await client.query(`
-            INSERT INTO v06_fee_volume_daily_conditional
-              (token, date, buy_volume, sell_volume, base_volume, target_volume, trade_count,
-               usdc_fees, token_fees, token_fees_usdc, sell_volume_usdc,
-               conditional_reconciled, pending_open_proposals, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
-            ON CONFLICT (token, date) DO UPDATE SET
-              buy_volume = EXCLUDED.buy_volume,
-              sell_volume = EXCLUDED.sell_volume,
-              base_volume = EXCLUDED.base_volume,
-              target_volume = EXCLUDED.target_volume,
-              trade_count = EXCLUDED.trade_count,
-              usdc_fees = EXCLUDED.usdc_fees,
-              token_fees = EXCLUDED.token_fees,
-              token_fees_usdc = EXCLUDED.token_fees_usdc,
-              sell_volume_usdc = EXCLUDED.sell_volume_usdc,
-              conditional_reconciled = EXCLUDED.conditional_reconciled,
-              pending_open_proposals = EXCLUDED.pending_open_proposals,
-              updated_at = CURRENT_TIMESTAMP
-          `, [
-            token, swapDateStr,
-            buyVol, sellVol,
-            Number(winRow.base_volume), Number(winRow.target_volume),
-            winRow.trade_count,
-            buyVol * FEE_RATE,
-            sellVol * FEE_RATE,
-            sellOutputUsdc * FEE_RATE,
-            sellOutputUsdc,
-            reconciled, pendingCount,
-          ]);
+          winEntries.push({ token, date: swapDateStr, row: winRow, pending: pendingCount, reconciled: pendingCount === 0 });
         } else {
-          // Only pending swaps exist for this token-date, no winning-market volume yet
-          await client.query(`
-            INSERT INTO v06_fee_volume_daily_conditional
-              (token, date, conditional_reconciled, pending_open_proposals, updated_at)
-            VALUES ($1, $2, false, $3, CURRENT_TIMESTAMP)
-            ON CONFLICT (token, date) DO UPDATE SET
-              conditional_reconciled = false,
-              pending_open_proposals = EXCLUDED.pending_open_proposals,
-              updated_at = CURRENT_TIMESTAMP
-          `, [token, swapDateStr, pendingCount]);
+          pendingOnlyEntries.push({ token, date: swapDateStr, pending: pendingCount });
         }
+      }
+
+      // Batch upsert winning-market rows with fee math in SQL
+      const BATCH_SIZE = 500;
+      for (let i = 0; i < winEntries.length; i += BATCH_SIZE) {
+        const batch = winEntries.slice(i, i + BATCH_SIZE);
+        const values: any[] = [];
+        const placeholders: string[] = [];
+
+        batch.forEach((entry, idx) => {
+          const offset = idx * 10;
+          placeholders.push(
+            `($${offset + 1}, $${offset + 2}, $${offset + 3}::numeric, $${offset + 4}::numeric, $${offset + 5}::numeric, $${offset + 6}::numeric, $${offset + 7}, $${offset + 8}::numeric, $${offset + 9}, $${offset + 10})`
+          );
+          values.push(
+            entry.token, entry.date,
+            entry.row.buy_volume, entry.row.sell_volume,
+            entry.row.base_volume, entry.row.target_volume,
+            entry.row.trade_count,
+            entry.row.sell_output_usdc,
+            entry.reconciled, entry.pending,
+          );
+        });
+
+        await client.query(`
+          INSERT INTO v06_fee_volume_daily_conditional
+            (token, date, buy_volume, sell_volume, base_volume, target_volume, trade_count,
+             usdc_fees, token_fees, token_fees_usdc, sell_volume_usdc,
+             conditional_reconciled, pending_open_proposals, updated_at)
+          SELECT
+            v.token, v.date, v.buy_volume, v.sell_volume, v.base_volume, v.target_volume, v.trade_count,
+            v.buy_volume * ${FEE_RATE}::numeric       AS usdc_fees,
+            v.sell_volume * ${FEE_RATE}::numeric      AS token_fees,
+            v.sell_output_usdc * ${FEE_RATE}::numeric AS token_fees_usdc,
+            v.sell_output_usdc,
+            v.reconciled, v.pending,
+            CURRENT_TIMESTAMP
+          FROM (VALUES ${placeholders.join(', ')})
+            AS v(token, date, buy_volume, sell_volume, base_volume, target_volume, trade_count, sell_output_usdc, reconciled, pending)
+          ON CONFLICT (token, date) DO UPDATE SET
+            buy_volume = EXCLUDED.buy_volume,
+            sell_volume = EXCLUDED.sell_volume,
+            base_volume = EXCLUDED.base_volume,
+            target_volume = EXCLUDED.target_volume,
+            trade_count = EXCLUDED.trade_count,
+            usdc_fees = EXCLUDED.usdc_fees,
+            token_fees = EXCLUDED.token_fees,
+            token_fees_usdc = EXCLUDED.token_fees_usdc,
+            sell_volume_usdc = EXCLUDED.sell_volume_usdc,
+            conditional_reconciled = EXCLUDED.conditional_reconciled,
+            pending_open_proposals = EXCLUDED.pending_open_proposals,
+            updated_at = CURRENT_TIMESTAMP
+        `, values);
+      }
+
+      // Batch upsert pending-only rows (no winning-market volume yet)
+      for (let i = 0; i < pendingOnlyEntries.length; i += BATCH_SIZE) {
+        const batch = pendingOnlyEntries.slice(i, i + BATCH_SIZE);
+        const values: any[] = [];
+        const placeholders: string[] = [];
+
+        batch.forEach((entry, idx) => {
+          const offset = idx * 3;
+          placeholders.push(`($${offset + 1}, $${offset + 2}, $${offset + 3})`);
+          values.push(entry.token, entry.date, entry.pending);
+        });
+
+        await client.query(`
+          INSERT INTO v06_fee_volume_daily_conditional
+            (token, date, conditional_reconciled, pending_open_proposals, updated_at)
+          SELECT v.token, v.date, false, v.pending, CURRENT_TIMESTAMP
+          FROM (VALUES ${placeholders.join(', ')})
+            AS v(token, date, pending)
+          ON CONFLICT (token, date) DO UPDATE SET
+            conditional_reconciled = false,
+            pending_open_proposals = EXCLUDED.pending_open_proposals,
+            updated_at = CURRENT_TIMESTAMP
+        `, values);
       }
 
       await client.query('COMMIT');

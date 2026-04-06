@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS v06_fee_volume_daily_spot (
 );
 
 CREATE INDEX IF NOT EXISTS idx_v06_fee_spot_token_date ON v06_fee_volume_daily_spot(token, date DESC);
+CREATE INDEX IF NOT EXISTS idx_v06_fee_spot_date ON v06_fee_volume_daily_spot(date DESC);
 
 -- ============================================
 -- 4) Fee breakdown: conditional — daily by (token, date)
@@ -107,6 +108,7 @@ CREATE TABLE IF NOT EXISTS v06_fee_volume_daily_conditional (
 );
 
 CREATE INDEX IF NOT EXISTS idx_v06_fee_cond_token_date ON v06_fee_volume_daily_conditional(token, date DESC);
+CREATE INDEX IF NOT EXISTS idx_v06_fee_cond_date ON v06_fee_volume_daily_conditional(date DESC);
 
 -- ============================================
 -- 5) Fee aggregate — primary for accountant
@@ -152,3 +154,4 @@ CREATE TABLE IF NOT EXISTS v06_fee_volume_daily_aggregate (
 );
 
 CREATE INDEX IF NOT EXISTS idx_v06_fee_agg_token_date ON v06_fee_volume_daily_aggregate(token, date DESC);
+CREATE INDEX IF NOT EXISTS idx_v06_fee_agg_date ON v06_fee_volume_daily_aggregate(date DESC);

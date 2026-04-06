@@ -17,10 +17,19 @@ export function createRootRouter(services: ServiceGetters): Router {
       documentation: 'https://docs.coingecko.com/reference/exchanges-list',
       endpoints: {
         tickers: '/api/tickers - Returns all DAO tickers with pricing and volume',
+        market_data: '/api/market-data - Daily market data (futarchy AMM + Meteora); uses v0.6 indexer when USE_DUNE_DATA=false',
         supply: '/api/supply/:mintAddress - Returns complete supply breakdown with allocation details',
         supply_total: '/api/supply/:mintAddress/total - Returns total supply only',
         supply_circulating: '/api/supply/:mintAddress/circulating - Returns circulating supply (excludes team performance package)',
         health: '/health',
+        health_detailed: '/api/health - Comprehensive health with DB and data freshness',
+      },
+      dexscreener: {
+        description: 'DexScreener Adapter (v1.1) — requires EXTERNAL_DATABASE_URL',
+        latest_block: '/dexscreener/latest-block - Latest indexed Solana slot',
+        asset: '/dexscreener/asset?id=:mintAddress - Token metadata',
+        pair: '/dexscreener/pair?id=:daoAddress - Pair info',
+        events: '/dexscreener/events?fromBlock=:slot&toBlock=:slot - Swap events by slot range',
       },
       dex: {
         fork_type: config.dex.forkType,

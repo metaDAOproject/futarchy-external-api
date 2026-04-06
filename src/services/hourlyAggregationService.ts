@@ -331,12 +331,11 @@ export class HourlyAggregationService {
    */
   private updateInMemoryCache(records: HourlyVolumeRecord[]): void {
     for (const record of records) {
-      const tokenLower = record.token.toLowerCase();
-      let tokenRecords = this.inMemoryHourlyCache.get(tokenLower);
+      let tokenRecords = this.inMemoryHourlyCache.get(record.token);
       
       if (!tokenRecords) {
         tokenRecords = [];
-        this.inMemoryHourlyCache.set(tokenLower, tokenRecords);
+        this.inMemoryHourlyCache.set(record.token, tokenRecords);
       }
 
       // Find and update or add
@@ -381,7 +380,7 @@ export class HourlyAggregationService {
     const cutoffTime = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
     const tokensToCheck = tokens
-      ? tokens.map(t => t.toLowerCase())
+      ? tokens
       : Array.from(this.inMemoryHourlyCache.keys());
 
     for (const tokenLower of tokensToCheck) {

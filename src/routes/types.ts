@@ -9,6 +9,35 @@ import type { HourlyAggregationService } from '../services/hourlyAggregationServ
 import type { TenMinuteVolumeFetcherService } from '../services/tenMinuteVolumeFetcherService.js';
 import type { DailyAggregationService } from '../services/dailyAggregationService.js';
 import type { MeteoraVolumeFetcherService } from '../services/meteoraVolumeFetcherService.js';
+import type { ExternalDatabaseService } from '../services/externalDatabaseService.js';
+import type { V06ReconciliationService } from '../services/v06ReconciliationService.js';
+import { AppError } from '../middleware/errorHandler.js';
+
+/**
+ * Service registry for all application services.
+ *
+ * Three conventions are used:
+ * - `foo: T`        → always available, getter returns `T`
+ * - `foo: T | null` → optional capability, getter returns `T | null`
+ * - `foo?: T`       → conditionally wired, getter throws `AppError(503)` if missing
+ */
+export interface Services {
+  futarchyService: FutarchyService;
+  priceService: PriceService;
+  databaseService: DatabaseService;
+
+  externalDatabaseService: ExternalDatabaseService | null;
+  duneService: DuneService | null;
+  duneCacheService: DuneCacheService | null;
+  hourlyAggregationService: HourlyAggregationService | null;
+  tenMinuteVolumeFetcherService: TenMinuteVolumeFetcherService | null;
+  dailyAggregationService: DailyAggregationService | null;
+  meteoraVolumeFetcherService: MeteoraVolumeFetcherService | null;
+  v06ReconciliationService: V06ReconciliationService | null;
+
+  solanaService?: SolanaService;
+  launchpadService?: LaunchpadService;
+}
 
 /**
  * Service getters passed to route handlers.
@@ -27,4 +56,33 @@ export interface ServiceGetters {
   getTenMinuteVolumeFetcherService: () => TenMinuteVolumeFetcherService | null;
   getDailyAggregationService: () => DailyAggregationService | null;
   getMeteoraVolumeFetcherService: () => MeteoraVolumeFetcherService | null;
+  getExternalDatabaseService: () => ExternalDatabaseService | null;
+}
+
+function requireService<T>(service: T | undefined, name: string): T {
+  if (!service) throw new AppError(`${name} service not available`, 503);
+  return service;
+}
+
+function optionalService<T>(service: T | null | undefined): T | null {
+  return service ?? null;
+}
+
+export function createServiceGetters(services: Services): ServiceGetters {
+  return {
+    getFutarchyService: () => services.futarchyService,
+    getPriceService: () => services.priceService,
+    getDatabaseService: () => services.databaseService,
+
+    getDuneService: () => optionalService(services.duneService),
+    getDuneCacheService: () => optionalService(services.duneCacheService),
+    getHourlyAggregationService: () => optionalService(services.hourlyAggregationService),
+    getTenMinuteVolumeFetcherService: () => optionalService(services.tenMinuteVolumeFetcherService),
+    getDailyAggregationService: () => optionalService(services.dailyAggregationService),
+    getMeteoraVolumeFetcherService: () => optionalService(services.meteoraVolumeFetcherService),
+    getExternalDatabaseService: () => optionalService(services.externalDatabaseService),
+
+    getSolanaService: () => requireService(services.solanaService, 'Solana'),
+    getLaunchpadService: () => requireService(services.launchpadService, 'Launchpad'),
+  };
 }

@@ -4,6 +4,7 @@ import type { ServiceGetters } from './types.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 import { sendAlert } from '../utils/alerts.js';
+import { config } from '../config.js';
 
 export function createCoinGeckoRouter(services: ServiceGetters): Router {
   const router = Router();
@@ -26,77 +27,102 @@ export function createCoinGeckoRouter(services: ServiceGetters): Router {
       
       const tokenToDaoMap = new Map<string, string>();
       for (const dao of allDaos) {
-        tokenToDaoMap.set(dao.baseMint.toString().toLowerCase(), dao.daoAddress.toString().toLowerCase());
+        tokenToDaoMap.set(dao.baseMint.toString(), dao.daoAddress.toString());
       }
       
-      let duneMetricsMap = new Map<string, { base_volume_24h: string; target_volume_24h: string; high_24h: string; low_24h: string }>();
+      let volumeMetricsMap = new Map<string, { base_volume_24h: string; target_volume_24h: string; high_24h: string; low_24h: string }>();
       let volumeSource = 'none';
-      
-      // Try TenMinuteVolumeFetcherService first
-      if (tenMinuteVolumeFetcherService?.isInitialized && tenMinuteVolumeFetcherService.isDatabaseConnected()) {
-        const baseMints = allDaos.map(dao => dao.baseMint.toString());
-        const tenMinMetrics = await tenMinuteVolumeFetcherService.getRolling24hMetrics(baseMints);
-        
-        if (tenMinMetrics.size > 0) {
-          for (const [tokenAddress, metrics] of tenMinMetrics.entries()) {
-            const daoAddress = tokenToDaoMap.get(tokenAddress.toLowerCase());
-            if (daoAddress) {
-              duneMetricsMap.set(daoAddress, {
-                base_volume_24h: String(metrics.base_volume_24h),
-                target_volume_24h: String(metrics.target_volume_24h),
-                high_24h: String(metrics.high_24h),
-                low_24h: String(metrics.low_24h),
-              });
+
+      if (!config.useDuneData) {
+        // USE_DUNE_DATA=false — source FutarchyAMM 24h volume from v0.6 indexer data
+        if (databaseService?.isAvailable()) {
+          const baseMints = allDaos.map(dao => dao.baseMint.toString());
+          const v06Metrics = await databaseService.getV06Rolling24hMetrics(baseMints);
+
+          if (v06Metrics.size > 0) {
+            for (const [tokenAddress, metrics] of v06Metrics.entries()) {
+              const daoAddress = tokenToDaoMap.get(tokenAddress);
+              if (daoAddress) {
+                volumeMetricsMap.set(daoAddress, {
+                  base_volume_24h: metrics.base_volume_24h,
+                  target_volume_24h: metrics.target_volume_24h,
+                  high_24h: metrics.high_24h,
+                  low_24h: metrics.low_24h,
+                });
+              }
             }
+            volumeSource = 'v06-indexer';
+            logger.debug('Using v0.6 indexer rolling 24h metrics', { daoCount: volumeMetricsMap.size, requestId: req.requestId });
           }
-          volumeSource = '10-minute';
-          logger.debug('Using 10-minute rolling 24h metrics', { daoCount: duneMetricsMap.size, requestId: req.requestId });
         }
-      }
-      
-      // Fall back to HourlyAggregationService
-      if (duneMetricsMap.size === 0 && hourlyAggregationService?.isInitialized && hourlyAggregationService.isDatabaseConnected()) {
-        const baseMints = allDaos.map(dao => dao.baseMint.toString());
-        const hourlyMetrics = await hourlyAggregationService.getRolling24hMetrics(baseMints);
-        
-        if (hourlyMetrics.size > 0) {
-          for (const [tokenAddress, metrics] of hourlyMetrics.entries()) {
-            const daoAddress = tokenToDaoMap.get(tokenAddress.toLowerCase());
-            if (daoAddress) {
-              duneMetricsMap.set(daoAddress, {
-                base_volume_24h: metrics.base_volume_24h,
-                target_volume_24h: metrics.target_volume_24h,
-                high_24h: metrics.high_24h,
-                low_24h: metrics.low_24h,
-              });
+      } else {
+        // USE_DUNE_DATA=true (default) — Dune pipeline: 10-min → hourly → cache
+        // Try TenMinuteVolumeFetcherService first
+        if (tenMinuteVolumeFetcherService?.isInitialized && tenMinuteVolumeFetcherService.isDatabaseConnected()) {
+          const baseMints = allDaos.map(dao => dao.baseMint.toString());
+          const tenMinMetrics = await tenMinuteVolumeFetcherService.getRolling24hMetrics(baseMints);
+
+          if (tenMinMetrics.size > 0) {
+            for (const [tokenAddress, metrics] of tenMinMetrics.entries()) {
+              const daoAddress = tokenToDaoMap.get(tokenAddress);
+              if (daoAddress) {
+                volumeMetricsMap.set(daoAddress, {
+                  base_volume_24h: String(metrics.base_volume_24h),
+                  target_volume_24h: String(metrics.target_volume_24h),
+                  high_24h: String(metrics.high_24h),
+                  low_24h: String(metrics.low_24h),
+                });
+              }
             }
+            volumeSource = '10-minute';
+            logger.debug('Using 10-minute rolling 24h metrics', { daoCount: volumeMetricsMap.size, requestId: req.requestId });
           }
-          volumeSource = 'hourly';
-          logger.debug('Using hourly rolling 24h metrics', { daoCount: duneMetricsMap.size, requestId: req.requestId });
+        }
+
+        // Fall back to HourlyAggregationService
+        if (volumeMetricsMap.size === 0 && hourlyAggregationService?.isInitialized && hourlyAggregationService.isDatabaseConnected()) {
+          const baseMints = allDaos.map(dao => dao.baseMint.toString());
+          const hourlyMetrics = await hourlyAggregationService.getRolling24hMetrics(baseMints);
+
+          if (hourlyMetrics.size > 0) {
+            for (const [tokenAddress, metrics] of hourlyMetrics.entries()) {
+              const daoAddress = tokenToDaoMap.get(tokenAddress);
+              if (daoAddress) {
+                volumeMetricsMap.set(daoAddress, {
+                  base_volume_24h: metrics.base_volume_24h,
+                  target_volume_24h: metrics.target_volume_24h,
+                  high_24h: metrics.high_24h,
+                  low_24h: metrics.low_24h,
+                });
+              }
+            }
+            volumeSource = 'hourly';
+            logger.debug('Using hourly rolling 24h metrics', { daoCount: volumeMetricsMap.size, requestId: req.requestId });
+          }
+        }
+
+        // Fall back to DuneCacheService
+        if (volumeMetricsMap.size === 0 && duneCacheService) {
+          const cachedMetrics = duneCacheService.getPoolMetrics();
+          if (cachedMetrics && cachedMetrics.size > 0) {
+            const cacheStatus = duneCacheService.getCacheStatus();
+            logger.debug('Using Dune cache metrics', { cacheAgeSeconds: Math.round(cacheStatus.cacheAgeMs / 1000), entryCount: cachedMetrics.size, requestId: req.requestId });
+            volumeMetricsMap = cachedMetrics;
+            volumeSource = 'dune-cache';
+          } else {
+            logger.warn('No cached metrics available yet', { requestId: req.requestId });
+          }
         }
       }
-      
-      // Fall back to DuneCacheService
-      if (duneMetricsMap.size === 0 && duneCacheService) {
-        const cachedMetrics = duneCacheService.getPoolMetrics();
-        if (cachedMetrics && cachedMetrics.size > 0) {
-          const cacheStatus = duneCacheService.getCacheStatus();
-          logger.debug('Using Dune cache metrics', { cacheAgeSeconds: Math.round(cacheStatus.cacheAgeMs / 1000), entryCount: cachedMetrics.size, requestId: req.requestId });
-          duneMetricsMap = cachedMetrics;
-          volumeSource = 'dune-cache';
-        } else {
-          logger.warn('No cached metrics available yet', { requestId: req.requestId });
-        }
-      }
-      
-      if (duneMetricsMap.size === 0) {
+
+      if (volumeMetricsMap.size === 0) {
         logger.warn('No volume metrics available', { requestId: req.requestId });
         sendAlert(
-          'No volume metrics available — all sources (10-min DB, hourly DB, Dune cache) returned empty',
+          'No volume metrics available — all sources returned empty',
           { cooldownKey: 'no-volume-data', cooldownMs: 10 * 60 * 1000 }
         );
       } else {
-        logger.debug('Volume source selected', { volumeSource, daoCount: duneMetricsMap.size, requestId: req.requestId });
+        logger.debug('Volume source selected', { volumeSource, daoCount: volumeMetricsMap.size, requestId: req.requestId });
       }
       
       const tickers: CoinGeckoTicker[] = [];
@@ -139,7 +165,7 @@ export function createCoinGeckoRouter(services: ServiceGetters): Router {
           
           if (!liquidityUsd) continue;
 
-          const duneMetrics = duneMetricsMap.get(poolId.toLowerCase());
+          const duneMetrics = volumeMetricsMap.get(poolId);
           let baseVolume: string;
           let targetVolume: string;
           let high24h: string | undefined;
@@ -181,7 +207,7 @@ export function createCoinGeckoRouter(services: ServiceGetters): Router {
           if (daoData.treasuryUsdcAum) ticker.treasury_usdc_aum = daoData.treasuryUsdcAum;
           if (daoData.treasuryVaultAddress) ticker.treasury_vault_address = daoData.treasuryVaultAddress;
 
-          const startDate = firstTradeDates.get(baseMint.toString().toLowerCase());
+          const startDate = firstTradeDates.get(baseMint.toString());
           if (startDate) ticker.startDate = startDate;
 
           tickers.push(ticker);
