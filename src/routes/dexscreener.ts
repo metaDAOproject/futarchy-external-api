@@ -190,6 +190,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
     }
 
     // Query swap events in the slot range (both inclusive)
+    // amm_base_amount / amm_quote_amount = post-swap pool reserves (nullable for older rows)
     const result = await extDb.query(
       `SELECT
          s.id,
@@ -200,7 +201,9 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
          s.user_addr,
          s.swap_type,
          s.input_amount,
-         s.output_amount
+         s.output_amount,
+         s.amm_base_amount,
+         s.amm_quote_amount
        FROM v0_6_spot_swaps s
        WHERE s.slot >= $1 AND s.slot <= $2
          AND s.input_amount > 0 AND s.output_amount > 0
@@ -238,6 +241,12 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       const inputAmount = Number(row.input_amount) / DECIMALIZE;
       const outputAmount = Number(row.output_amount) / DECIMALIZE;
 
+      // Post-swap reserves from the DB (may be null for older rows)
+      const hasReserves = row.amm_base_amount != null && row.amm_quote_amount != null;
+      const reserves = hasReserves
+        ? { asset0: Number(row.amm_base_amount) / DECIMALIZE, asset1: Number(row.amm_quote_amount) / DECIMALIZE }
+        : undefined;
+
       let priceNative: number;
       let event: DexScreenerSwapEvent;
 
@@ -258,6 +267,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
           asset1In: inputAmount,
           asset0Out: outputAmount,
           priceNative,
+          reserves,
         };
       } else {
         // Sell: user sends token (asset0), receives USDC (asset1)
@@ -276,6 +286,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
           asset0In: inputAmount,
           asset1Out: outputAmount,
           priceNative,
+          reserves,
         };
       }
 

@@ -14,6 +14,14 @@ export interface DexScreenerAsset {
   metadata?: Record<string, string>;
 }
 
+export interface DexScreenerPool {
+  id: string;
+  name: string;
+  assetIds: string[];
+  pairIds: string[];
+  metadata?: Record<string, string>;
+}
+
 export interface DexScreenerPair {
   id: string;
   dexKey: string;
@@ -22,8 +30,9 @@ export interface DexScreenerPair {
   createdAtBlockNumber?: number;
   createdAtBlockTimestamp?: number;
   createdAtTxnId?: string;
+  creator?: string;
   feeBps?: number;
-  pool?: string;
+  pool?: DexScreenerPool;
   metadata?: Record<string, string>;
 }
 
