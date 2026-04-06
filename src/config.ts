@@ -63,7 +63,7 @@ export const config = {
   },
   externalDatabase: {
     // Read-only connection to the external indexer DB (v0_6_* tables)
-    connectionString: process.env.EXTERNAL_DATABASE_URL || '',
+    connectionString: process.env.FRONTEND_READER_PG_URL || process.env.EXTERNAL_DATABASE_URL || '',
     ssl: process.env.EXTERNAL_DATABASE_SSL === 'true',
   },
 };
