@@ -12,7 +12,7 @@ import type {
   DexScreenerSwapEvent,
 } from '../types/dexscreener.js';
 
-const DEX_KEY = 'futarchy';
+const DEX_KEY = 'futarchyAMM';
 const FEE_BPS = Math.round(config.fees.protocolFeeRate * 10000); // 0.005 → 50
 const TOKEN_DECIMALS = 6; // All futarchy tokens + USDC use 6 decimals
 const DECIMALIZE = Math.pow(10, TOKEN_DECIMALS);
