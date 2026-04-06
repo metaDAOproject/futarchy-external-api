@@ -94,12 +94,12 @@ export class DuneCacheService {
           
           const tokenToDaoMap = new Map<string, string>();
           for (const dao of allDaos) {
-            tokenToDaoMap.set(dao.baseMint.toString().toLowerCase(), dao.daoAddress.toString().toLowerCase());
+            tokenToDaoMap.set(dao.baseMint.toString(), dao.daoAddress.toString());
           }
 
           const daoMetricsMap = new Map<string, DunePoolMetrics>();
           for (const [tokenAddress, metrics] of rolling24hMetrics.entries()) {
-            const daoAddress = tokenToDaoMap.get(tokenAddress.toLowerCase());
+            const daoAddress = tokenToDaoMap.get(tokenAddress);
             if (daoAddress) {
               daoMetricsMap.set(daoAddress, {
                 pool_id: daoAddress,

@@ -5,33 +5,9 @@ import { errorHandler, asyncHandler, AppError } from './middleware/errorHandler.
 import { metricsService } from './services/metricsService.js';
 import { config } from './config.js';
 import { createRoutes } from './routes/index.js';
-import type { ServiceGetters } from './routes/types.js';
+import { createServiceGetters, type Services } from './routes/types.js';
 
-import type { FutarchyService } from './services/futarchyService.js';
-import type { PriceService } from './services/priceService.js';
-import type { DuneService } from './services/duneService.js';
-import type { DuneCacheService } from './services/duneCacheService.js';
-import type { SolanaService } from './services/solanaService.js';
-import type { LaunchpadService } from './services/launchpadService.js';
-import type { DatabaseService } from './services/databaseService.js';
-import type { HourlyAggregationService } from './services/hourlyAggregationService.js';
-import type { TenMinuteVolumeFetcherService } from './services/tenMinuteVolumeFetcherService.js';
-import type { DailyAggregationService } from './services/dailyAggregationService.js';
-import type { MeteoraVolumeFetcherService } from './services/meteoraVolumeFetcherService.js';
-
-export interface Services {
-  futarchyService: FutarchyService;
-  priceService: PriceService;
-  databaseService: DatabaseService;
-  duneService?: DuneService | null;
-  duneCacheService?: DuneCacheService | null;
-  solanaService?: SolanaService;
-  launchpadService?: LaunchpadService;
-  hourlyAggregationService?: HourlyAggregationService | null;
-  tenMinuteVolumeFetcherService?: TenMinuteVolumeFetcherService | null;
-  dailyAggregationService?: DailyAggregationService | null;
-  meteoraVolumeFetcherService?: MeteoraVolumeFetcherService | null;
-}
+export type { Services } from './routes/types.js';
 
 export interface AppOptions {
   services: Services;
@@ -81,28 +57,6 @@ function createMetricsMiddleware() {
     });
 
     next();
-  };
-}
-
-function createServiceGetters(services: Services): ServiceGetters {
-  return {
-    getFutarchyService: () => services.futarchyService,
-    getPriceService: () => services.priceService,
-    getDuneService: () => services.duneService ?? null,
-    getDuneCacheService: () => services.duneCacheService ?? null,
-    getSolanaService: () => {
-      if (!services.solanaService) throw new AppError('Solana service not available', 503);
-      return services.solanaService;
-    },
-    getLaunchpadService: () => {
-      if (!services.launchpadService) throw new AppError('Launchpad service not available', 503);
-      return services.launchpadService;
-    },
-    getDatabaseService: () => services.databaseService,
-    getHourlyAggregationService: () => services.hourlyAggregationService ?? null,
-    getTenMinuteVolumeFetcherService: () => services.tenMinuteVolumeFetcherService ?? null,
-    getDailyAggregationService: () => services.dailyAggregationService ?? null,
-    getMeteoraVolumeFetcherService: () => services.meteoraVolumeFetcherService ?? null,
   };
 }
 

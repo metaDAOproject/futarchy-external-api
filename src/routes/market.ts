@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { parseDateParam, parseCommaSeparatedList } from '../utils/validation.js';
+import { config } from '../config.js';
 import type { ServiceGetters } from './types.js';
 
 export function createMarketRouter(services: ServiceGetters): Router {
@@ -7,6 +8,8 @@ export function createMarketRouter(services: ServiceGetters): Router {
   const { getDatabaseService } = services;
 
   // Get daily market data with date range and optional token filtering
+  // When USE_DUNE_DATA=false, sources from v0.6 indexer aggregate table;
+  // otherwise uses the Dune-sourced daily_volumes table.
   router.get('/api/market-data', async (req: Request, res: Response) => {
     const databaseService = getDatabaseService();
     
@@ -41,8 +44,12 @@ export function createMarketRouter(services: ServiceGetters): Router {
         endDate: endDateResult.value!,
       };
 
+      const useV06 = !config.useDuneData;
+
       const [futarchyData, meteoraData] = await Promise.all([
-        databaseService.getDailyBuySellVolumes(queryOptions),
+        useV06
+          ? databaseService.getDailyTradingActivity(queryOptions)
+          : databaseService.getDailyBuySellVolumes(queryOptions),
         databaseService.getDailyMeteoraVolumes(queryOptions),
       ]);
       
@@ -52,6 +59,7 @@ export function createMarketRouter(services: ServiceGetters): Router {
           startDate: startDateResult.value,
           endDate: endDateResult.value,
         },
+        source: useV06 ? 'v06-indexer' : 'dune',
         futarchyAMM: {
           count: futarchyData.length,
           data: futarchyData,
