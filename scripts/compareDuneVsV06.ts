@@ -9,6 +9,16 @@
  *   bun run scripts/compareDuneVsV06.ts --days 30
  *   bun run scripts/compareDuneVsV06.ts --days 30 --token META
  *   bun run scripts/compareDuneVsV06.ts --threshold 5           # flag rows with >5% delta (default: 1%)
+ *   bun run scripts/compareDuneVsV06.ts --basis total             # compare Dune to v06 total_* (spot+conditional; expect gaps)
+ *
+ * Basis:
+ *   spot (default) — Dune daily_volumes is spot-only; compared to v06 spot_* columns (apples to apples).
+ *   total          — compared to v06 total_*; divergences are normal when conditional volume exists.
+ *
+ * Units:
+ *   daily_volumes (Dune path) stores human-scale amounts (/ 1e6 in Dune SQL).
+ *   v06_fee_volume_* stores raw on-chain amounts (6 decimals). This script divides
+ *   v06 volumes and fee columns by 1e6 before comparing so the delta is meaningful.
  *
  * Required env:
  *   DATABASE_URL (or COINGECKO_PG_URL)
@@ -30,7 +40,7 @@ interface ComparisonRow {
   dune_trade_count: number;
   dune_usdc_fees: number;
   dune_token_fees_usdc: number;
-  // v06 aggregate (total columns = spot + conditional)
+  // v06 aggregate (spot_* or total_* depending on --basis)
   v06_buy_volume: number;
   v06_sell_volume: number;
   v06_base_volume: number;
@@ -60,6 +70,11 @@ interface DivergenceReport {
 
 // ---- main ----
 
+type CompareBasis = 'spot' | 'total';
+
+/** v0.6 indexer + reconciliation use raw token amounts (6 dp); Dune daily_volumes uses /1e6. */
+const V06_TO_HUMAN_DIVISOR = 1_000_000;
+
 async function main() {
   const { values } = parseArgs({
     options: {
@@ -67,6 +82,7 @@ async function main() {
       days:               { type: 'string',  short: 'd' },
       token:              { type: 'string',  short: 't' },
       threshold:          { type: 'string',  short: 'p' },
+      basis:              { type: 'string',  short: 'b' },
     },
     strict: false,
   });
@@ -82,11 +98,15 @@ async function main() {
 
   const thresholdPct = values.threshold ? Number(values.threshold) : 1;
   const tokenFilter = values.token as string | undefined;
+  const basisRaw = (values.basis as string | undefined)?.toLowerCase();
+  const basis: CompareBasis = basisRaw === 'total' ? 'total' : 'spot';
 
   console.log('🔍 Dune vs v06 Comparison');
   console.log(`   Since:      ${since.toISOString().slice(0, 10)}`);
   console.log(`   Token:      ${tokenFilter || 'all'}`);
   console.log(`   Threshold:  ${thresholdPct}%`);
+  console.log(`   Basis:      ${basis} (v06 ${basis === 'spot' ? 'spot_* ↔ Dune spot-only' : 'total_* includes conditional — gaps vs Dune expected'})`);
+  console.log(`   v06 scale:  volumes/fees ÷ ${V06_TO_HUMAN_DIVISOR} (raw 6dp → match Dune)`);
   console.log('');
 
   // ---- connect ----
@@ -101,7 +121,7 @@ async function main() {
 
   try {
     // ---- run comparison query ----
-    const rows = await runComparison(db, since, tokenFilter);
+    const rows = await runComparison(db, since, tokenFilter, basis);
     const divergences = findDivergences(rows, thresholdPct);
 
     printSummary(rows, divergences, thresholdPct);
@@ -117,14 +137,34 @@ async function main() {
 async function runComparison(
   db: any,
   since: Date,
-  tokenFilter?: string,
+  tokenFilter: string | undefined,
+  basis: CompareBasis,
 ): Promise<ComparisonRow[]> {
   const params: any[] = [since.toISOString().slice(0, 10)];
-  let tokenClause = '';
   if (tokenFilter) {
-    tokenClause = `AND LOWER(d.token) = LOWER($2) AND LOWER(v.token) = LOWER($2)`;
     params.push(tokenFilter);
   }
+
+  const v06Cols =
+    basis === 'total'
+      ? {
+          buy: 'v.total_buy_volume',
+          sell: 'v.total_sell_volume',
+          base: 'v.total_base_volume',
+          target: 'v.total_target_volume',
+          trades: 'v.total_trade_count',
+          usdc: 'v.total_usdc_fees',
+          tokUsdc: 'v.total_token_fees_usdc',
+        }
+      : {
+          buy: 'v.spot_buy_volume',
+          sell: 'v.spot_sell_volume',
+          base: 'v.spot_base_volume',
+          target: 'v.spot_target_volume',
+          trades: 'v.spot_trade_count',
+          usdc: 'v.spot_usdc_fees',
+          tokUsdc: 'v.spot_token_fees_usdc',
+        };
 
   // Use a FULL OUTER JOIN so we see rows present in one table but not the other
   const sql = `
@@ -139,16 +179,16 @@ async function runComparison(
       COALESCE(d.trade_count, 0)::int           AS dune_trade_count,
       COALESCE(d.usdc_fees, 0)::float8          AS dune_usdc_fees,
       COALESCE(d.token_fees_usdc, 0)::float8    AS dune_token_fees_usdc,
-      -- v06
-      COALESCE(v.total_buy_volume, 0)::float8   AS v06_buy_volume,
-      COALESCE(v.total_sell_volume, 0)::float8   AS v06_sell_volume,
-      COALESCE(v.total_base_volume, 0)::float8   AS v06_base_volume,
-      COALESCE(v.total_target_volume, 0)::float8 AS v06_target_volume,
-      COALESCE(v.total_trade_count, 0)::int      AS v06_trade_count,
-      COALESCE(v.total_usdc_fees, 0)::float8     AS v06_usdc_fees,
-      COALESCE(v.total_token_fees_usdc, 0)::float8 AS v06_token_fees_usdc,
-      -- flags
-      (v.conditional_buy_volume IS NOT NULL)     AS has_conditional_volume,
+      -- v06 (${basis}) — divide by ${V06_TO_HUMAN_DIVISOR} so amounts match Dune human scale
+      (COALESCE(${v06Cols.buy}, 0)::numeric / ${V06_TO_HUMAN_DIVISOR})::float8   AS v06_buy_volume,
+      (COALESCE(${v06Cols.sell}, 0)::numeric / ${V06_TO_HUMAN_DIVISOR})::float8   AS v06_sell_volume,
+      (COALESCE(${v06Cols.base}, 0)::numeric / ${V06_TO_HUMAN_DIVISOR})::float8   AS v06_base_volume,
+      (COALESCE(${v06Cols.target}, 0)::numeric / ${V06_TO_HUMAN_DIVISOR})::float8 AS v06_target_volume,
+      COALESCE(${v06Cols.trades}, 0)::int      AS v06_trade_count,
+      (COALESCE(${v06Cols.usdc}, 0)::numeric / ${V06_TO_HUMAN_DIVISOR})::float8     AS v06_usdc_fees,
+      (COALESCE(${v06Cols.tokUsdc}, 0)::numeric / ${V06_TO_HUMAN_DIVISOR})::float8 AS v06_token_fees_usdc,
+      -- flags (non-zero conditional activity on this token-day)
+      (COALESCE(v.conditional_trade_count, 0) > 0) AS has_conditional_volume,
       COALESCE(v.conditional_reconciled, false)  AS conditional_reconciled,
       (d.token IS NOT NULL)                      AS in_dune,
       (v.token IS NOT NULL)                      AS in_v06
