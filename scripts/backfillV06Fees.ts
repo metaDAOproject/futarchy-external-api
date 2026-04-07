@@ -8,6 +8,9 @@
  *   bun run scripts/backfillV06Fees.ts --since 2025-06-01
  *   bun run scripts/backfillV06Fees.ts --days 90
  *   bun run scripts/backfillV06Fees.ts --chunk-days 30
+ *
+ * Spot and conditional fee queries run in parallel against the indexer,
+ * then the aggregate step runs once.
  */
 
 import { parseArgs } from 'util';

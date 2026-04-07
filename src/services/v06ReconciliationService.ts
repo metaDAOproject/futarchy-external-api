@@ -82,9 +82,12 @@ export class V06ReconciliationService {
     logger.info(`[V06Reconciliation] Starting reconciliation cycle (since ${sinceISO} until ${untilISO})`);
 
     await this.reconcileSpotOhlcv1m(sinceISO, untilISO);
-    await this.reconcileSpotOhlcv1d(windowStart);
-    await this.reconcileFeeDailySpot(sinceISO, untilISO);
-    await this.reconcileFeeDailyConditional(sinceISO, untilISO);
+    // 1d rollup (app DB) and fee aggregates (indexer → app DB) are independent — run in parallel.
+    await Promise.all([
+      this.reconcileSpotOhlcv1d(windowStart),
+      this.reconcileFeeDailySpot(sinceISO, untilISO),
+      this.reconcileFeeDailyConditional(sinceISO, untilISO),
+    ]);
     await this.reconcileFeeDailyAggregate(windowStart);
 
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
@@ -99,8 +102,10 @@ export class V06ReconciliationService {
     const untilISO = windowEnd.toISOString();
     logger.info(`[V06Reconciliation] Starting fee-only reconciliation (since ${sinceISO} until ${untilISO})`);
 
-    await this.reconcileFeeDailySpot(sinceISO, untilISO);
-    await this.reconcileFeeDailyConditional(sinceISO, untilISO);
+    await Promise.all([
+      this.reconcileFeeDailySpot(sinceISO, untilISO),
+      this.reconcileFeeDailyConditional(sinceISO, untilISO),
+    ]);
     await this.reconcileFeeDailyAggregate(windowStart);
 
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
@@ -338,7 +343,7 @@ export class V06ReconciliationService {
           const offset = idx * 8;
           // #11: Pass raw volumes + fee rate; compute fees in SQL as NUMERIC arithmetic
           placeholders.push(
-            `($${offset + 1}, $${offset + 2}, $${offset + 3}::numeric, $${offset + 4}::numeric, $${offset + 5}::numeric, $${offset + 6}::numeric, $${offset + 7}, $${offset + 8}::numeric)`
+            `($${offset + 1}, $${offset + 2}::date, $${offset + 3}::numeric, $${offset + 4}::numeric, $${offset + 5}::numeric, $${offset + 6}::numeric, $${offset + 7}::int, $${offset + 8}::numeric)`
           );
           values.push(
             r.token, dateStr,
@@ -498,7 +503,7 @@ export class V06ReconciliationService {
         batch.forEach((entry, idx) => {
           const offset = idx * 10;
           placeholders.push(
-            `($${offset + 1}, $${offset + 2}, $${offset + 3}::numeric, $${offset + 4}::numeric, $${offset + 5}::numeric, $${offset + 6}::numeric, $${offset + 7}, $${offset + 8}::numeric, $${offset + 9}, $${offset + 10})`
+            `($${offset + 1}, $${offset + 2}::date, $${offset + 3}::numeric, $${offset + 4}::numeric, $${offset + 5}::numeric, $${offset + 6}::numeric, $${offset + 7}::int, $${offset + 8}::numeric, $${offset + 9}::boolean, $${offset + 10}::int)`
           );
           values.push(
             entry.token, entry.date,
@@ -549,7 +554,7 @@ export class V06ReconciliationService {
 
         batch.forEach((entry, idx) => {
           const offset = idx * 3;
-          placeholders.push(`($${offset + 1}, $${offset + 2}, $${offset + 3})`);
+          placeholders.push(`($${offset + 1}, $${offset + 2}::date, $${offset + 3}::int)`);
           values.push(entry.token, entry.date, entry.pending);
         });
 

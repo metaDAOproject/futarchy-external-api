@@ -8,9 +8,13 @@
  *   bun run scripts/backfillV06.ts --since 2025-06-01
  *   bun run scripts/backfillV06.ts --days 90          # last 90 days
  *
- * For large ranges the queries run against the indexer in a single pass
- * (same SQL the hourly reconciliation uses). On very large datasets you
- * may want to chunk — see --chunk-days.
+ * Speed tips:
+ *   - Only need fee / aggregate tables? Use `bun run scripts/backfillV06Fees.ts`
+ *     (skips OHLCV 1m/1d — usually much faster).
+ *   - After 1m, reconciliation runs daily rollup + spot fees + conditional fees
+ *     in parallel on the app DB / indexer pools.
+ *   - For huge date ranges, `--chunk-days` avoids one enormous indexer scan
+ *     (can help with memory/timeouts; total work is similar).
  *
  * Required env:
  *   DATABASE_URL            (or COINGECKO_PG_URL) — app DB (read-write)
