@@ -15,14 +15,14 @@ const FEE_RATE = config.fees.protocolFeeRate; // 0.005 = 0.5%
  * Pipeline:
  *   1. Spot OHLCV 1m  — scan v0_6_spot_swaps JOIN v0_6_daos
  *   2. Spot OHLCV 1d  — rollup from 1m data
- *   3. Fee volume daily spot — aggregate spot swaps by calendar day
- *   4. Fee volume daily conditional — winning-market-only swaps
+ *   3–4. Fee volume daily spot / conditional — aggregate by calendar day (when until defaults
+ *        to now, two windows: completed UTC days then partial “today” to avoid mid-day truncation)
  *   5. Fee volume daily aggregate — spot + conditional totals
  */
 export class V06ReconciliationService {
   private scheduledTask: ScheduledTask | null = null;
   private static readonly RECONCILIATION_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
-  private static readonly LOOKBACK_HOURS = 26; // re-touch recent window to catch late state changes
+  private static readonly LOOKBACK_HOURS = 72; // re-touch recent window to catch late state changes
 
   constructor(
     private readonly appDb: DatabaseService,
@@ -70,6 +70,10 @@ export class V06ReconciliationService {
    * @param since  Override the lookback window start (for backfills).
    *               Defaults to LOOKBACK_HOURS ago.
    * @param until  Upper bound for the window (exclusive). Defaults to now.
+   *                When omitted, fee daily spot/conditional use a two-pass window: completed
+   *                UTC days [since, startOfUtcDay(now)) then today [startOfUtcDay(now), now),
+   *                so completed days are not overwritten with partial same-day aggregates.
+   *                When set (e.g. chunked backfill), fees use a single [since, until) interval.
    */
   async reconcile(since?: Date, until?: Date): Promise<void> {
     const start = Date.now();
@@ -82,11 +86,19 @@ export class V06ReconciliationService {
     logger.info(`[V06Reconciliation] Starting reconciliation cycle (since ${sinceISO} until ${untilISO})`);
 
     await this.reconcileSpotOhlcv1m(sinceISO, untilISO);
-    // 1d rollup (app DB) and fee aggregates (indexer → app DB) are independent — run in parallel.
+    const feeWindows = this.feeDailyTimeWindows(
+      sinceISO,
+      untilISO,
+      windowStart,
+      windowEnd,
+      until === undefined,
+    );
+    // 1d rollup (app DB) and fee spot / conditional (indexer → app DB) are independent — run in parallel.
+    // Each fee stream applies the same UTC day split windows sequentially on its own table.
     await Promise.all([
       this.reconcileSpotOhlcv1d(windowStart),
-      this.reconcileFeeDailySpot(sinceISO, untilISO),
-      this.reconcileFeeDailyConditional(sinceISO, untilISO),
+      this.runFeeDailySpotWindows(feeWindows),
+      this.runFeeDailyConditionalWindows(feeWindows),
     ]);
     await this.reconcileFeeDailyAggregate(windowStart);
 
@@ -102,14 +114,83 @@ export class V06ReconciliationService {
     const untilISO = windowEnd.toISOString();
     logger.info(`[V06Reconciliation] Starting fee-only reconciliation (since ${sinceISO} until ${untilISO})`);
 
+    const feeWindows = this.feeDailyTimeWindows(
+      sinceISO,
+      untilISO,
+      windowStart,
+      windowEnd,
+      until === undefined,
+    );
     await Promise.all([
-      this.reconcileFeeDailySpot(sinceISO, untilISO),
-      this.reconcileFeeDailyConditional(sinceISO, untilISO),
+      this.runFeeDailySpotWindows(feeWindows),
+      this.runFeeDailyConditionalWindows(feeWindows),
     ]);
     await this.reconcileFeeDailyAggregate(windowStart);
 
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
     logger.info(`[V06Reconciliation] Fee-only cycle complete in ${elapsed}s`);
+  }
+
+  /** Start of the UTC calendar day containing `d` (00:00:00.000 UTC). */
+  private static startOfUtcDay(d: Date): Date {
+    const t = new Date(d.getTime());
+    t.setUTCHours(0, 0, 0, 0);
+    return t;
+  }
+
+  /** One or two time bounds for fee daily upserts (completed UTC days vs current day when splitting). */
+  private feeDailyTimeWindows(
+    sinceISO: string,
+    untilISO: string,
+    windowStart: Date,
+    windowEnd: Date,
+    splitAtUtcDay: boolean,
+  ): { since: string; until: string; logLabel: string }[] {
+    if (!splitAtUtcDay) {
+      return [
+        {
+          since: sinceISO,
+          until: untilISO,
+          logLabel: `fee window [${sinceISO}, ${untilISO})`,
+        },
+      ];
+    }
+
+    const untilComplete = V06ReconciliationService.startOfUtcDay(windowEnd);
+    const untilCompleteISO = untilComplete.toISOString();
+    const out: { since: string; until: string; logLabel: string }[] = [];
+
+    if (windowStart.getTime() < untilComplete.getTime()) {
+      out.push({
+        since: sinceISO,
+        until: untilCompleteISO,
+        logLabel: `completed UTC days [${sinceISO}, ${untilCompleteISO})`,
+      });
+    }
+
+    out.push({
+      since: untilCompleteISO,
+      until: untilISO,
+      logLabel: `current UTC day [${untilCompleteISO}, ${untilISO})`,
+    });
+
+    return out;
+  }
+
+  private async runFeeDailySpotWindows(windows: { since: string; until: string; logLabel: string }[]): Promise<void> {
+    for (const w of windows) {
+      logger.info(`[V06Reconciliation] Fee daily spot: ${w.logLabel}`);
+      await this.reconcileFeeDailySpot(w.since, w.until);
+    }
+  }
+
+  private async runFeeDailyConditionalWindows(
+    windows: { since: string; until: string; logLabel: string }[],
+  ): Promise<void> {
+    for (const w of windows) {
+      logger.info(`[V06Reconciliation] Fee daily conditional: ${w.logLabel}`);
+      await this.reconcileFeeDailyConditional(w.since, w.until);
+    }
   }
 
   // ------------------------------------------------------------------
