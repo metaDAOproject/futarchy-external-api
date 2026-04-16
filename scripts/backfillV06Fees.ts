@@ -4,6 +4,7 @@
  * (spot, conditional, aggregate) without touching OHLCV data.
  *
  * Usage:
+ *   bun run scripts/backfillV06Fees.ts --from-oldest --chunk-days 30
  *   bun run scripts/backfillV06Fees.ts                   # default since 2025-01-01
  *   bun run scripts/backfillV06Fees.ts --since 2025-06-01
  *   bun run scripts/backfillV06Fees.ts --days 90
@@ -11,22 +12,49 @@
  *
  * Spot and conditional fee queries run in parallel against the indexer,
  * then the aggregate step runs once.
+ *
+ * Chunk boundaries use UTC midnight (see backfillV06.ts) so daily upserts are full days.
  */
 
 import { parseArgs } from 'util';
 
+function startOfUtcDay(d: Date): Date {
+  const x = new Date(d);
+  x.setUTCHours(0, 0, 0, 0);
+  return x;
+}
+
+function addUtcDays(d: Date, n: number): Date {
+  const x = new Date(d);
+  x.setUTCDate(x.getUTCDate() + n);
+  return x;
+}
+
 async function main() {
   const { values } = parseArgs({
+    args: process.argv.slice(2),
     options: {
-      since:        { type: 'string',  short: 's' },
-      days:         { type: 'string',  short: 'd' },
-      'chunk-days': { type: 'string',  short: 'c' },
+      since: { type: 'string', short: 's' },
+      days: { type: 'string', short: 'd' },
+      'chunk-days': { type: 'string', short: 'c' },
+      'from-oldest': { type: 'boolean', short: 'o', default: false },
     },
     strict: false,
   });
 
+  const fromOldest = values['from-oldest'] === true;
+  const hasSince = Boolean(values.since);
+  const hasDays = Boolean(values.days);
+
+  if (fromOldest && (hasSince || hasDays)) {
+    console.error('❌ Use only one of: --from-oldest  OR  --since / --days');
+    process.exit(1);
+  }
+
   let since: Date;
-  if (values.since) {
+  if (fromOldest) {
+    since = new Date(0);
+  } else if (values.since) {
     since = new Date(values.since as string);
   } else if (values.days) {
     since = new Date(Date.now() - Number(values.days) * 86_400_000);
@@ -36,8 +64,10 @@ async function main() {
 
   const chunkDays = values['chunk-days'] ? Number(values['chunk-days']) : 0;
 
-  console.log('🚀 v0.6 Fee-only Backfill');
-  console.log(`   Since:      ${since.toISOString()}`);
+  console.log('🚀 v0.6 Fee-only Backfill (spot + conditional + aggregate)');
+  if (!fromOldest) {
+    console.log(`   Since:      ${since.toISOString()}`);
+  }
   console.log(`   Chunk days: ${chunkDays || 'none (single pass)'}`);
   console.log('');
 
@@ -45,8 +75,8 @@ async function main() {
     console.error('❌ DATABASE_URL (or COINGECKO_PG_URL) is required');
     process.exit(1);
   }
-  if (!process.env.EXTERNAL_DATABASE_URL) {
-    console.error('❌ EXTERNAL_DATABASE_URL is required');
+  if (!process.env.EXTERNAL_DATABASE_URL && !process.env.FRONTEND_READER_PG_URL) {
+    console.error('❌ EXTERNAL_DATABASE_URL or FRONTEND_READER_PG_URL is required');
     process.exit(1);
   }
 
@@ -65,22 +95,44 @@ async function main() {
   if (!extOk) { console.error('❌ Failed to connect to external DB'); await appDb.close(); process.exit(1); }
   console.log('✅ External DB connected');
 
+  if (fromOldest) {
+    console.log('📍 Resolving earliest reconcilable swap timestamp in external DB...');
+    const minEpoch = await extDb.getEarliestReconcilableSwapUnixTimestamp();
+    if (minEpoch === null) {
+      console.error('❌ No reconcilable rows found in external DB.');
+      await extDb.close();
+      await appDb.close();
+      process.exit(1);
+    }
+    since = new Date(minEpoch * 1000);
+    console.log(`   Earliest unix_timestamp: ${minEpoch} → ${since.toISOString()}`);
+    since = startOfUtcDay(since);
+    console.log(`   Aligned to UTC day start: ${since.toISOString()}`);
+    const spanDays = (Date.now() - since.getTime()) / 86_400_000;
+    if (spanDays > 120 && chunkDays <= 0) {
+      console.warn(
+        `⚠️  Range is ~${Math.round(spanDays)} days without --chunk-days. Consider --chunk-days 30.`,
+      );
+    }
+  }
+
   const reconciler = new V06ReconciliationService(appDb, extDb);
 
   try {
     const totalStart = Date.now();
 
     if (chunkDays > 0) {
-      const chunkMs = chunkDays * 86_400_000;
-      let cursor = new Date(since);
+      let cursor = startOfUtcDay(since);
       const now = new Date();
-      const totalChunks = Math.ceil((now.getTime() - cursor.getTime()) / chunkMs);
+      const msPerChunk = chunkDays * 86_400_000;
+      const totalChunks = Math.max(1, Math.ceil((now.getTime() - cursor.getTime()) / msPerChunk));
       let chunkNum = 0;
 
       while (cursor < now) {
         chunkNum++;
         const chunkStart = Date.now();
-        const chunkEnd = new Date(Math.min(cursor.getTime() + chunkMs, now.getTime()));
+        const nextBoundary = addUtcDays(cursor, chunkDays);
+        const chunkEnd = new Date(Math.min(nextBoundary.getTime(), now.getTime()));
         console.log(`\n📦 Chunk ${chunkNum}/${totalChunks}: ${cursor.toISOString()} → ${chunkEnd.toISOString()}`);
         await reconciler.reconcileFeesOnly(cursor, chunkEnd);
         cursor = chunkEnd;

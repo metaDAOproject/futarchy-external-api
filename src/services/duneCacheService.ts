@@ -24,8 +24,9 @@ export class DuneCacheService {
     this.databaseService = databaseService;
     this.futarchyService = futarchyService;
     
-    // Default to 1 hour refresh interval, configurable via environment
-    this.refreshIntervalMs = parseInt(process.env.DUNE_CACHE_REFRESH_INTERVAL || '3600') * 1000;
+    // Fallback pool metrics are read from DB (rolling 24h SQL), not Dune API — keep this fresh.
+    // Default 2 minutes; override with DUNE_CACHE_REFRESH_INTERVAL (seconds).
+    this.refreshIntervalMs = parseInt(process.env.DUNE_CACHE_REFRESH_INTERVAL || '120') * 1000;
     
     // Initialize empty cache
     this.cache = {

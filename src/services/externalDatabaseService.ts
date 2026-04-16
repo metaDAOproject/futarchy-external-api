@@ -55,6 +55,31 @@ export class ExternalDatabaseService {
     return this.pool.query(text, params);
   }
 
+  /**
+   * Earliest unix_timestamp (seconds) that the v0.6 reconciliation pipeline can import:
+   * spot swaps joined to DAOs, and conditional swaps joined through proposals to DAOs.
+   * Used by backfill scripts to start from true historical beginning instead of a fixed date.
+   */
+  async getEarliestReconcilableSwapUnixTimestamp(): Promise<number | null> {
+    const result = await this.query(`
+      SELECT MIN(ts) AS min_ts
+      FROM (
+        SELECT s.unix_timestamp AS ts
+        FROM v0_6_spot_swaps s
+        INNER JOIN v0_6_daos d ON d.dao_addr = s.dao_addr
+        UNION ALL
+        SELECT c.unix_timestamp AS ts
+        FROM v0_6_conditional_swaps c
+        INNER JOIN v0_6_proposals p ON p.proposal_addr = c.proposal_addr
+        INNER JOIN v0_6_daos d ON d.dao_addr = p.dao_addr
+      ) u
+    `);
+    const raw = result.rows[0]?.min_ts;
+    if (raw === null || raw === undefined) return null;
+    const n = typeof raw === 'string' ? parseInt(raw, 10) : Math.trunc(Number(raw));
+    return Number.isFinite(n) ? n : null;
+  }
+
   async close(): Promise<void> {
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);

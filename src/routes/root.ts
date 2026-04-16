@@ -44,8 +44,9 @@ export function createRootRouter(services: ServiceGetters): Router {
         meteoraLpLiquidity: 'Tokens in the external Meteora DAMM pool (POL) - IS circulating',
       },
       caching: {
-        description: 'Dune data is cached and refreshed hourly to improve response times',
-        refreshInterval: `${parseInt(process.env.DUNE_CACHE_REFRESH_INTERVAL || '3600')} seconds`,
+        description:
+          'Background snapshot of rolling 24h volume (DB query) used only when live /api/tickers sources (10m hourly, v0.6 1m) are unavailable. /api/tickers normally reads the database per request.',
+        refreshInterval: `${parseInt(process.env.DUNE_CACHE_REFRESH_INTERVAL || '120')} seconds`,
         fetchTimeout: `${parseInt(process.env.DUNE_FETCH_TIMEOUT || '240')} seconds`,
         status: cacheStatus ? {
           isInitialized: cacheStatus.isInitialized,

@@ -18,16 +18,26 @@ const FEE_RATE = config.fees.protocolFeeRate; // 0.005 = 0.5%
  *   3. Fee volume daily spot — aggregate spot swaps by calendar day
  *   4. Fee volume daily conditional — winning-market-only swaps
  *   5. Fee volume daily aggregate — spot + conditional totals
+ *
+ * Window start is normalized to UTC midnight so daily fee upserts never replace a full calendar
+ * day with a partial sum (which happened when backfill chunks or --from-oldest began mid-day).
  */
 export class V06ReconciliationService {
   private scheduledTask: ScheduledTask | null = null;
   private static readonly RECONCILIATION_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
-  private static readonly LOOKBACK_HOURS = 26; // re-touch recent window to catch late state changes
+  private static readonly LOOKBACK_HOURS = 72; // re-touch recent window to catch late state changes
 
   constructor(
     private readonly appDb: DatabaseService,
     private readonly extDb: ExternalDatabaseService,
   ) {}
+
+  /** Start of the UTC calendar day containing `d` (used for fee daily boundaries). */
+  private startOfUtcDay(d: Date): Date {
+    const x = new Date(d);
+    x.setUTCHours(0, 0, 0, 0);
+    return x;
+  }
 
   start(): void {
     if (!this.extDb.isAvailable()) {
@@ -73,8 +83,13 @@ export class V06ReconciliationService {
    */
   async reconcile(since?: Date, until?: Date): Promise<void> {
     const start = Date.now();
-    const windowStart = since ?? new Date(Date.now() - V06ReconciliationService.LOOKBACK_HOURS * 3600_000);
+    let windowStart = since ?? new Date(Date.now() - V06ReconciliationService.LOOKBACK_HOURS * 3600_000);
     const windowEnd = until ?? new Date();
+    const rawStart = windowStart;
+    windowStart = this.startOfUtcDay(windowStart);
+    if (rawStart.getTime() !== windowStart.getTime()) {
+      logger.info(`[V06Reconciliation] Normalized window start to UTC midnight: ${windowStart.toISOString()}`);
+    }
     // Pass ISO strings to sub-methods so the pg driver never calls Date.toString()
     // (which can produce un-parseable timezone names like "GMT-0700" under Bun).
     const sinceISO = windowStart.toISOString();
@@ -96,8 +111,13 @@ export class V06ReconciliationService {
 
   async reconcileFeesOnly(since?: Date, until?: Date): Promise<void> {
     const start = Date.now();
-    const windowStart = since ?? new Date(Date.now() - V06ReconciliationService.LOOKBACK_HOURS * 3600_000);
+    let windowStart = since ?? new Date(Date.now() - V06ReconciliationService.LOOKBACK_HOURS * 3600_000);
     const windowEnd = until ?? new Date();
+    const rawStart = windowStart;
+    windowStart = this.startOfUtcDay(windowStart);
+    if (rawStart.getTime() !== windowStart.getTime()) {
+      logger.info(`[V06Reconciliation] Normalized fee window start to UTC midnight: ${windowStart.toISOString()}`);
+    }
     const sinceISO = windowStart.toISOString();
     const untilISO = windowEnd.toISOString();
     logger.info(`[V06Reconciliation] Starting fee-only reconciliation (since ${sinceISO} until ${untilISO})`);
@@ -592,6 +612,8 @@ export class V06ReconciliationService {
     const dayStart = new Date(since);
     dayStart.setUTCHours(0, 0, 0, 0);
 
+    // FULL OUTER JOIN ensures every (token, date) present in either spot or conditional
+    // gets a row; totals use COALESCE for spot-only or conditional-only days.
     await pool.query(`
       INSERT INTO v06_fee_volume_daily_aggregate
         (token, date,
