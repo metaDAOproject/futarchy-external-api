@@ -22,7 +22,10 @@ const FEE_RATE = config.fees.protocolFeeRate; // 0.005 = 0.5%
 export class V06ReconciliationService {
   private scheduledTask: ScheduledTask | null = null;
   private static readonly RECONCILIATION_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
-  private static readonly LOOKBACK_HOURS = 26; // re-touch recent window to catch late state changes
+  // Window must start at a UTC day boundary — fee queries GROUP BY UTC day and a mid-day start
+  // would upsert partial-day sums over complete rows. Must also be > proposal voting period (3d)
+  // so that conditional swaps get re-reconciled after their proposal resolves.
+  private static readonly LOOKBACK_DAYS = 4;
 
   constructor(
     private readonly appDb: DatabaseService,
@@ -65,15 +68,34 @@ export class V06ReconciliationService {
   // Top-level reconciliation
   // ------------------------------------------------------------------
 
+  private static startOfUtcDay(d: Date): Date {
+    const t = new Date(d.getTime());
+    t.setUTCHours(0, 0, 0, 0);
+    return t;
+  }
+
+  private static defaultWindowStart(): Date {
+    const floor = V06ReconciliationService.startOfUtcDay(new Date());
+    floor.setUTCDate(floor.getUTCDate() - V06ReconciliationService.LOOKBACK_DAYS);
+    return floor;
+  }
+
+  // Always floors to UTC midnight — a caller-supplied mid-day `since` would reintroduce the
+  // partial-day overwrite bug.
+  private static resolveWindowStart(since?: Date): Date {
+    return since
+      ? V06ReconciliationService.startOfUtcDay(since)
+      : V06ReconciliationService.defaultWindowStart();
+  }
+
   /**
    * Run the full reconciliation pipeline.
-   * @param since  Override the lookback window start (for backfills).
-   *               Defaults to LOOKBACK_HOURS ago.
-   * @param until  Upper bound for the window (exclusive). Defaults to now.
+   * @param since  Lookback window start (floored to UTC midnight). Defaults to LOOKBACK_DAYS ago.
+   * @param until  Window upper bound (exclusive). Defaults to now.
    */
   async reconcile(since?: Date, until?: Date): Promise<void> {
     const start = Date.now();
-    const windowStart = since ?? new Date(Date.now() - V06ReconciliationService.LOOKBACK_HOURS * 3600_000);
+    const windowStart = V06ReconciliationService.resolveWindowStart(since);
     const windowEnd = until ?? new Date();
     // Pass ISO strings to sub-methods so the pg driver never calls Date.toString()
     // (which can produce un-parseable timezone names like "GMT-0700" under Bun).
@@ -96,7 +118,7 @@ export class V06ReconciliationService {
 
   async reconcileFeesOnly(since?: Date, until?: Date): Promise<void> {
     const start = Date.now();
-    const windowStart = since ?? new Date(Date.now() - V06ReconciliationService.LOOKBACK_HOURS * 3600_000);
+    const windowStart = V06ReconciliationService.resolveWindowStart(since);
     const windowEnd = until ?? new Date();
     const sinceISO = windowStart.toISOString();
     const untilISO = windowEnd.toISOString();
@@ -299,10 +321,11 @@ export class V06ReconciliationService {
     const untilEpoch = Math.floor(new Date(until).getTime() / 1000);
 
     logger.info('[V06Reconciliation] Fee daily spot: querying...');
+    // `AT TIME ZONE 'UTC'` keeps bucketing independent of pg session timezone.
     const rows = await this.extDb.query(`
       SELECT
-        d.base_mint_acct                               AS token,
-        date_trunc('day', to_timestamp(s.unix_timestamp))::date AS swap_date,
+        d.base_mint_acct                                     AS token,
+        (to_timestamp(s.unix_timestamp) AT TIME ZONE 'UTC')::date AS swap_date,
         SUM(CASE WHEN LOWER(TRIM(s.swap_type)) = 'buy' THEN s.input_amount::numeric  ELSE 0 END) AS buy_volume,
         SUM(CASE WHEN LOWER(TRIM(s.swap_type)) = 'sell' THEN s.input_amount::numeric ELSE 0 END) AS sell_volume,
         SUM(CASE WHEN LOWER(TRIM(s.swap_type)) = 'buy' THEN s.output_amount::numeric ELSE s.input_amount::numeric END) AS base_volume,
@@ -315,7 +338,7 @@ export class V06ReconciliationService {
         AND s.unix_timestamp < $2
         AND s.input_amount > 0 AND s.output_amount > 0
         AND LOWER(TRIM(s.swap_type)) IN ('buy', 'sell')
-      GROUP BY d.base_mint_acct, date_trunc('day', to_timestamp(s.unix_timestamp))::date
+      GROUP BY d.base_mint_acct, (to_timestamp(s.unix_timestamp) AT TIME ZONE 'UTC')::date
     `, [sinceEpoch, untilEpoch]);
 
     if (rows.rows.length === 0) {
@@ -409,7 +432,7 @@ export class V06ReconciliationService {
     const rows = await this.extDb.query(`
       SELECT
         d.base_mint_acct                                             AS token,
-        date_trunc('day', to_timestamp(c.unix_timestamp))::date      AS swap_date,
+        (to_timestamp(c.unix_timestamp) AT TIME ZONE 'UTC')::date    AS swap_date,
         SUM(CASE WHEN LOWER(TRIM(c.swap_type)) = 'buy' THEN c.input_amount::numeric  ELSE 0 END) AS buy_volume,
         SUM(CASE WHEN LOWER(TRIM(c.swap_type)) = 'sell' THEN c.input_amount::numeric ELSE 0 END) AS sell_volume,
         SUM(CASE WHEN LOWER(TRIM(c.swap_type)) = 'buy' THEN c.output_amount::numeric ELSE c.input_amount::numeric END) AS base_volume,
@@ -428,7 +451,7 @@ export class V06ReconciliationService {
           OR
           (p.state = 'Failed' AND LOWER(TRIM(c.market)) = 'fail')
         )
-      GROUP BY d.base_mint_acct, date_trunc('day', to_timestamp(c.unix_timestamp))::date
+      GROUP BY d.base_mint_acct, (to_timestamp(c.unix_timestamp) AT TIME ZONE 'UTC')::date
     `, [sinceEpoch, untilEpoch]);
 
     // Also count how many open (non-terminal) proposals have swaps in this window
@@ -436,7 +459,7 @@ export class V06ReconciliationService {
     const pendingRows = await this.extDb.query(`
       SELECT
         d.base_mint_acct                                           AS token,
-        date_trunc('day', to_timestamp(c.unix_timestamp))::date    AS swap_date,
+        (to_timestamp(c.unix_timestamp) AT TIME ZONE 'UTC')::date  AS swap_date,
         COUNT(DISTINCT p.proposal_addr)::int                       AS pending_count
       FROM v0_6_conditional_swaps c
       JOIN v0_6_proposals p ON p.proposal_addr = c.proposal_addr
@@ -444,7 +467,7 @@ export class V06ReconciliationService {
       WHERE c.unix_timestamp >= $1
         AND c.unix_timestamp < $2
         AND p.state NOT IN ('Passed', 'Failed')
-      GROUP BY d.base_mint_acct, date_trunc('day', to_timestamp(c.unix_timestamp))::date
+      GROUP BY d.base_mint_acct, (to_timestamp(c.unix_timestamp) AT TIME ZONE 'UTC')::date
     `, [sinceEpoch, untilEpoch]);
 
     // Normalise swap_date coming from pg (Date objects) into YYYY-MM-DD strings
