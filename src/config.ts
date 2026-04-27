@@ -13,8 +13,13 @@ export const config = {
     // Keep-alive timeout in milliseconds (default: 5 minutes)
     keepAliveTimeout: parseInt(process.env.SERVER_KEEP_ALIVE_TIMEOUT || '300000'),
     rateLimit: {
-      windowMs: 60000, // 1 minute
-      maxRequests: 60, // 60 requests per minute
+      windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000'),
+      maxRequests: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '60'),
+      elevated: {
+        headerName: process.env.RATE_LIMIT_ELEVATED_HEADER || 'X-Rate-Limit-Token',
+        secret: process.env.RATE_LIMIT_ELEVATED_SECRET || '',
+        maxRequests: parseInt(process.env.RATE_LIMIT_ELEVATED_MAX_REQUESTS || '300'),
+      },
     },
   },
   cache: {
