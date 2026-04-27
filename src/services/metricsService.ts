@@ -113,14 +113,14 @@ export const cacheMisses = new client.Counter({
 export const httpRequestsTotal = new client.Counter({
   name: 'futarchy_http_requests_total',
   help: 'Total number of HTTP requests',
-  labelNames: ['method', 'path', 'status'],
+  labelNames: ['method', 'path', 'status', 'client_tier'],
   registers: [register],
 });
 
 export const httpRequestDuration = new client.Histogram({
   name: 'futarchy_http_request_duration_seconds',
   help: 'HTTP request duration in seconds',
-  labelNames: ['method', 'path', 'status'],
+  labelNames: ['method', 'path', 'status', 'client_tier'],
   buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30],
   registers: [register],
 });
@@ -300,10 +300,16 @@ export class MetricsService {
   /**
    * Record HTTP request
    */
-  recordHttpRequest(method: string, path: string, status: number, durationSeconds: number): void {
+  recordHttpRequest(
+    method: string,
+    path: string,
+    status: number,
+    durationSeconds: number,
+    clientTier: 'anon' | 'trusted' = 'anon',
+  ): void {
     const normalizedPath = this.normalizePath(path);
-    httpRequestsTotal.labels(method, normalizedPath, String(status)).inc();
-    httpRequestDuration.labels(method, normalizedPath, String(status)).observe(durationSeconds);
+    httpRequestsTotal.labels(method, normalizedPath, String(status), clientTier).inc();
+    httpRequestDuration.labels(method, normalizedPath, String(status), clientTier).observe(durationSeconds);
   }
 
   incrementHttpRequestsInFlight(): void {

@@ -217,6 +217,8 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | **Server** | | |
 | `PORT` | Server port | `3000` |
 | `SERVER_REQUEST_TIMEOUT` | Request timeout (ms) | `300000` |
+| `TRUSTED_API_KEYS` | Comma-separated allowlist of trusted partner keys | — |
+| `TRUSTED_RATE_LIMIT_MAX` | Per-bucket request count per minute for trusted keys | `600` |
 | **Database (App DB)** | | |
 | `COINGECKO_PG_URL` / `DATABASE_URL` | PostgreSQL connection string | — |
 | `DATABASE_SSL` | Enable SSL | `false` |
@@ -306,8 +308,10 @@ bun run backfill:ten-minute
 
 ## Rate Limiting
 
-- **60 requests per minute** per IP address
-- Returns `429 Too Many Requests` when exceeded
+- **Anonymous (default):** 60 requests per minute per IP. Returns `429 Too Many Requests` when exceeded.
+- **Trusted partners:** 600 requests per minute per key (configurable via `TRUSTED_RATE_LIMIT_MAX`). Send the issued key in the `X-API-Key` header. Each key has its own bucket — partners do not share quota.
+- Requests sent with an `X-API-Key` header that does not match the server-side allowlist receive `401 Unauthorized` with `code: "INVALID_API_KEY"`.
+- Keys are issued out-of-band by the team. Contact us if you need elevated access.
 
 ## Error Handling
 
@@ -322,6 +326,7 @@ bun run backfill:ten-minute
 | Code | Description |
 |------|-------------|
 | `400` | Bad Request (missing/invalid parameters) |
+| `401` | Unauthorized (invalid `X-API-Key`) |
 | `404` | Not Found |
 | `429` | Rate limit exceeded |
 | `503` | Service unavailable (DB not connected) |

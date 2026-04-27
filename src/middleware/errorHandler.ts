@@ -23,6 +23,10 @@ export class AppError extends Error {
     return new AppError(message, 400, { code });
   }
 
+  static unauthorized(message: string = 'Unauthorized', code?: string): AppError {
+    return new AppError(message, 401, { code });
+  }
+
   static notFound(message: string = 'Resource not found', code?: string): AppError {
     return new AppError(message, 404, { code });
   }

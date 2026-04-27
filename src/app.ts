@@ -9,28 +9,49 @@ import { createServiceGetters, type Services } from './routes/types.js';
 
 export type { Services } from './routes/types.js';
 
+declare global {
+  namespace Express {
+    interface Request {
+      clientTier?: 'anon' | 'trusted';
+    }
+  }
+}
+
 export interface AppOptions {
   services: Services;
 }
 
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-
 function createRateLimitMiddleware() {
+  const buckets = new Map<string, { count: number; resetTime: number }>();
+
   return (req: Request, res: Response, next: NextFunction): void => {
-    const ip = req.ip || 'unknown';
+    const apiKey = req.header('x-api-key');
+    let tier: { windowMs: number; maxRequests: number };
+    let bucketKey: string;
+
+    if (apiKey) {
+      if (!config.server.trustedApiKeys.has(apiKey)) {
+        throw AppError.unauthorized('Invalid API key', 'INVALID_API_KEY');
+      }
+      tier = config.server.trustedRateLimit;
+      bucketKey = `key:${apiKey}`;
+      req.clientTier = 'trusted';
+    } else {
+      tier = config.server.rateLimit;
+      bucketKey = `ip:${req.ip ?? 'unknown'}`;
+      req.clientTier = 'anon';
+    }
+
     const now = Date.now();
-    const limit = rateLimitMap.get(ip);
+    const limit = buckets.get(bucketKey);
 
     if (!limit || now > limit.resetTime) {
-      rateLimitMap.set(ip, {
-        count: 1,
-        resetTime: now + config.server.rateLimit.windowMs,
-      });
+      buckets.set(bucketKey, { count: 1, resetTime: now + tier.windowMs });
       next();
       return;
     }
 
-    if (limit.count >= config.server.rateLimit.maxRequests) {
+    if (limit.count >= tier.maxRequests) {
       res.status(429).json({ error: 'Too many requests' });
       return;
     }
@@ -53,7 +74,13 @@ function createMetricsMiddleware() {
     res.on('finish', () => {
       metricsService.decrementHttpRequestsInFlight();
       const durationSeconds = (Date.now() - startTime) / 1000;
-      metricsService.recordHttpRequest(req.method, req.path, res.statusCode, durationSeconds);
+      metricsService.recordHttpRequest(
+        req.method,
+        req.path,
+        res.statusCode,
+        durationSeconds,
+        req.clientTier ?? 'anon',
+      );
     });
 
     next();

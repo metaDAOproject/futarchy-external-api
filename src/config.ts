@@ -16,6 +16,16 @@ export const config = {
       windowMs: 60000, // 1 minute
       maxRequests: 60, // 60 requests per minute
     },
+    trustedApiKeys: new Set<string>(
+      (process.env.TRUSTED_API_KEYS || '')
+        .split(',')
+        .map(k => k.trim())
+        .filter(Boolean)
+    ),
+    trustedRateLimit: {
+      windowMs: 60_000,
+      maxRequests: parseInt(process.env.TRUSTED_RATE_LIMIT_MAX || '600'),
+    },
   },
   cache: {
     // TTL for blockchain data cache in milliseconds (default: 10 seconds)

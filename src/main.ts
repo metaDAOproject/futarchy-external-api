@@ -199,6 +199,10 @@ async function main(): Promise<void> {
       healthUrl: `http://localhost:${config.server.port}/health`,
     });
 
+    logger.info('Trusted API keys loaded', {
+      count: config.server.trustedApiKeys.size,
+    });
+
     await startServices(services);
     scheduledTasks = startScheduledTasks(services);
 
