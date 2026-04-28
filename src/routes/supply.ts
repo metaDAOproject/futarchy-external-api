@@ -1,9 +1,9 @@
 import { Router, type Request, type Response } from 'express';
-import { PublicKey } from '@solana/web3.js';
 import { parseSolanaAddress } from '../utils/validation.js';
 import type { ServiceGetters } from './types.js';
 import { asyncHandler, AppError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
+import { getSupplyInfoWithLaunchpadAllocation } from '../services/supplyWithLaunchpadAllocation.js';
 
 export function createSupplyRouter(services: ServiceGetters): Router {
   const router = Router();
@@ -20,38 +20,11 @@ export function createSupplyRouter(services: ServiceGetters): Router {
       const solanaService = getSolanaService();
       const launchpadService = getLaunchpadService();
 
-      const allocation = await launchpadService.getTokenAllocationBreakdown(
-        new PublicKey(mintAddress)
+      const { supplyInfo } = await getSupplyInfoWithLaunchpadAllocation(
+        mintAddress,
+        solanaService,
+        launchpadService,
       );
-
-      const supplyInfo = await solanaService.getSupplyInfo(mintAddress, {
-        teamPerformancePackage: {
-          amount: allocation.teamPerformancePackage.amount,
-          address: allocation.teamPerformancePackage.address?.toString(),
-        },
-        futarchyAmmLiquidity: {
-          amount: allocation.futarchyAmmLiquidity.amount,
-          vaultAddress: allocation.futarchyAmmLiquidity.vaultAddress?.toString(),
-        },
-        meteoraLpLiquidity: {
-          amount: allocation.meteoraLpLiquidity.amount,
-          poolAddress: allocation.meteoraLpLiquidity.poolAddress?.toString(),
-          vaultAddress: allocation.meteoraLpLiquidity.vaultAddress?.toString(),
-        },
-        additionalTokenAllocation: allocation.additionalTokenAllocation ? {
-          amount: allocation.additionalTokenAllocation.amount,
-          recipient: allocation.additionalTokenAllocation.recipient.toString(),
-          claimed: allocation.additionalTokenAllocation.claimed,
-          tokenAccountAddress: allocation.additionalTokenAllocation.tokenAccountAddress?.toString(),
-        } : undefined,
-        daoTreasuryTokens: {
-          amount: allocation.daoTreasuryTokens.amount,
-          vaultAddress: allocation.daoTreasuryTokens.vaultAddress?.toString(),
-        },
-        daoAddress: allocation.daoAddress?.toString(),
-        launchAddress: allocation.launchAddress?.toString(),
-        version: allocation.version,
-      });
 
       res.json({
         result: supplyInfo.totalSupply,
@@ -85,38 +58,11 @@ export function createSupplyRouter(services: ServiceGetters): Router {
     const solanaService = getSolanaService();
     const launchpadService = getLaunchpadService();
 
-    const allocation = await launchpadService.getTokenAllocationBreakdown(
-      new PublicKey(mintAddress)
+    const { supplyInfo, allocation } = await getSupplyInfoWithLaunchpadAllocation(
+      mintAddress,
+      solanaService,
+      launchpadService,
     );
-
-    const supplyInfo = await solanaService.getSupplyInfo(mintAddress, {
-      teamPerformancePackage: {
-        amount: allocation.teamPerformancePackage.amount,
-        address: allocation.teamPerformancePackage.address?.toString(),
-      },
-      futarchyAmmLiquidity: {
-        amount: allocation.futarchyAmmLiquidity.amount,
-        vaultAddress: allocation.futarchyAmmLiquidity.vaultAddress?.toString(),
-      },
-      meteoraLpLiquidity: {
-        amount: allocation.meteoraLpLiquidity.amount,
-        poolAddress: allocation.meteoraLpLiquidity.poolAddress?.toString(),
-        vaultAddress: allocation.meteoraLpLiquidity.vaultAddress?.toString(),
-      },
-      additionalTokenAllocation: allocation.additionalTokenAllocation ? {
-        amount: allocation.additionalTokenAllocation.amount,
-        recipient: allocation.additionalTokenAllocation.recipient.toString(),
-        claimed: allocation.additionalTokenAllocation.claimed,
-        tokenAccountAddress: allocation.additionalTokenAllocation.tokenAccountAddress?.toString(),
-      } : undefined,
-      daoTreasuryTokens: {
-        amount: allocation.daoTreasuryTokens.amount,
-        vaultAddress: allocation.daoTreasuryTokens.vaultAddress?.toString(),
-      },
-      daoAddress: allocation.daoAddress?.toString(),
-      launchAddress: allocation.launchAddress?.toString(),
-      version: allocation.version,
-    });
 
     const response: { 
       result: string; 
@@ -179,38 +125,11 @@ export function createSupplyRouter(services: ServiceGetters): Router {
     const solanaService = getSolanaService();
     const launchpadService = getLaunchpadService();
 
-    const allocation = await launchpadService.getTokenAllocationBreakdown(
-      new PublicKey(mintAddress)
+    const { supplyInfo } = await getSupplyInfoWithLaunchpadAllocation(
+      mintAddress,
+      solanaService,
+      launchpadService,
     );
-
-    const supplyInfo = await solanaService.getSupplyInfo(mintAddress, {
-      teamPerformancePackage: {
-        amount: allocation.teamPerformancePackage.amount,
-        address: allocation.teamPerformancePackage.address?.toString(),
-      },
-      futarchyAmmLiquidity: {
-        amount: allocation.futarchyAmmLiquidity.amount,
-        vaultAddress: allocation.futarchyAmmLiquidity.vaultAddress?.toString(),
-      },
-      meteoraLpLiquidity: {
-        amount: allocation.meteoraLpLiquidity.amount,
-        poolAddress: allocation.meteoraLpLiquidity.poolAddress?.toString(),
-        vaultAddress: allocation.meteoraLpLiquidity.vaultAddress?.toString(),
-      },
-      additionalTokenAllocation: allocation.additionalTokenAllocation ? {
-        amount: allocation.additionalTokenAllocation.amount,
-        recipient: allocation.additionalTokenAllocation.recipient.toString(),
-        claimed: allocation.additionalTokenAllocation.claimed,
-        tokenAccountAddress: allocation.additionalTokenAllocation.tokenAccountAddress?.toString(),
-      } : undefined,
-      daoTreasuryTokens: {
-        amount: allocation.daoTreasuryTokens.amount,
-        vaultAddress: allocation.daoTreasuryTokens.vaultAddress?.toString(),
-      },
-      daoAddress: allocation.daoAddress?.toString(),
-      launchAddress: allocation.launchAddress?.toString(),
-      version: allocation.version,
-    });
 
     res.json({ circulatingSupply: parseFloat(supplyInfo.circulatingSupply) });
   }));

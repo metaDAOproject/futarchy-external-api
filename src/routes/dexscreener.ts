@@ -11,6 +11,7 @@ import type {
   DexScreenerEventsResponse,
   DexScreenerSwapEvent,
 } from '../types/dexscreener.js';
+import { getSupplyInfoWithLaunchpadAllocation } from '../services/supplyWithLaunchpadAllocation.js';
 
 const DEX_KEY = 'futarchyAMM';
 const FEE_BPS = Math.round(config.fees.protocolFeeRate * 10000); // 0.005 → 50
@@ -19,7 +20,8 @@ const DECIMALIZE = Math.pow(10, TOKEN_DECIMALS);
 
 export function createDexScreenerRouter(services: ServiceGetters): Router {
   const router = Router();
-  const { getFutarchyService, getExternalDatabaseService } = services;
+  const { getFutarchyService, getExternalDatabaseService, getSolanaService, getLaunchpadService } =
+    services;
 
   // In-memory TTL caches for mostly-static endpoints
   const assetCache = new Map<string, { data: DexScreenerAssetResponse; expiresAt: number }>();
@@ -72,6 +74,8 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
     }
 
     const futarchyService = getFutarchyService();
+    const solanaService = getSolanaService();
+    const launchpadService = getLaunchpadService();
 
     let mintPubkey: PublicKey;
     try {
@@ -85,11 +89,35 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       futarchyService.getTokenDecimals(mintPubkey),
     ]);
 
+    let totalSupply: number | undefined;
+    let circulatingSupply: number | undefined;
+    try {
+      const { supplyInfo } = await getSupplyInfoWithLaunchpadAllocation(
+        id,
+        solanaService,
+        launchpadService,
+      );
+      const total = parseFloat(supplyInfo.totalSupply);
+      const circ = parseFloat(supplyInfo.circulatingSupply);
+      if (Number.isFinite(total) && Number.isFinite(circ)) {
+        totalSupply = total;
+        circulatingSupply = circ;
+      }
+    } catch (err) {
+      logger.warn('[DexScreener] /asset could not load supply', {
+        mint: id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     const response: DexScreenerAssetResponse = {
       asset: {
         id,
         name: metadata?.name || id.slice(0, 8),
         symbol: metadata?.symbol || id.slice(0, 8),
+        ...(totalSupply !== undefined && circulatingSupply !== undefined
+          ? { totalSupply, circulatingSupply }
+          : {}),
         metadata: {
           decimals: String(decimals),
         },
