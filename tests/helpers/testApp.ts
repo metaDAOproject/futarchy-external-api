@@ -1,3 +1,4 @@
+import BN from 'bn.js';
 import { createApp, type Services } from '../../src/app.js';
 import type { FutarchyService } from '../../src/services/futarchyService.js';
 import type { PriceService } from '../../src/services/priceService.js';
@@ -48,9 +49,12 @@ export function createMockSolanaService(): SolanaService {
 export function createMockLaunchpadService(): LaunchpadService {
   return {
     getTokenAllocationBreakdown: async () => ({
-      teamPerformancePackage: { amount: '0' },
-      futarchyAmmLiquidity: { amount: '0' },
-      meteoraLpLiquidity: { amount: '0' },
+      version: 'v0.6',
+      teamPerformancePackage: { amount: new BN(0) },
+      futarchyAmmLiquidity: { amount: new BN(0) },
+      meteoraLpLiquidity: { amount: new BN(0) },
+      daoTreasuryTokens: { amount: new BN(0) },
+      totalNonCirculating: new BN(0),
     }),
   } as unknown as LaunchpadService;
 }

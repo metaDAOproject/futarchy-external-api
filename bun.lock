@@ -6,7 +6,7 @@
       "name": "futarchy-coingecko-api",
       "dependencies": {
         "@coral-xyz/anchor": "0.32.1",
-        "@metadaoproject/futarchy": "0.7.3-alpha.0",
+        "@metadaoproject/futarchy": "0.7.4-alpha.3",
         "@solana/spl-token": "0.4.14",
         "@solana/web3.js": "1.98.4",
         "@types/express": "5.0.6",
@@ -172,7 +172,7 @@
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.9", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.0.3", "@jridgewell/sourcemap-codec": "^1.4.10" } }, "sha512-3Belt6tdc8bPgAtbcmdtNJlirVoTmEb5e2gC94PnkwEW9jI6CAHUeoG85tjWP5WquqfavoMtMwiG4P926ZKKuQ=="],
 
-    "@metadaoproject/futarchy": ["@metadaoproject/futarchy@0.7.3-alpha.0", "", { "dependencies": { "@coral-xyz/anchor": "^0.29.0", "@metaplex-foundation/umi": "^0.9.2", "@metaplex-foundation/umi-bundle-defaults": "^0.9.2", "@metaplex-foundation/umi-uploader-bundlr": "^0.9.2", "@noble/hashes": "^1.4.0", "@solana/spl-token": "^0.3.7", "@solana/web3.js": "^1.76.0", "@sqds/multisig": "^2.1.4", "bn.js": "^5.2.1", "decimal.js": "^10.4.3", "esbuild": "^0.17.15" } }, "sha512-kMHZ8+yAxJeUyvFqc1EYE8xImq+ESEYaCgQp6rJP6E6lC2cYUVjvukN7fjmOeERF8F0BpZb+fysMm/7J4afezg=="],
+    "@metadaoproject/futarchy": ["@metadaoproject/futarchy@0.7.4-alpha.3", "", { "dependencies": { "@coral-xyz/anchor": "^0.29.0", "@metaplex-foundation/umi": "^0.9.2", "@metaplex-foundation/umi-bundle-defaults": "^0.9.2", "@metaplex-foundation/umi-uploader-bundlr": "^0.9.2", "@noble/hashes": "^1.4.0", "@solana/spl-token": "^0.3.7", "@solana/web3.js": "^1.76.0", "@sqds/multisig": "^2.1.4", "bn.js": "^5.2.1", "decimal.js": "^10.4.3", "esbuild": "^0.17.15" } }, "sha512-SpMfZVjb4JQv/5h/17XeG4cTHKuD30wYRmAP/Y5mOxyFh8nP4DiMx4okTF0d0k3foQ41vc2I8DGKnlIEq5ITEw=="],
 
     "@metaplex-foundation/beet": ["@metaplex-foundation/beet@0.7.1", "", { "dependencies": { "ansicolors": "^0.3.2", "bn.js": "^5.2.0", "debug": "^4.3.3" } }, "sha512-hNCEnS2WyCiYyko82rwuISsBY3KYpe828ubsd2ckeqZr7tl0WVLivGkoyA/qdiaaHEBGdGl71OpfWa2rqL3DiA=="],
 
