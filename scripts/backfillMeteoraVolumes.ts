@@ -9,12 +9,28 @@
  *   bun run scripts/backfillMeteoraVolumes.ts
  *   RECENT_DAYS=7 bun run scripts/backfillMeteoraVolumes.ts   # Only backfill last 7 days
  *   CHUNK_DAYS=30 bun run scripts/backfillMeteoraVolumes.ts   # Use 30-day chunks (default: 30)
+ *
+ * Chunk skipping (METEORA_BACKFILL_SKIP_CHUNKS):
+ *   coverage (default) — skip a chunk only if DB already has rows for every mapped token in that date range (adds missing tokens after you extend the map + Dune query).
+ *   any — skip whenever any row exists in the chunk (legacy; misses new tokens in already-filled ranges).
+ *   never — always call Dune (idempotent upserts; highest Dune usage).
  */
 
 import { DatabaseService } from '../src/services/databaseService.js';
 import { DuneService } from '../src/services/duneService.js';
 import { MeteoraVolumeFetcherService } from '../src/services/meteoraVolumeFetcherService.js';
+import { getAllMappedTokens } from '../src/services/meteoraService.js';
 import { config } from '../src/config.js';
+
+/** Chunk skip behavior: avoid re-querying Dune when data already exists. */
+type ChunkSkipMode = 'coverage' | 'any' | 'never';
+
+function parseChunkSkipMode(raw: string | undefined): ChunkSkipMode {
+  if (raw === 'any' || raw === 'never' || raw === 'coverage') {
+    return raw;
+  }
+  return 'coverage';
+}
 
 /**
  * Helper to add days to a date
@@ -66,11 +82,14 @@ async function backfillMeteoraVolumes() {
   // Check environment variables for options
   const recentDays = process.env.RECENT_DAYS ? parseInt(process.env.RECENT_DAYS) : null;
   const chunkDays = process.env.CHUNK_DAYS ? parseInt(process.env.CHUNK_DAYS) : 30; // Default: 30-day chunks
+  const chunkSkipMode = parseChunkSkipMode(process.env.METEORA_BACKFILL_SKIP_CHUNKS);
+  const expectedTokens = getAllMappedTokens();
 
   if (recentDays) {
     console.log(`⚠ RECENT_DAYS=${recentDays}: Will only backfill last ${recentDays} days\n`);
   }
-  console.log(`📦 Using ${chunkDays}-day chunks to avoid API limits\n`);
+  console.log(`📦 Using ${chunkDays}-day chunks to avoid API limits`);
+  console.log(`   Mapped Meteora tokens: ${expectedTokens.length} (${chunkSkipMode} chunk skip)\n`);
 
   // Initialize services
   const databaseService = new DatabaseService();
@@ -161,18 +180,49 @@ async function backfillMeteoraVolumes() {
       console.log(`   [${chunkIdx + 1}/${chunks.length}] Processing ${chunkStart} to ${chunkEnd}...`);
 
       try {
-        // Check if this chunk already has data
-        const existingCheck = await databaseService.pool!.query(`
-          SELECT COUNT(*) as count
-          FROM daily_meteora_volumes
-          WHERE date >= $1 AND date <= $2
-        `, [chunkStart, chunkEnd]);
+        if (chunkSkipMode !== 'never') {
+          if (chunkSkipMode === 'any') {
+            const existingCheck = await databaseService.pool!.query(
+              `
+              SELECT COUNT(*)::int AS count
+              FROM daily_meteora_volumes
+              WHERE date >= $1 AND date <= $2
+            `,
+              [chunkStart, chunkEnd],
+            );
 
-        const existingCount = parseInt(existingCheck.rows[0]!.count);
-        if (existingCount > 0) {
-          console.log(`      ⏭️  Skipping (${existingCount} records already exist)`);
-          processedChunks++;
-          continue;
+            const existingCount = Number(existingCheck.rows[0]!.count);
+            if (existingCount > 0) {
+              console.log(`      ⏭️  Skipping (${existingCount} records already exist, skip mode=any)`);
+              processedChunks++;
+              continue;
+            }
+          } else {
+            const coverageCheck = await databaseService.pool!.query(
+              `
+              SELECT COUNT(*)::int AS distinct_tokens
+              FROM (
+                SELECT DISTINCT token
+                FROM daily_meteora_volumes
+                WHERE date >= $1 AND date <= $2
+                  AND token = ANY($3::varchar[])
+              ) t
+            `,
+              [chunkStart, chunkEnd, expectedTokens],
+            );
+
+            const distinctInChunk = Number(coverageCheck.rows[0]!.distinct_tokens);
+            if (distinctInChunk >= expectedTokens.length) {
+              console.log(
+                `      ⏭️  Skipping (${distinctInChunk}/${expectedTokens.length} mapped tokens present in range, skip mode=coverage)`,
+              );
+              processedChunks++;
+              continue;
+            }
+            if (distinctInChunk > 0) {
+              console.log(`      Refetch (${distinctInChunk}/${expectedTokens.length} mapped tokens in range — filling gaps)`);
+            }
+          }
         }
 
         // Fetch chunk from Dune
@@ -200,8 +250,8 @@ async function backfillMeteoraVolumes() {
           console.error(`\n   Options to continue:`);
           console.error(`   1. Wait for your Dune billing cycle to reset`);
           console.error(`   2. Upgrade your Dune subscription`);
-          console.error(`   3. Resume later - script will skip already-filled chunks`);
-          console.error(`\n   To resume, run the script again - it will skip chunks that already have data.\n`);
+          console.error(`   3. Resume later - with METEORA_BACKFILL_SKIP_CHUNKS=coverage (default), chunks skip only when every mapped token exists in that date range`);
+          console.error(`\n   Run the script again to resume; use METEORA_BACKFILL_SKIP_CHUNKS=never to force re-querying all chunks.\n`);
           break;
         } else {
           console.error(`      ✗ Error: ${error.message}`);
