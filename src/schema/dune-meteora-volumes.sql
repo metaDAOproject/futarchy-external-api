@@ -1,4 +1,6 @@
 -- Dune Query: Meteora Daily Volumes per Owner
+-- Deploy: paste this file into the query behind DUNE_METEORA_VOLUME_QUERY_ID (see .env).
+--
 -- Parameters:
 --   start_date: DATE - fetch data from this date onwards (default: '2025-10-09')
 --   end_date: DATE (optional) - fetch data up to this date (inclusive). If not provided, fetches all data from start_date onwards.
@@ -25,16 +27,36 @@ target_pools AS (
   UNION ALL SELECT '5gB4NPgFB3MHFHSeKN4sbaY6t9MB8ikCe9HyiKYid4Td' -- Avici / USDC
   UNION ALL SELECT '57SnL1dxJPgc6TH6DcbRn7Nn5jnYCdcrkpVTy9d5vRuP' -- ZKFG / USDC
   UNION ALL SELECT '2zsbECzM7roqnDcuv2TNGpfv5PAnuqGmMo5YPtqmUz5p' -- Solomon / USDC
+  UNION ALL SELECT 'G63kb4W4nsHFsWExtz5vBipqiESCVYua8PzDmswDNZ8S' -- Omnipair / USDC (DAMM v2, v0.6 config)
+  UNION ALL SELECT 'AMAYXpujqBETmLz3GRppj5nKdpJLEbLXWbAJq8Zgiqav' -- Superclaw / USDC
+  UNION ALL SELECT '4cY7i4Pnt8zAgZi5k986AnNdpdHm9hLjnH9xYjRbMybr' -- Futardio cult / USDC
 ),
 
-target_owners AS (
-  SELECT '6VsC8PuKkXm5xo54c2vbrAaSfQipkpGHqNuKTxXFySx6' AS owner -- Umbra
-  UNION ALL SELECT '55H1Q1YrHJQ93uhG4jqrBBHx3a8H7TCM8kvf2UM2g5q3' -- Ranger
-  UNION ALL SELECT 'BpXtB2ASf2Tft97ewTd8PayXCqFQ6Wqod33qrwwfK9Vz' -- Paystream
-  UNION ALL SELECT 'AQyyTwCKemeeMu8ZPZFxrXMbVwAYTSbBhi1w4PBrhvYE' -- Loyal
-  UNION ALL SELECT 'DGgYoUcu1aDZt4GEL5NQiducwHRGbkMWsUzsXh2j622G' -- Avici
-  UNION ALL SELECT 'BNvDfXYG2FAyBDYD71Xr9GhKE18MbmhtjsLKsCuXho6z' -- ZKFG
-  UNION ALL SELECT '98SPcyUZ2rqM2dgjCqqSXS4gJrNTLSNUAAVCF38xYj9u' -- Solomon
+/* First on-chain add_liquidity per pool/owner — supplies position account for newer pools (see meteoraService.ts owners). */
+new_pool_first_position AS (
+  SELECT account_pool AS pool, account_owner AS owner, account_position AS position
+  FROM (
+    SELECT
+      account_pool,
+      account_owner,
+      account_position,
+      ROW_NUMBER() OVER (
+        PARTITION BY account_pool, account_owner
+        ORDER BY call_block_time ASC
+      ) AS rn
+    FROM meteora_solana.cp_amm_call_add_liquidity
+    WHERE account_pool IN (
+      'G63kb4W4nsHFsWExtz5vBipqiESCVYua8PzDmswDNZ8S',
+      'AMAYXpujqBETmLz3GRppj5nKdpJLEbLXWbAJq8Zgiqav',
+      '4cY7i4Pnt8zAgZi5k986AnNdpdHm9hLjnH9xYjRbMybr'
+    )
+    AND account_owner IN (
+      '8s6Jdoh7tgUqmU3D2EmpNJHSvuN5U4NybpLAdsiMitwB',
+      '5ZPnwQDU7dEKdMGqaY5oCQkiuQpwjtYSJNMNpiStTNvU',
+      'FeMyhpB3LJuuuA1oLzXFDuZ48EJz46gyyk3w2xuQA8uw'
+    )
+  ) x
+  WHERE rn = 1
 ),
 
 pool_map AS (
@@ -60,6 +82,7 @@ pool_map AS (
   UNION ALL SELECT '2zsbECzM7roqnDcuv2TNGpfv5PAnuqGmMo5YPtqmUz5p',
                   'w1BDxR4FvN4KryBuJwcEuohYKHkyDzD1beNH3AhF6Wn',
                   '98SPcyUZ2rqM2dgjCqqSXS4gJrNTLSNUAAVCF38xYj9u'
+  UNION ALL SELECT pool, position, owner FROM new_pool_first_position
 ),
 
 /* -----------------------------
