@@ -1,6 +1,6 @@
 import { Connection, PublicKey, Keypair } from '@solana/web3.js';
 import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
-import { FutarchyClient } from "@metadaoproject/futarchy/v0.6";
+import { FutarchyClient } from "@metadaoproject/programs/futarchy/v0.6";
 import { getMint, getAssociatedTokenAddress, getAccount } from '@solana/spl-token';
 import { config } from '../config.js';
 import BN from 'bn.js';

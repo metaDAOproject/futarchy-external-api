@@ -22,14 +22,15 @@
     "backfill:v06": "bun run scripts/backfillV06.ts",
     "safe-update": "bun run scripts/safe-update.ts",
     "safe-update:dry": "bun run scripts/safe-update.ts --dry-run",
-    "compare:dune-vs-v06": "bun run scripts/compareDuneVsV06.ts"
+    "compare:dune-vs-v06": "bun run scripts/compareDuneVsV06.ts",
+    "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
     "typescript": "^5.9.3"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1",
-    "@metadaoproject/futarchy": "0.7.4-alpha.3",
+    "@metadaoproject/programs": "0.1.0-alpha.2",
     "@solana/spl-token": "0.4.14",
     "@solana/web3.js": "1.98.4",
     "@types/express": "5.0.6",
