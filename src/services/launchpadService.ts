@@ -1,18 +1,20 @@
 import { Connection, PublicKey, Keypair } from '@solana/web3.js';
 import { AnchorProvider, Wallet, Program } from '@coral-xyz/anchor';
-import { 
-  LaunchpadClient as LaunchpadClientV06, 
-  FutarchyClient, 
-  getLaunchSignerAddr, 
-  getPerformancePackageAddr, 
+import {
+  LaunchpadClient as LaunchpadClientV06,
+  getLaunchSignerAddr,
+} from "@metadaoproject/programs/launchpad/v0.6";
+import {
+  LaunchpadClient as LaunchpadClientV07,
+} from "@metadaoproject/programs/launchpad/v0.7";
+import { FutarchyClient } from "@metadaoproject/programs/futarchy/v0.6";
+import { getPerformancePackageAddr } from "@metadaoproject/programs/price_based_performance_package/v0.6";
+import {
   PRICE_BASED_PERFORMANCE_PACKAGE_PROGRAM_ID,
   DAMM_V2_PROGRAM_ID,
-  MAINNET_METEORA_CONFIG as MAINNET_METEORA_CONFIG_V06,
-} from "@metadaoproject/futarchy/v0.6";
-import { 
-  LaunchpadClient as LaunchpadClientV07,
-  MAINNET_METEORA_CONFIG as MAINNET_METEORA_CONFIG_V07,
-} from "@metadaoproject/futarchy/v0.7";
+  LAUNCHPAD_V0_6_MAINNET_METEORA_CONFIG as MAINNET_METEORA_CONFIG_V06,
+  LAUNCHPAD_V0_7_MAINNET_METEORA_CONFIG as MAINNET_METEORA_CONFIG_V07,
+} from "@metadaoproject/programs";
 import { getAccount, getAssociatedTokenAddress } from '@solana/spl-token';
 import { config } from '../config.js';
 import BN from 'bn.js';
