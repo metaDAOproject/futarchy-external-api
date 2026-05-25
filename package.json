@@ -4,11 +4,6 @@
   "type": "module",
   "private": true,
   "version": "2.0.0",
-  "devDependencies": {
-    "@types/bun": "latest",
-    "@types/pg": "8.20.0",
-    "@types/supertest": "7.2.0"
-  },
   "scripts": {
     "dev": "bun --watch src/main.ts",
     "build": "tsc",
@@ -23,10 +18,9 @@
     "safe-update": "bun run scripts/safe-update.ts",
     "safe-update:dry": "bun run scripts/safe-update.ts --dry-run",
     "compare:dune-vs-v06": "bun run scripts/compareDuneVsV06.ts",
-    "typecheck": "tsc --noEmit"
-  },
-  "peerDependencies": {
-    "typescript": "^5.9.3"
+    "typecheck": "tsc --noEmit",
+    "repo:guard": "bun scripts/repo-guard.ts",
+    "deps:check": "knip --include unlisted --reporter compact"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1",
@@ -44,5 +38,17 @@
     "prom-client": "15.1.3",
     "supertest": "7.2.2",
     "ts-node": "10.9.2"
-  }
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.3",
+    "@types/pg": "8.20.0",
+    "@types/supertest": "7.2.0",
+    "@socketsecurity/bun-security-scanner": "1.1.2",
+    "knip": "6.3.0",
+    "typescript": "5.9.3"
+  },
+  "installConfig": {
+    "exact": true
+  },
+  "packageManager": "bun@1.3.14"
 }
