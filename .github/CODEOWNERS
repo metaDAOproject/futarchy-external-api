@@ -1,0 +1,17 @@
+# API config / startup surfaces
+/src/config.ts @metanallok
+/src/main.ts @metanallok
+/src/app.ts @metanallok
+
+# Solana / Futarchy / external data surfaces
+/src/services/solanaService.ts @metanallok
+/src/services/futarchyService.ts @metanallok
+/src/services/launchpadService.ts @metanallok
+/src/services/meteoraService.ts @metanallok
+/src/services/databaseService.ts @metanallok
+/src/services/externalDatabaseService.ts @metanallok
+
+# Operational scripts
+/scripts/safe-update.ts @metanallok
+/scripts/backfill.ts @metanallok
+/scripts/backfillV06.ts @metanallok

@@ -1,0 +1,10 @@
+[install]
+exact = true
+
+[install.security]
+# Socket security scanner hooks into `bun install` via Bun's security plugin
+# API. Every install (dev + CI) scans direct and transitive deps against
+# Socket's threat database and blocks malicious packages.
+# Works in free mode without an API key. Set SOCKET_API_KEY for enhanced
+# scanning tied to the Socket org (packages scope).
+scanner = "@socketsecurity/bun-security-scanner"
