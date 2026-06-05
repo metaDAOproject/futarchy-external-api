@@ -2,22 +2,18 @@ import { Router, type Request, type Response } from 'express';
 import { config } from '../config.js';
 import type { ServiceGetters } from './types.js';
 
-export function createRootRouter(services: ServiceGetters): Router {
+export function createRootRouter(_services: ServiceGetters): Router {
   const router = Router();
-  const { getDuneCacheService } = services;
 
   // Root endpoint with API documentation
   router.get('/', (req: Request, res: Response) => {
-    const duneCacheService = getDuneCacheService();
-    const cacheStatus = duneCacheService?.getCacheStatus();
-    
     res.json({
       name: 'Futarchy AMM - CoinGecko API',
       version: '1.0.0',
       documentation: 'https://docs.coingecko.com/reference/exchanges-list',
       endpoints: {
         tickers: '/api/tickers - Returns all DAO tickers with pricing and volume',
-        market_data: '/api/market-data - Daily market data (futarchy AMM + Meteora); uses v0.6 indexer when USE_DUNE_DATA=false',
+        market_data: '/api/market-data - Daily market data (futarchy AMM + Meteora); FutarchyAMM served from the v0.6 indexer',
         supply: '/api/supply/:mintAddress - Returns complete supply breakdown with allocation details',
         supply_total: '/api/supply/:mintAddress/total - Returns total supply only',
         supply_circulating: '/api/supply/:mintAddress/circulating - Returns circulating supply (excludes team performance package)',
@@ -47,11 +43,7 @@ export function createRootRouter(services: ServiceGetters): Router {
         description: 'Ticker volume is served from app DB aggregates populated by the separate indexer runtime',
         refreshInterval: `${parseInt(process.env.DUNE_CACHE_REFRESH_INTERVAL || '3600')} seconds`,
         fetchTimeout: `${parseInt(process.env.DUNE_FETCH_TIMEOUT || '240')} seconds`,
-        status: cacheStatus ? {
-          isInitialized: cacheStatus.isInitialized,
-          poolMetricsCount: cacheStatus.poolMetricsCount,
-          lastUpdated: cacheStatus.lastUpdated.toISOString(),
-        } : 'No live cache in API runtime',
+        status: 'No live cache in API runtime',
       },
       note: 'This API discovers DAOs for serving responses; background indexing runs separately.',
     });

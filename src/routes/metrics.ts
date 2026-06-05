@@ -6,7 +6,7 @@ import { logger } from '../utils/logger.js';
 
 export function createMetricsRouter(services: ServiceGetters): Router {
   const router = Router();
-  const { getDatabaseService, getDuneCacheService, getHourlyAggregationService, getTenMinuteVolumeFetcherService, getFutarchyService } = services;
+  const { getDatabaseService, getFutarchyService } = services;
 
   // Prometheus metrics endpoint
   router.get('/metrics', async (req: Request, res: Response) => {
@@ -84,9 +84,6 @@ export function createMetricsRouter(services: ServiceGetters): Router {
 // Helper function to update all metrics
 async function updateMetricsSnapshot(services: ServiceGetters): Promise<void> {
   const databaseService = services.getDatabaseService();
-  const duneCacheService = services.getDuneCacheService();
-  const hourlyAggregationService = services.getHourlyAggregationService();
-  const tenMinuteVolumeFetcherService = services.getTenMinuteVolumeFetcherService();
   const futarchyService = services.getFutarchyService();
 
   metricsService.setDatabaseConnected(databaseService.isAvailable());
@@ -119,31 +116,6 @@ async function updateMetricsSnapshot(services: ServiceGetters): Promise<void> {
       metricsService.setDatabaseLatestDate('daily_buy_sell_volumes', latestBuySell);
     } catch (error) {
       logger.error('[Metrics] Error fetching database metrics:', error);
-    }
-  }
-
-  if (duneCacheService) {
-    const status = duneCacheService.getCacheStatus();
-    metricsService.setServiceStatus('dune_cache', status.isInitialized);
-    metricsService.setRefreshInProgress('dune_cache', status.isRefreshing);
-    if (status.lastUpdated) {
-      metricsService.setLastRefreshTime('dune_cache', status.lastUpdated);
-      metricsService.updateTimeSinceLastRefresh('dune_cache', status.lastUpdated.getTime());
-    }
-  }
-
-  if (hourlyAggregationService) {
-    metricsService.setServiceStatus('hourly_volume', hourlyAggregationService.isInitialized);
-    metricsService.setRefreshInProgress('hourly_volume', false);
-  }
-
-  if (tenMinuteVolumeFetcherService) {
-    const status = tenMinuteVolumeFetcherService.getStatus();
-    metricsService.setServiceStatus('ten_minute_volume', status.initialized);
-    metricsService.setRefreshInProgress('ten_minute_volume', status.refreshInProgress);
-    if (status.lastRefreshTime) {
-      metricsService.setLastRefreshTime('ten_minute_volume', new Date(status.lastRefreshTime));
-      metricsService.updateTimeSinceLastRefresh('ten_minute_volume', new Date(status.lastRefreshTime).getTime());
     }
   }
 

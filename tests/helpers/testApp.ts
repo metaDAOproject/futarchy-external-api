@@ -66,13 +66,8 @@ export function createTestServices(overrides?: Partial<Services>): Services {
     futarchyService: createMockFutarchyService(),
     priceService: createMockPriceService(),
     databaseService: createMockDatabaseService(),
-    duneService: null,
-    duneCacheService: null,
     solanaService: createMockSolanaService(),
     launchpadService: createMockLaunchpadService(),
-    hourlyAggregationService: null,
-    tenMinuteVolumeFetcherService: null,
-    dailyAggregationService: null,
     v06ReconciliationService: null,
     ...overrides,
   };

@@ -6,47 +6,6 @@ import { scheduleDailyAtUTC, scheduleWithoutPileup, type ScheduledTask } from '.
 import type { Services } from './app.js';
 
 async function startIndexingServices(services: Services): Promise<void> {
-  if (services.hourlyAggregationService) {
-    logger.info('Starting Hourly Aggregation service');
-    try {
-      await services.hourlyAggregationService.start();
-      logger.info('Hourly Aggregation service started');
-    } catch (error) {
-      logger.error('Failed to start Hourly Aggregation service', error);
-    }
-  }
-
-  if (services.tenMinuteVolumeFetcherService) {
-    logger.info('Starting 10-Minute Volume Fetcher service');
-    try {
-      await services.tenMinuteVolumeFetcherService.start();
-      logger.info('10-Minute Volume Fetcher service started');
-    } catch (error) {
-      logger.error('Failed to start 10-Minute Volume Fetcher service', error);
-    }
-  }
-
-  if (services.dailyAggregationService) {
-    logger.info('Starting Daily Aggregation service');
-    try {
-      await services.dailyAggregationService.initialize();
-      services.dailyAggregationService.start();
-      logger.info('Daily Aggregation service started');
-    } catch (error) {
-      logger.error('Failed to start Daily Aggregation service', error);
-    }
-  }
-
-  if (services.duneCacheService) {
-    logger.info('Starting Dune cache service');
-    try {
-      await services.duneCacheService.start();
-      logger.info('Dune cache service started');
-    } catch (error) {
-      logger.error('Failed to start Dune cache service', error);
-    }
-  }
-
   if (services.externalDatabaseService?.isAvailable() && services.v06ReconciliationService) {
     logger.info('Starting v0.6 Reconciliation service');
     services.v06ReconciliationService.start();
@@ -92,10 +51,6 @@ function startIndexerScheduledTasks(services: Services): ScheduledTask[] {
 
 async function stopIndexingServices(services: Services, scheduledTasks: ScheduledTask[]): Promise<void> {
   scheduledTasks.forEach(task => task.stop());
-  services.duneCacheService?.stop();
-  services.hourlyAggregationService?.stop();
-  services.tenMinuteVolumeFetcherService?.stop();
-  services.dailyAggregationService?.stop();
   services.v06ReconciliationService?.stop();
   await closeDataStores(services);
 }

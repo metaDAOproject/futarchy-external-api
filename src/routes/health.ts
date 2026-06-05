@@ -3,33 +3,20 @@ import type { ServiceGetters } from './types.js';
 
 export function createHealthRouter(services: ServiceGetters): Router {
   const router = Router();
-  const { getDatabaseService, getDuneCacheService, getHourlyAggregationService, getTenMinuteVolumeFetcherService } = services;
+  const { getDatabaseService } = services;
 
   // Basic health check
   router.get('/health', (req: Request, res: Response) => {
-    const duneCacheService = getDuneCacheService();
-    const cacheStatus = duneCacheService?.getCacheStatus();
-    
     res.json({
       status: 'healthy',
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
-      duneCache: cacheStatus ? {
-        lastUpdated: cacheStatus.lastUpdated.toISOString(),
-        isRefreshing: cacheStatus.isRefreshing,
-        poolMetricsCount: cacheStatus.poolMetricsCount,
-        cacheAgeSeconds: Math.round(cacheStatus.cacheAgeMs / 1000),
-        isInitialized: cacheStatus.isInitialized,
-      } : null,
     });
   });
 
   // Comprehensive health check
   router.get('/api/health', async (req: Request, res: Response) => {
     const databaseService = getDatabaseService();
-    const duneCacheService = getDuneCacheService();
-    const hourlyAggregationService = getHourlyAggregationService();
-    const tenMinuteVolumeFetcherService = getTenMinuteVolumeFetcherService();
 
     const health: Record<string, any> = {
       status: 'healthy',
@@ -39,32 +26,6 @@ export function createHealthRouter(services: ServiceGetters): Router {
         connected: databaseService.isAvailable(),
       },
     };
-
-    if (duneCacheService) {
-      const status = duneCacheService.getCacheStatus();
-      health.services.dune_cache = {
-        initialized: status.isInitialized,
-        refreshing: status.isRefreshing,
-        lastRefreshTime: status.lastUpdated ? status.lastUpdated.toISOString() : null,
-      };
-    }
-
-    if (hourlyAggregationService) {
-      health.services.hourly_volume = {
-        initialized: hourlyAggregationService.isInitialized,
-        databaseConnected: hourlyAggregationService.isDatabaseConnected(),
-      };
-    }
-
-    if (tenMinuteVolumeFetcherService) {
-      const status = tenMinuteVolumeFetcherService.getStatus();
-      health.services.ten_minute_volume = {
-        initialized: status.initialized,
-        running: status.isRunning,
-        refreshing: status.refreshInProgress,
-        lastRefreshTime: status.lastRefreshTime,
-      };
-    }
 
     const hasUnhealthyService = Object.values(health.services).some(
       (s: any) => s.initialized === false
@@ -139,48 +100,8 @@ export function createHealthRouter(services: ServiceGetters): Router {
 // Helper function to save health snapshots
 export async function saveHealthSnapshots(services: ServiceGetters): Promise<void> {
   const databaseService = services.getDatabaseService();
-  const duneCacheService = services.getDuneCacheService();
-  const hourlyAggregationService = services.getHourlyAggregationService();
-  const tenMinuteVolumeFetcherService = services.getTenMinuteVolumeFetcherService();
 
   if (!databaseService.isAvailable()) return;
-
-  if (duneCacheService) {
-    const status = duneCacheService.getCacheStatus();
-    await databaseService.insertServiceHealthSnapshot(
-      'dune_cache',
-      status.isInitialized,
-      status.lastUpdated,
-      undefined,
-      undefined,
-      { isRefreshing: status.isRefreshing }
-    );
-  }
-
-  if (hourlyAggregationService) {
-    const recordCount = await databaseService.getHourlyRecordCount();
-    await databaseService.insertServiceHealthSnapshot(
-      'hourly_volume',
-      hourlyAggregationService.isInitialized,
-      undefined,
-      recordCount,
-      undefined,
-      { databaseConnected: hourlyAggregationService.isDatabaseConnected() }
-    );
-  }
-
-  if (tenMinuteVolumeFetcherService) {
-    const status = tenMinuteVolumeFetcherService.getStatus();
-    const recordCount = await databaseService.getTenMinuteRecordCount();
-    await databaseService.insertServiceHealthSnapshot(
-      'ten_minute_volume',
-      status.initialized,
-      status.lastRefreshTime ? new Date(status.lastRefreshTime) : undefined,
-      recordCount,
-      undefined,
-      { isRunning: status.isRunning, refreshInProgress: status.refreshInProgress }
-    );
-  }
 
   const dailyCount = await databaseService.getDailyRecordCount();
   const hourlyCount = await databaseService.getHourlyRecordCount();

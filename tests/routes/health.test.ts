@@ -27,13 +27,6 @@ describe('Health Routes', () => {
       expect(typeof response.body.uptime).toBe('number');
       expect(response.body.uptime).toBeGreaterThanOrEqual(0);
     });
-
-    it('should include duneCache info when available', async () => {
-      const response = await request(app).get('/health');
-      
-      // duneCache may be null if not configured
-      expect(response.body).toHaveProperty('duneCache');
-    });
   });
 
   describe('GET /api/health', () => {

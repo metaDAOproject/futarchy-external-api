@@ -328,7 +328,7 @@ export function createDailyVolumesRepo(db: DbRuntime) {
 
     /**
      * Get rolling 24h metrics from v06_spot_ohlcv_1m table.
-     * Used when USE_DUNE_DATA=false to source FutarchyAMM volume from the v0.6 indexer.
+     * Sources FutarchyAMM rolling-24h volume from the v0.6 indexer.
      * Amounts in this table are raw integers (6 decimals) — caller divides by 1e6.
      */
     async getV06Rolling24hMetrics(tokens?: string[]): Promise<Map<string, Rolling24hMetrics>> {

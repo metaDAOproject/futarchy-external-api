@@ -75,13 +75,8 @@ function createMockServices(): Services {
     priceService: mockPriceService,
     databaseService: mockDatabaseService,
     externalDatabaseService: mockExternalDatabaseService,
-    duneService: null,
-    duneCacheService: null,
     solanaService: undefined,
     launchpadService: undefined,
-    hourlyAggregationService: null,
-    tenMinuteVolumeFetcherService: null,
-    dailyAggregationService: null,
     v06ReconciliationService: null,
   };
 }

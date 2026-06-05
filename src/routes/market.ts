@@ -1,15 +1,13 @@
 import { Router, type Request, type Response } from 'express';
 import { parseDateParam, parseCommaSeparatedList } from '../utils/validation.js';
-import { config } from '../config.js';
 import type { ServiceGetters } from './types.js';
 
 export function createMarketRouter(services: ServiceGetters): Router {
   const router = Router();
   const { getDatabaseService, getExternalDatabaseService } = services;
 
-  // Get daily market data with date range and optional token filtering
-  // When USE_DUNE_DATA=false, sources from v0.6 indexer aggregate table;
-  // otherwise uses the Dune-sourced daily_volumes table.
+  // Get daily market data with date range and optional token filtering.
+  // FutarchyAMM rows are sourced from the v0.6 indexer aggregate table.
   router.get('/api/market-data', async (req: Request, res: Response) => {
     const databaseService = getDatabaseService();
     
@@ -44,16 +42,12 @@ export function createMarketRouter(services: ServiceGetters): Router {
         endDate: endDateResult.value!,
       };
 
-      const useV06 = !config.useDuneData;
-
       // Meteora rows are served directly from our meteora accounting ETL
       // (futarchy.meteora_daily in the served DB, via externalDatabase).
       const externalDatabaseService = getExternalDatabaseService();
 
       const [futarchyData, meteoraData] = await Promise.all([
-        useV06
-          ? databaseService.getDailyTradingActivity(queryOptions)
-          : databaseService.getDailyBuySellVolumes(queryOptions),
+        databaseService.getDailyTradingActivity(queryOptions),
         externalDatabaseService?.isAvailable()
           ? externalDatabaseService.getDailyMeteoraVolumes(queryOptions)
           : Promise.resolve([]),
@@ -65,7 +59,7 @@ export function createMarketRouter(services: ServiceGetters): Router {
           startDate: startDateResult.value,
           endDate: endDateResult.value,
         },
-        source: useV06 ? 'v06-indexer' : 'dune',
+        source: 'v06-indexer',
         futarchyAMM: {
           count: futarchyData.length,
           data: futarchyData,
