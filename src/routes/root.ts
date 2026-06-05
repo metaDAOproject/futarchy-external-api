@@ -39,13 +39,7 @@ export function createRootRouter(_services: ServiceGetters): Router {
         futarchyAmmLiquidity: 'Tokens in the internal FutarchyAMM for spot trading - IS circulating',
         meteoraLpLiquidity: 'Tokens in the external Meteora DAMM pool (POL) - IS circulating',
       },
-      caching: {
-        description: 'Ticker volume is served from app DB aggregates populated by the separate indexer runtime',
-        refreshInterval: `${parseInt(process.env.DUNE_CACHE_REFRESH_INTERVAL || '3600')} seconds`,
-        fetchTimeout: `${parseInt(process.env.DUNE_FETCH_TIMEOUT || '240')} seconds`,
-        status: 'No live cache in API runtime',
-      },
-      note: 'This API discovers DAOs for serving responses; background indexing runs separately.',
+      note: 'Read-only API. Data is served from our own indexed/ETL data (served indexer DB + app-DB v0.6 aggregates); no Dune, no in-process indexing.',
     });
   });
 

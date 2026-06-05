@@ -5,24 +5,18 @@ import { FutarchyService } from '../services/futarchyService.js';
 import { LaunchpadService } from '../services/launchpadService.js';
 import { PriceService } from '../services/priceService.js';
 import { SolanaService } from '../services/solanaService.js';
-import { V06ReconciliationService } from '../services/v06ReconciliationService.js';
 import { logger } from '../utils/logger.js';
 
-export type RuntimeMode = 'api' | 'indexer';
+export type RuntimeMode = 'api';
 
 export function createServices(mode: RuntimeMode): Services {
+  void mode;
   const futarchyService = new FutarchyService();
   const priceService = new PriceService();
   const databaseService = new DatabaseService();
   const externalDatabaseService = new ExternalDatabaseService();
   const solanaService = new SolanaService();
   const launchpadService = new LaunchpadService();
-
-  let v06ReconciliationService: V06ReconciliationService | null = null;
-
-  if (mode === 'indexer') {
-    v06ReconciliationService = new V06ReconciliationService(databaseService, externalDatabaseService);
-  }
 
   return {
     futarchyService,
@@ -31,7 +25,6 @@ export function createServices(mode: RuntimeMode): Services {
     externalDatabaseService,
     solanaService,
     launchpadService,
-    v06ReconciliationService,
   };
 }
 

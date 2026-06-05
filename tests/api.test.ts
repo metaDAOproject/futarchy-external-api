@@ -78,7 +78,6 @@ function createMockServices(): Services {
     externalDatabaseService: mockExternalDatabaseService,
     solanaService: undefined,
     launchpadService: undefined,
-    v06ReconciliationService: null,
   };
 }
 

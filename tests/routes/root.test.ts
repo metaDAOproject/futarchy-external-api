@@ -46,12 +46,13 @@ describe('Root Routes', () => {
       expect(response.body.supplyBreakdown).toHaveProperty('circulatingSupply');
     });
 
-    it('should include caching information', async () => {
+    it('describes itself as a read-only, Dune-free API', async () => {
       const response = await request(app).get('/');
-      
-      expect(response.body).toHaveProperty('caching');
-      expect(response.body.caching).toHaveProperty('description');
-      expect(response.body.caching).toHaveProperty('refreshInterval');
+
+      // The stale Dune-cache block was removed; root now carries a `note` and no caching/Dune cruft.
+      expect(response.body).toHaveProperty('note');
+      expect(response.body.note).toContain('no Dune');
+      expect(response.body).not.toHaveProperty('caching');
     });
   });
 });

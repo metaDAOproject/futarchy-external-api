@@ -7,12 +7,5 @@ describe('runtime service composition', () => {
 
     expect(services.databaseService).toBeTruthy();
     expect(services.externalDatabaseService).toBeTruthy();
-    expect(services.v06ReconciliationService).toBeNull();
-  });
-
-  it('creates indexer services for reconciliation', () => {
-    const services = createServices('indexer');
-
-    expect(services.v06ReconciliationService).toBeTruthy();
   });
 });

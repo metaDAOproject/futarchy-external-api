@@ -197,14 +197,8 @@ bun run build
 # Start the server (runs build first)
 bun run start
 
-# Start indexing workers separately (runs build first)
-bun run start:indexer
-
 # Development with hot reload
 bun run dev
-
-# Development indexer with hot reload
-bun run dev:indexer
 ```
 
 ## Configuration
@@ -242,9 +236,8 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 src/
 ├── app.ts                        # Express app setup & middleware
 ├── main.ts                       # API entry point (serves routes, no indexing workers)
-├── indexer.ts                    # Indexer entry point (Dune collection, rollups, v0.6 reconciliation)
 ├── runtime/
-│   └── services.ts               # API/indexer service composition
+│   └── services.ts               # API service composition
 ├── config.ts                     # Environment variables & configuration
 ├── routes/
 │   ├── index.ts                  # Route registration
@@ -260,7 +253,6 @@ src/
 │   ├── priceService.ts           # Price, spread, liquidity calculations
 │   ├── databaseService.ts        # App DB (volumes, OHLCV, fees, metrics)
 │   ├── externalDatabaseService.ts # Read-only indexer DB connection
-│   ├── v06ReconciliationService.ts # v0.6 data reconciliation (served DB → app-DB v0.6 aggregates)
 │   ├── solanaService.ts          # SPL token supply queries
 │   ├── launchpadService.ts       # Token allocation breakdown
 │   └── metricsService.ts         # Prometheus counters/histograms
@@ -279,25 +271,12 @@ src/
 ### Sources (Dune fully removed)
 The API process serves data from the app DB (v0.6 aggregates: `v06_fee_volume_daily_aggregate`, `v06_spot_ohlcv_1m`) and the read-only served indexer DB (`futarchy.trades`, `futarchy.meteora_daily`, `v0_6_spot_swaps`). It does not start indexing, fetchers, rollups, or app-DB schema setup.
 
-The only remaining background job is **v0.6 reconciliation** (`bun run start:indexer`): reads `v0_6_spot_swaps` + `v0_6_conditional_swaps` from the served indexer DB and writes the v0.6 OHLCV + fee-breakdown aggregates to the app DB. (This is being phased out — the goal is for the API to read all FutarchyAMM aggregates directly from the served DB, with no indexer in this repo.)
+This is a pure read-only API with no in-process indexing: FutarchyAMM v0.6 aggregates are read from the app DB, while Meteora data and tickers are read from the served indexer DB.
 
 `/api/tickers` reads 24h metrics primarily from the served DB's `futarchy.trades` (direct), falling back to the app-DB v0.6 OHLCV.
 
 ### DexScreener Pipeline
 The DexScreener adapter reads **directly from the external indexer DB** (`v0_6_spot_swaps` + `v0_6_daos`) and serves real-time swap events indexed by Solana slot. No intermediate aggregation — raw swap data mapped to the DexScreener schema.
-
-## Backfill Scripts
-
-```bash
-# Full v0.6 backfill (since 2025-01-01)
-bun run backfill:v06
-
-# With custom range
-bun run backfill:v06 -- --since 2025-06-01
-
-# Chunked for large ranges
-bun run backfill:v06 -- --since 2025-01-01 --chunk-days 30
-```
 
 ## Rate Limiting
 

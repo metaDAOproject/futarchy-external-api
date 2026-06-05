@@ -75,7 +75,6 @@ export function createTestServices(overrides?: Partial<Services>): Services {
     externalDatabaseService: createMockExternalDatabaseService(),
     solanaService: createMockSolanaService(),
     launchpadService: createMockLaunchpadService(),
-    v06ReconciliationService: null,
     ...overrides,
   };
 }

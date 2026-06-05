@@ -4,7 +4,6 @@ import type { SolanaService } from '../services/solanaService.js';
 import type { LaunchpadService } from '../services/launchpadService.js';
 import type { DatabaseService } from '../services/databaseService.js';
 import type { ExternalDatabaseService } from '../services/externalDatabaseService.js';
-import type { V06ReconciliationService } from '../services/v06ReconciliationService.js';
 import { AppError } from '../middleware/errorHandler.js';
 
 /**
@@ -21,7 +20,6 @@ export interface Services {
   databaseService: DatabaseService;
 
   externalDatabaseService: ExternalDatabaseService | null;
-  v06ReconciliationService: V06ReconciliationService | null;
 
   solanaService?: SolanaService;
   launchpadService?: LaunchpadService;

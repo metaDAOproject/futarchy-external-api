@@ -110,8 +110,13 @@ export class ExternalDatabaseService {
       }
       return metricsMap;
     } catch (error: any) {
+      // Surface query/schema failures (e.g. served-DB contract drift) instead of
+      // masking them as an empty map — an empty map must mean "genuinely no spot
+      // trades in the window", not "the query failed". The /api/tickers handler is
+      // wrapped in asyncHandler, so this propagates to a clean 5xx rather than
+      // silently degrading to the v0.6 fallback and hiding the problem.
       logger.error('[ExternalDB] Error getting spot rolling 24h metrics from futarchy.trades:', error);
-      return new Map();
+      throw error;
     }
   }
 

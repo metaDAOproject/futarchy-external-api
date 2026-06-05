@@ -51,28 +51,32 @@ export function createCoinGeckoRouter(services: ServiceGetters): Router {
         }
       }
 
-      // Fallback: v0.6 indexer OHLCV (app DB, populated by reconciliation from
-      // the indexer DB). Live in prod and Dune-free — covers the window before
-      // futarchy.trades is populated for a DAO.
-      if (volumeMetricsMap.size === 0 && databaseService?.isAvailable()) {
-        const baseMints = allDaos.map(dao => dao.baseMint.toString());
-        const v06Metrics = await databaseService.getV06Rolling24hMetrics(baseMints);
+      // Fallback: v0.6 indexer OHLCV (app DB) for ONLY the DAOs the primary
+      // (futarchy.trades) didn't cover — per-DAO merge, not all-or-nothing. This
+      // covers the window before futarchy.trades is populated for a given DAO
+      // without zeroing out the DAOs that the primary did return.
+      const missingDaos = allDaos.filter(dao => !volumeMetricsMap.has(dao.daoAddress.toString()));
+      if (missingDaos.length > 0 && databaseService?.isAvailable()) {
+        const missingBaseMints = missingDaos.map(dao => dao.baseMint.toString());
+        const v06Metrics = await databaseService.getV06Rolling24hMetrics(missingBaseMints);
 
+        let filled = 0;
         for (const [tokenAddress, metrics] of v06Metrics.entries()) {
           const daoAddress = tokenToDaoMap.get(tokenAddress);
-          if (daoAddress) {
+          if (daoAddress && !volumeMetricsMap.has(daoAddress)) {
             volumeMetricsMap.set(daoAddress, {
               base_volume_24h: metrics.base_volume_24h,
               target_volume_24h: metrics.target_volume_24h,
               high_24h: metrics.high_24h,
               low_24h: metrics.low_24h,
             });
+            filled++;
           }
         }
 
-        if (volumeMetricsMap.size > 0) {
-          volumeSource = 'v06-indexer-fallback';
-          logger.debug('Using v0.6 indexer rolling 24h metrics (fallback)', { daoCount: volumeMetricsMap.size, requestId: req.requestId });
+        if (filled > 0) {
+          volumeSource = volumeSource === 'futarchy-trades-db' ? 'futarchy-trades-db+v06-fallback' : 'v06-indexer-fallback';
+          logger.debug('Filled missing DAOs from v0.6 indexer rolling 24h metrics', { filled, requestId: req.requestId });
         }
       }
 
