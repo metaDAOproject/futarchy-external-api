@@ -44,16 +44,16 @@ export function createRootRouter(services: ServiceGetters): Router {
         meteoraLpLiquidity: 'Tokens in the external Meteora DAMM pool (POL) - IS circulating',
       },
       caching: {
-        description: 'Dune data is cached and refreshed hourly to improve response times',
+        description: 'Ticker volume is served from app DB aggregates populated by the separate indexer runtime',
         refreshInterval: `${parseInt(process.env.DUNE_CACHE_REFRESH_INTERVAL || '3600')} seconds`,
         fetchTimeout: `${parseInt(process.env.DUNE_FETCH_TIMEOUT || '240')} seconds`,
         status: cacheStatus ? {
           isInitialized: cacheStatus.isInitialized,
           poolMetricsCount: cacheStatus.poolMetricsCount,
           lastUpdated: cacheStatus.lastUpdated.toISOString(),
-        } : 'Not available (DUNE_API_KEY not set)',
+        } : 'No live cache in API runtime',
       },
-      note: 'This API automatically discovers and aggregates all DAOs from the Futarchy protocol.',
+      note: 'This API discovers DAOs for serving responses; background indexing runs separately.',
     });
   });
 

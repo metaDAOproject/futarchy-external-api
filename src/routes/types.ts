@@ -8,7 +8,6 @@ import type { DatabaseService } from '../services/databaseService.js';
 import type { HourlyAggregationService } from '../services/hourlyAggregationService.js';
 import type { TenMinuteVolumeFetcherService } from '../services/tenMinuteVolumeFetcherService.js';
 import type { DailyAggregationService } from '../services/dailyAggregationService.js';
-import type { MeteoraVolumeFetcherService } from '../services/meteoraVolumeFetcherService.js';
 import type { ExternalDatabaseService } from '../services/externalDatabaseService.js';
 import type { V06ReconciliationService } from '../services/v06ReconciliationService.js';
 import { AppError } from '../middleware/errorHandler.js';
@@ -32,7 +31,6 @@ export interface Services {
   hourlyAggregationService: HourlyAggregationService | null;
   tenMinuteVolumeFetcherService: TenMinuteVolumeFetcherService | null;
   dailyAggregationService: DailyAggregationService | null;
-  meteoraVolumeFetcherService: MeteoraVolumeFetcherService | null;
   v06ReconciliationService: V06ReconciliationService | null;
 
   solanaService?: SolanaService;
@@ -55,7 +53,6 @@ export interface ServiceGetters {
   getHourlyAggregationService: () => HourlyAggregationService | null;
   getTenMinuteVolumeFetcherService: () => TenMinuteVolumeFetcherService | null;
   getDailyAggregationService: () => DailyAggregationService | null;
-  getMeteoraVolumeFetcherService: () => MeteoraVolumeFetcherService | null;
   getExternalDatabaseService: () => ExternalDatabaseService | null;
 }
 
@@ -79,7 +76,6 @@ export function createServiceGetters(services: Services): ServiceGetters {
     getHourlyAggregationService: () => optionalService(services.hourlyAggregationService),
     getTenMinuteVolumeFetcherService: () => optionalService(services.tenMinuteVolumeFetcherService),
     getDailyAggregationService: () => optionalService(services.dailyAggregationService),
-    getMeteoraVolumeFetcherService: () => optionalService(services.meteoraVolumeFetcherService),
     getExternalDatabaseService: () => optionalService(services.externalDatabaseService),
 
     getSolanaService: () => requireService(services.solanaService, 'Solana'),

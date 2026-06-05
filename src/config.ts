@@ -54,8 +54,6 @@ export const config = {
     apiKey: process.env.DUNE_API_KEY || '',
     // ACTIVE: 10-minute query - single source of truth, all other data aggregated from this
     tenMinuteVolumeQueryId: process.env.DUNE_TEN_MINUTE_VOLUME_QUERY_ID ? parseInt(process.env.DUNE_TEN_MINUTE_VOLUME_QUERY_ID) : undefined,
-    // ACTIVE: Meteora daily volumes query - tracks Meteora pool fees per owner (service currently disabled)
-    meteoraVolumeQueryId: process.env.DUNE_METEORA_VOLUME_QUERY_ID ? parseInt(process.env.DUNE_METEORA_VOLUME_QUERY_ID) : undefined,
   },
   alerts: {
     webhookUrl: process.env.ALERT_WEBHOOK_URL || 'https://telegram-webhook-relay.themetadao-org.workers.dev',

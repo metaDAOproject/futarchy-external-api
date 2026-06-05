@@ -8,7 +8,6 @@ import { createDailyVolumesRepo } from './database/internal/repos/dailyVolumesRe
 import { createIntervalVolumesRepo } from './database/internal/repos/intervalVolumesRepo.js';
 import { createDailyBuySellVolumesRepo } from './database/internal/repos/dailyBuySellVolumesRepo.js';
 import { createDailyFeesVolumesRepo } from './database/internal/repos/dailyFeesVolumesRepo.js';
-import { createDailyMeteoraVolumesRepo } from './database/internal/repos/dailyMeteoraVolumesRepo.js';
 import { createMetricsRepo } from './database/internal/repos/metricsRepo.js';
 import { createV06TradingActivityRepo } from './database/internal/repos/v06TradingActivityRepo.js';
 
@@ -112,24 +111,6 @@ export interface DailyFeesVolumeRecord {
   low: string;
 }
 
-export interface DailyMeteoraVolumeRecord {
-  token: string;  // mapped from owner
-  date: string;    // YYYY-MM-DD
-  base_volume: string;  // volume_usd_approx
-  target_volume: string;  // calculated from buy_volume + sell_volume
-  trade_count: number;  // num_swaps
-  buy_volume: string;
-  sell_volume: string;
-  usdc_fees: string;  // lp_fee_usdc
-  token_fees: string;  // lp_fee_token
-  token_fees_usdc: string;  // lp_fee_token_usdc
-  token_per_usdc: string;  // token_per_usdc_raw
-  average_price: string;  // token_price_usdc
-  ownership_share: string;  // ownership_share
-  earned_fee_usdc: string;  // earned_fee_usdc
-  is_complete: boolean;
-}
-
 export interface CumulativeVolumeData {
   token: string;
   date: string;
@@ -166,6 +147,10 @@ export interface TokenVolumeAggregate {
   daily_data: DailyVolumeRecord[];
 }
 
+export interface DatabaseInitializeOptions {
+  ensureSchema?: boolean;
+}
+
 export class DatabaseService {
   public pool: pg.Pool | null = null;
   private isConnected: boolean = false;
@@ -184,7 +169,6 @@ export class DatabaseService {
   private _intervalVolumes = createIntervalVolumesRepo(this.dbRuntime);
   private _dailyBuySellVolumes = createDailyBuySellVolumesRepo(this.dbRuntime);
   private _dailyFeesVolumes = createDailyFeesVolumesRepo(this.dbRuntime);
-  private _dailyMeteoraVolumes = createDailyMeteoraVolumesRepo(this.dbRuntime);
   private _metrics = createMetricsRepo(this.dbRuntime);
   private _v06TradingActivity = createV06TradingActivityRepo(this.dbRuntime);
 
@@ -224,9 +208,11 @@ export class DatabaseService {
   }
 
   /**
-   * Initialize the database connection and create tables if needed
+   * Initialize the database connection.
    */
-  async initialize(): Promise<boolean> {
+  async initialize(options: DatabaseInitializeOptions = {}): Promise<boolean> {
+    const { ensureSchema = true } = options;
+
     if (!this.pool) {
       logger.info('[Database] No database configuration provided, volume history will use in-memory cache only');
       return false;
@@ -238,11 +224,10 @@ export class DatabaseService {
       logger.info('[Database] Connected to PostgreSQL');
       client.release();
 
-      // Create tables
-      await this._schema.createTables();
-      
-      // Create aggregation functions
-      await this._schema.createAggregationFunctions();
+      if (ensureSchema) {
+        await this._schema.createTables();
+        await this._schema.createAggregationFunctions();
+      }
       
       this.isConnected = true;
       this.consecutiveFailures = 0;
@@ -576,48 +561,6 @@ export class DatabaseService {
 
   async getFeesRecordCount(): Promise<number> {
     return this._dailyFeesVolumes.getFeesRecordCount();
-  }
-
-  // ============================================
-  // Daily Meteora volumes (delegated to DailyMeteoraVolumesRepo)
-  // ============================================
-
-  async getDailyMeteoraVolumes(options?: {
-    token?: string;
-    tokens?: string[];
-    startDate?: string;
-    endDate?: string;
-  }): Promise<{
-    token: string;
-    date: string;
-    base_volume: string;
-    target_volume: string;
-    buy_volume: string;
-    sell_volume: string;
-    trade_count: number;
-    average_price: string;
-    usdc_fees: string;
-    token_fees: string;
-    token_fees_usdc: string;
-    token_per_usdc: string;
-  }[]> {
-    return this._dailyMeteoraVolumes.getDailyMeteoraVolumes(options);
-  }
-
-  async getLatestMeteoraDate(): Promise<string | null> {
-    return this._dailyMeteoraVolumes.getLatestMeteoraDate();
-  }
-
-  async upsertDailyMeteoraVolumes(records: DailyMeteoraVolumeRecord[], markComplete: boolean = false): Promise<number> {
-    return this._dailyMeteoraVolumes.upsertDailyMeteoraVolumes(records, markComplete);
-  }
-
-  async markMeteoraDaysComplete(beforeDate: string): Promise<void> {
-    return this._dailyMeteoraVolumes.markMeteoraDaysComplete(beforeDate);
-  }
-
-  async getMeteoraRecordCount(): Promise<number> {
-    return this._dailyMeteoraVolumes.getMeteoraRecordCount();
   }
 
   // ============================================

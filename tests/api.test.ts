@@ -5,6 +5,7 @@ import { createApp, type Services } from '../src/app.js';
 import type { FutarchyService, DaoTickerData } from '../src/services/futarchyService.js';
 import type { PriceService } from '../src/services/priceService.js';
 import type { DatabaseService } from '../src/services/databaseService.js';
+import type { ExternalDatabaseService } from '../src/services/externalDatabaseService.js';
 
 // Mock DAO data
 const mockBaseMint = new PublicKey('SoLo9oxzLDpcq1dpqAgMwgce5WqkRDtNXK7EPnbmeta');
@@ -57,13 +58,23 @@ const mockPriceService = {
 const mockDatabaseService = {
   isAvailable: jest.fn().mockReturnValue(true),
   getFirstTradeDates: jest.fn().mockResolvedValue(new Map()),
+  // v0.6 indexer fallback for /api/tickers 24h volume
+  getV06Rolling24hMetrics: jest.fn().mockResolvedValue(new Map()),
 } as unknown as DatabaseService;
+
+// Primary /api/tickers source: rolling-24h spot metrics read straight from the
+// indexer DB (futarchy.trades), keyed by dao_addr.
+const mockExternalDatabaseService = {
+  isAvailable: jest.fn().mockReturnValue(true),
+  getSpotRolling24hMetrics: jest.fn().mockResolvedValue(new Map()),
+} as unknown as ExternalDatabaseService;
 
 function createMockServices(): Services {
   return {
     futarchyService: mockFutarchyService,
     priceService: mockPriceService,
     databaseService: mockDatabaseService,
+    externalDatabaseService: mockExternalDatabaseService,
     duneService: null,
     duneCacheService: null,
     solanaService: undefined,
@@ -71,7 +82,7 @@ function createMockServices(): Services {
     hourlyAggregationService: null,
     tenMinuteVolumeFetcherService: null,
     dailyAggregationService: null,
-    meteoraVolumeFetcherService: null,
+    v06ReconciliationService: null,
   };
 }
 
@@ -122,6 +133,46 @@ describe('CoinGecko API', () => {
         expect(response.body[0].base_volume).toBe('0');
         expect(response.body[0].target_volume).toBe('0');
       }
+    });
+
+    it('should read 24h volume from the indexer DB (futarchy.trades) keyed by dao_addr', async () => {
+      (mockExternalDatabaseService as any).getSpotRolling24hMetrics.mockResolvedValueOnce(new Map([
+        [mockDaoAddress.toString(), {
+          token: mockDaoAddress.toString(),
+          base_volume_24h: '12.5',
+          target_volume_24h: '125',
+          high_24h: '0.06',
+          low_24h: '0.04',
+          trade_count_24h: 4,
+        }],
+      ]));
+
+      const response = await request(app).get('/api/tickers');
+
+      expect(response.status).toBe(200);
+      expect(response.body[0].base_volume).toBe('12.5');
+      expect(response.body[0].target_volume).toBe('125');
+      expect(response.body[0].high_24h).toBe('0.06');
+      expect(response.body[0].low_24h).toBe('0.04');
+    });
+
+    it('should fall back to v0.6 indexer metrics when futarchy.trades is empty', async () => {
+      (mockDatabaseService as any).getV06Rolling24hMetrics.mockResolvedValueOnce(new Map([
+        [mockBaseMint.toString(), {
+          token: mockBaseMint.toString(),
+          base_volume_24h: '7',
+          target_volume_24h: '70',
+          high_24h: '0.06',
+          low_24h: '0.04',
+          trade_count_24h: 3,
+        }],
+      ]));
+
+      const response = await request(app).get('/api/tickers');
+
+      expect(response.status).toBe(200);
+      expect(response.body[0].base_volume).toBe('7');
+      expect(response.body[0].target_volume).toBe('70');
     });
   });
 

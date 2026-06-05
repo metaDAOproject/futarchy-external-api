@@ -15,6 +15,8 @@ export function createMockDatabaseService(): DatabaseService {
     getTenMinuteRecordCount: async () => 0,
     getDailyRecordCount: async () => 0,
     getBuySellRecordCount: async () => 0,
+    getRolling24hFromTenMinute: async () => new Map(),
+    getRolling24hMetrics: async () => new Map(),
     insertServiceHealthSnapshot: async () => {},
     insertMetricsBatch: async () => {},
     pruneOldMetrics: async () => {},
@@ -71,7 +73,7 @@ export function createTestServices(overrides?: Partial<Services>): Services {
     hourlyAggregationService: null,
     tenMinuteVolumeFetcherService: null,
     dailyAggregationService: null,
-    meteoraVolumeFetcherService: null,
+    v06ReconciliationService: null,
     ...overrides,
   };
 }

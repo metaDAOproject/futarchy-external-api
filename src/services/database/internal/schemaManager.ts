@@ -155,33 +155,6 @@ export function createSchemaManager(db: DbRuntime) {
       CREATE INDEX IF NOT EXISTS idx_daily_fees_volumes_date ON daily_fees_volumes(trading_date);
       CREATE INDEX IF NOT EXISTS idx_daily_fees_volumes_token_date ON daily_fees_volumes(token, trading_date);
 
-      -- Daily Meteora volumes table for tracking Meteora pool fees and volumes per owner
-      CREATE TABLE IF NOT EXISTS daily_meteora_volumes (
-        id SERIAL PRIMARY KEY,
-        token VARCHAR(64) NOT NULL,
-        date DATE NOT NULL,
-        base_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
-        target_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
-        trade_count INT NOT NULL DEFAULT 0,
-        buy_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
-        sell_volume NUMERIC(40, 12) NOT NULL DEFAULT 0,
-        usdc_fees NUMERIC(40, 12) NOT NULL DEFAULT 0,
-        token_fees NUMERIC(40, 12) NOT NULL DEFAULT 0,
-        token_fees_usdc NUMERIC(40, 12) NOT NULL DEFAULT 0,
-        token_per_usdc NUMERIC(40, 12) NOT NULL DEFAULT 0,
-        average_price NUMERIC(40, 12) NOT NULL DEFAULT 0,
-        ownership_share NUMERIC(40, 12) NOT NULL DEFAULT 0,
-        earned_fee_usdc NUMERIC(40, 12) NOT NULL DEFAULT 0,
-        is_complete BOOLEAN NOT NULL DEFAULT false,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(token, date)
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_daily_meteora_volumes_token ON daily_meteora_volumes(token);
-      CREATE INDEX IF NOT EXISTS idx_daily_meteora_volumes_date ON daily_meteora_volumes(date);
-      CREATE INDEX IF NOT EXISTS idx_daily_meteora_volumes_token_date ON daily_meteora_volumes(token, date);
-
       -- Metrics history table for storing periodic snapshots of system metrics
       CREATE TABLE IF NOT EXISTS metrics_history (
         id SERIAL PRIMARY KEY,

@@ -5,7 +5,7 @@ import type { ServiceGetters } from './types.js';
 
 export function createMarketRouter(services: ServiceGetters): Router {
   const router = Router();
-  const { getDatabaseService } = services;
+  const { getDatabaseService, getExternalDatabaseService } = services;
 
   // Get daily market data with date range and optional token filtering
   // When USE_DUNE_DATA=false, sources from v0.6 indexer aggregate table;
@@ -46,13 +46,19 @@ export function createMarketRouter(services: ServiceGetters): Router {
 
       const useV06 = !config.useDuneData;
 
+      // Meteora rows are served directly from our meteora accounting ETL
+      // (futarchy.meteora_daily in the served DB, via externalDatabase).
+      const externalDatabaseService = getExternalDatabaseService();
+
       const [futarchyData, meteoraData] = await Promise.all([
         useV06
           ? databaseService.getDailyTradingActivity(queryOptions)
           : databaseService.getDailyBuySellVolumes(queryOptions),
-        databaseService.getDailyMeteoraVolumes(queryOptions),
+        externalDatabaseService?.isAvailable()
+          ? externalDatabaseService.getDailyMeteoraVolumes(queryOptions)
+          : Promise.resolve([]),
       ]);
-      
+
       res.json({
         filters: {
           tokens: tokensResult.value || 'all',
@@ -65,6 +71,7 @@ export function createMarketRouter(services: ServiceGetters): Router {
           data: futarchyData,
         },
         meteora: {
+          source: 'etl-meteora-daily',
           count: meteoraData.length,
           data: meteoraData,
         },

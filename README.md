@@ -55,7 +55,7 @@ Returns all DAO tickers with pricing, volume, and liquidity information. Automat
 | `high_24h` / `low_24h` | 24h high/low (when available) |
 | `startDate` | First trade date for the token |
 
-**Volume sources** (priority order): 10-minute DB → hourly DB → Dune cache.
+**Volume sources** (priority order): 10-minute DB → hourly DB → optional legacy cache.
 
 ---
 
@@ -199,8 +199,14 @@ bun run build
 # Start the server (runs build first)
 bun run start
 
+# Start indexing workers separately (runs build first)
+bun run start:indexer
+
 # Development with hot reload
 bun run dev
+
+# Development indexer with hot reload
+bun run dev:indexer
 ```
 
 ## Configuration
@@ -242,7 +248,10 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 ```
 src/
 ├── app.ts                        # Express app setup & middleware
-├── main.ts                       # Entry point, service wiring, scheduled tasks
+├── main.ts                       # API entry point (serves routes, no indexing workers)
+├── indexer.ts                    # Indexer entry point (Dune collection, rollups, v0.6 reconciliation)
+├── runtime/
+│   └── services.ts               # API/indexer service composition
 ├── config.ts                     # Environment variables & configuration
 ├── routes/
 │   ├── index.ts                  # Route registration
@@ -281,9 +290,24 @@ src/
 ## Data Pipeline
 
 ### Volume Sources (priority order)
+The API process serves data from the app DB and read-only external indexer DB. It does not start indexing, Dune fetchers, rollups, reconciliation workers, or app-DB schema setup.
+
+Run the indexer process separately:
+
+```bash
+bun run dev:indexer
+
+# production
+bun run start:indexer
+```
+
+Indexer-owned jobs:
+
 1. **10-minute volumes** — from Dune, stored in `ten_minute_volumes`, rolled up to hourly/daily
 2. **v0.6 Reconciliation** — hourly job reads `v0_6_spot_swaps` + `v0_6_conditional_swaps` from the external indexer DB, writes OHLCV and fee breakdowns to app DB
-3. **Dune cache** — fallback for 24h metrics when DB sources unavailable
+3. **Dune cache health** — maintained only by the indexer runtime for compatibility with existing health/metrics views
+
+The API's `/api/tickers` reads 24h metrics directly from the app DB in priority order: `ten_minute_volumes` → `hourly_volumes` → optional legacy cache if a caller intentionally wires it.
 
 ### DexScreener Pipeline
 The DexScreener adapter reads **directly from the external indexer DB** (`v0_6_spot_swaps` + `v0_6_daos`) and serves real-time swap events indexed by Solana slot. No intermediate aggregation — raw swap data mapped to the DexScreener schema.

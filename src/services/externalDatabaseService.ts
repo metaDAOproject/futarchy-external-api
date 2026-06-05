@@ -1,6 +1,7 @@
 import pg from 'pg';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import type { Rolling24hMetrics } from './databaseService.js';
 
 // Force pg to serialize Date parameters as ISO-8601 UTC strings so PostgreSQL
 // doesn't receive un-parseable local-timezone names like "GMT-0700".
@@ -11,7 +12,8 @@ const { Pool } = pg;
 /**
  * Read-only connection pool to the external indexer database.
  * Used by v0.6 reconciliation to query v0_6_spot_swaps,
- * v0_6_conditional_swaps, v0_6_daos, and v0_6_proposals.
+ * v0_6_conditional_swaps, v0_6_daos, and v0_6_proposals, and by /api/tickers to
+ * read rolling-24h spot metrics directly from futarchy.trades.
  */
 export class ExternalDatabaseService {
   private pool: pg.Pool | null = null;
@@ -53,6 +55,138 @@ export class ExternalDatabaseService {
       throw new Error('External database not connected');
     }
     return this.pool.query(text, params);
+  }
+
+  /**
+   * Rolling 24h spot-market volume metrics per DAO, read directly from the
+   * indexer's per-swap futarchy.trades table (no Dune, no app-DB rollup).
+   *
+   * Keyed by dao_addr (= the ticker's pool_id), so the caller needs no
+   * token→dao remap. Amounts are raw on-chain integers, so base/quote volume
+   * are scaled by each side's real decimals (futarchy.tokens.decimals, default
+   * 6) and price (raw quote/base) is rescaled to human units by
+   * 10^(baseDecimals − quoteDecimals) — matching the decimal-aware last_price.
+   *
+   * Returns an empty Map if the connection is down or no spot trades exist in
+   * the window (caller treats that as "fall back to another source").
+   */
+  async getSpotRolling24hMetrics(daoAddrs: string[]): Promise<Map<string, Rolling24hMetrics>> {
+    if (!this.pool || !this.isConnected || daoAddrs.length === 0) {
+      return new Map();
+    }
+
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    try {
+      const result = await this.pool.query(
+        `SELECT
+           t.dao_addr,
+           (SUM(t.base_amount)  / power(10::numeric, COALESCE(bt.decimals, 6)))::text  AS base_volume_24h,
+           (SUM(t.quote_amount) / power(10::numeric, COALESCE(qt.decimals, 6)))::text  AS target_volume_24h,
+           (MAX(t.price) * power(10::numeric, COALESCE(bt.decimals, 6) - COALESCE(qt.decimals, 6)))::text AS high_24h,
+           (MIN(t.price) FILTER (WHERE t.price > 0) * power(10::numeric, COALESCE(bt.decimals, 6) - COALESCE(qt.decimals, 6)))::text AS low_24h,
+           COUNT(*)::int AS trade_count_24h
+         FROM futarchy.trades t
+         JOIN futarchy.daos d ON d.dao_addr = t.dao_addr
+         LEFT JOIN futarchy.tokens bt ON bt.mint = d.base_mint
+         LEFT JOIN futarchy.tokens qt ON qt.mint = d.quote_mint
+         WHERE t.market_kind = 'spot'
+           AND t.block_time >= $1
+           AND t.dao_addr = ANY($2::text[])
+         GROUP BY t.dao_addr, bt.decimals, qt.decimals`,
+        [cutoff, daoAddrs]
+      );
+
+      const metricsMap = new Map<string, Rolling24hMetrics>();
+      for (const row of result.rows) {
+        metricsMap.set(row.dao_addr, {
+          token: row.dao_addr,
+          base_volume_24h: row.base_volume_24h ?? '0',
+          target_volume_24h: row.target_volume_24h ?? '0',
+          high_24h: row.high_24h ?? '0',
+          low_24h: row.low_24h ?? '0',
+          trade_count_24h: row.trade_count_24h ?? 0,
+        });
+      }
+      return metricsMap;
+    } catch (error: any) {
+      logger.error('[ExternalDB] Error getting spot rolling 24h metrics from futarchy.trades:', error);
+      return new Map();
+    }
+  }
+
+  /**
+   * Daily Meteora volumes read DIRECTLY from the meteora accounting ETL's
+   * `futarchy.meteora_daily` view in our served DB — the source of truth that
+   * replaces the Dune-sourced `daily_meteora_volumes` app-DB table.
+   *
+   * Returns the SAME column contract as the old (Dune) path so /api/market-data
+   * consumers are unchanged: token (base mint), date, base_volume, target_volume,
+   * buy_volume, sell_volume, trade_count, average_price, usdc_fees, token_fees,
+   * token_fees_usdc, token_per_usdc. Returns an empty array if the connection is
+   * down (the route serves an empty meteora list in that case).
+   */
+  async getDailyMeteoraVolumes(options?: {
+    token?: string;
+    tokens?: string[];
+    startDate?: string;
+    endDate?: string;
+  }): Promise<Array<{
+    token: string; date: string; base_volume: string; target_volume: string;
+    buy_volume: string; sell_volume: string; trade_count: number; average_price: string;
+    usdc_fees: string; token_fees: string; token_fees_usdc: string; token_per_usdc: string;
+  }>> {
+    if (!this.pool || !this.isConnected) {
+      return [];
+    }
+    const conditions: string[] = [];
+    const params: any[] = [];
+    let i = 1;
+    if (options?.tokens && options.tokens.length > 0) {
+      conditions.push(`token = ANY($${i}::text[])`);
+      params.push(options.tokens);
+      i++;
+    } else if (options?.token) {
+      conditions.push(`token = $${i}`);
+      params.push(options.token);
+      i++;
+    }
+    if (options?.startDate) {
+      conditions.push(`date >= $${i}`);
+      params.push(options.startDate);
+      i++;
+    }
+    if (options?.endDate) {
+      conditions.push(`date <= $${i}`);
+      params.push(options.endDate);
+      i++;
+    }
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    try {
+      const result = await this.pool.query(
+        `SELECT
+           token,
+           date::text,
+           base_volume::text,
+           target_volume::text,
+           buy_volume::text,
+           sell_volume::text,
+           trade_count,
+           average_price::text,
+           usdc_fees::text,
+           token_fees::text,
+           token_fees_usdc::text,
+           token_per_usdc::text
+         FROM futarchy.meteora_daily
+         ${whereClause}
+         ORDER BY token, date ASC`,
+        params
+      );
+      return result.rows;
+    } catch (error: any) {
+      logger.error('[ExternalDB] Error getting daily Meteora volumes from futarchy.meteora_daily:', error);
+      return [];
+    }
   }
 
   async close(): Promise<void> {

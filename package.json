@@ -6,8 +6,11 @@
   "version": "2.0.0",
   "scripts": {
     "dev": "bun --watch src/main.ts",
+    "dev:indexer": "bun --watch src/indexer.ts",
     "build": "tsc",
     "start": "bun dist/main.js",
+    "prestart:indexer": "bun run build",
+    "start:indexer": "bun dist/indexer.js",
     "prestart": "bun run build",
     "test": "bun test",
     "backfill": "bun run scripts/backfill.ts",
