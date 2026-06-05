@@ -189,6 +189,32 @@ export class ExternalDatabaseService {
     }
   }
 
+  /**
+   * First spot-trade date per token (base mint), from the v0.6 indexer's per-swap
+   * v0_6_spot_swaps in the served DB (replaces the frozen Dune buy/sell volumes table).
+   * Returns Map<token(base mint), 'YYYY-MM-DD'>. Empty map if the connection is down.
+   */
+  async getFirstTradeDates(): Promise<Map<string, string>> {
+    if (!this.pool || !this.isConnected) {
+      return new Map();
+    }
+    try {
+      const result = await this.pool.query(
+        `SELECT d.base_mint_acct AS token,
+                MIN((to_timestamp(s.unix_timestamp) AT TIME ZONE 'UTC')::date)::text AS first_date
+           FROM v0_6_spot_swaps s
+           JOIN v0_6_daos d ON d.dao_addr = s.dao_addr
+          GROUP BY d.base_mint_acct`
+      );
+      const m = new Map<string, string>();
+      for (const row of result.rows) m.set(row.token, row.first_date);
+      return m;
+    } catch (error: any) {
+      logger.error('[ExternalDB] Error getting first trade dates from v0_6_spot_swaps:', error);
+      return new Map();
+    }
+  }
+
   async close(): Promise<void> {
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);

@@ -57,16 +57,17 @@ const mockPriceService = {
 
 const mockDatabaseService = {
   isAvailable: jest.fn().mockReturnValue(true),
-  getFirstTradeDates: jest.fn().mockResolvedValue(new Map()),
   // v0.6 indexer fallback for /api/tickers 24h volume
   getV06Rolling24hMetrics: jest.fn().mockResolvedValue(new Map()),
 } as unknown as DatabaseService;
 
 // Primary /api/tickers source: rolling-24h spot metrics read straight from the
-// indexer DB (futarchy.trades), keyed by dao_addr.
+// indexer DB (futarchy.trades), keyed by dao_addr. First-trade dates (startDate)
+// also come from the served (external) DB now.
 const mockExternalDatabaseService = {
   isAvailable: jest.fn().mockReturnValue(true),
   getSpotRolling24hMetrics: jest.fn().mockResolvedValue(new Map()),
+  getFirstTradeDates: jest.fn().mockResolvedValue(new Map()),
 } as unknown as ExternalDatabaseService;
 
 function createMockServices(): Services {
@@ -149,6 +150,26 @@ describe('CoinGecko API', () => {
       expect(response.body[0].target_volume).toBe('125');
       expect(response.body[0].high_24h).toBe('0.06');
       expect(response.body[0].low_24h).toBe('0.04');
+    });
+
+    it('should set startDate from the served DB first-trade dates (keyed by base mint)', async () => {
+      (mockExternalDatabaseService as any).getFirstTradeDates.mockResolvedValueOnce(
+        new Map([[mockBaseMint.toString(), '2024-03-07']])
+      );
+
+      const response = await request(app).get('/api/tickers');
+
+      expect(response.status).toBe(200);
+      expect(response.body[0].startDate).toBe('2024-03-07');
+      expect((mockExternalDatabaseService as any).getFirstTradeDates).toHaveBeenCalled();
+    });
+
+    it('should omit startDate when no first-trade date exists for the base mint', async () => {
+      // Default mock returns an empty Map.
+      const response = await request(app).get('/api/tickers');
+
+      expect(response.status).toBe(200);
+      expect(response.body[0]).not.toHaveProperty('startDate');
     });
 
     it('should fall back to v0.6 indexer metrics when futarchy.trades is empty', async () => {

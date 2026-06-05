@@ -5,9 +5,6 @@ import { sendAlert } from '../utils/alerts.js';
 import type { DbRuntime } from './database/internal/dbRuntime.js';
 import { createSchemaManager } from './database/internal/schemaManager.js';
 import { createDailyVolumesRepo } from './database/internal/repos/dailyVolumesRepo.js';
-import { createIntervalVolumesRepo } from './database/internal/repos/intervalVolumesRepo.js';
-import { createDailyBuySellVolumesRepo } from './database/internal/repos/dailyBuySellVolumesRepo.js';
-import { createDailyFeesVolumesRepo } from './database/internal/repos/dailyFeesVolumesRepo.js';
 import { createMetricsRepo } from './database/internal/repos/metricsRepo.js';
 import { createV06TradingActivityRepo } from './database/internal/repos/v06TradingActivityRepo.js';
 
@@ -17,115 +14,6 @@ pg.defaults.parseInputDatesAsUTC = true;
 
 const { Pool } = pg;
 
-export interface DailyVolumeRecord {
-  token: string;
-  date: string; // YYYY-MM-DD
-  base_volume: string;
-  target_volume: string;
-  buy_volume?: string;
-  sell_volume?: string;
-  high: string;
-  low: string;
-  average_price?: string;
-  trade_count?: number;
-  usdc_fees?: string;
-  token_fees?: string;
-  token_fees_usdc?: string;
-  sell_volume_usdc?: string;
-  cumulative_usdc_fees?: string;
-  cumulative_token_in_usdc_fees?: string;
-  cumulative_target_volume?: string;
-  cumulative_token_volume?: string;
-}
-
-export interface HourlyVolumeRecord {
-  token: string;
-  hour: string; // ISO timestamp (YYYY-MM-DD HH:00:00)
-  base_volume: string;
-  target_volume: string;
-  buy_volume?: string;
-  sell_volume?: string;
-  high: string;
-  low: string;
-  average_price?: string;
-  trade_count: number;
-  usdc_fees?: string;
-  token_fees?: string;
-  token_fees_usdc?: string;
-  sell_volume_usdc?: string;
-}
-
-export interface TenMinuteVolumeRecord {
-  token: string;
-  bucket: string; // ISO timestamp (YYYY-MM-DD HH:M0:00 where M is 0,1,2,3,4,5)
-  base_volume: string;
-  target_volume: string;
-  buy_volume?: string;
-  sell_volume?: string;
-  high: string;
-  low: string;
-  average_price?: string;
-  trade_count: number;
-  usdc_fees?: string;
-  token_fees?: string;
-  token_fees_usdc?: string;
-  sell_volume_usdc?: string;
-}
-
-export interface DailyBuySellVolumeRecord {
-  token: string;
-  date: string; // YYYY-MM-DD
-  base_volume: string;
-  target_volume: string;
-  buy_usdc_volume: string;
-  sell_token_volume: string;
-  high: string;
-  low: string;
-  trade_count: number;
-  average_price: string;
-  usdc_fees: string;
-  token_fees: string;
-  token_fees_usdc: string;
-  sell_volume_usdc: string;
-  sell_volume: string;
-  buy_volume: string;
-}
-
-export interface DailyFeesVolumeRecord {
-  token: string;
-  trading_date: string; // YYYY-MM-DD
-  base_volume: string;
-  target_volume: string;
-  usdc_fees: string;
-  token_fees_usdc: string;
-  token_fees: string;
-  buy_volume: string;
-  sell_volume: string;
-  sell_volume_usdc: string;
-  cumulative_usdc_fees: string;
-  cumulative_token_in_usdc_fees: string;
-  cumulative_target_volume: string;
-  cumulative_token_volume: string;
-  high: string;
-  average_price: string;
-  low: string;
-}
-
-export interface CumulativeVolumeData {
-  token: string;
-  date: string;
-  base_volume: string;
-  target_volume: string;
-  buy_usdc_volume: string;
-  sell_token_volume: string;
-  cumulative_target_volume: string;
-  cumulative_base_volume: string;
-  cumulative_buy_usdc_volume: string;
-  cumulative_sell_token_volume: string;
-  high: string;
-  low: string;
-}
-
 export interface Rolling24hMetrics {
   token: string;
   base_volume_24h: string;
@@ -133,18 +21,6 @@ export interface Rolling24hMetrics {
   high_24h: string;
   low_24h: string;
   trade_count_24h: number;
-}
-
-export interface TokenVolumeAggregate {
-  token: string;
-  first_trade_date: string;
-  last_trade_date: string;
-  total_base_volume: string;
-  total_target_volume: string;
-  all_time_high: string;
-  all_time_low: string;
-  trading_days: number;
-  daily_data: DailyVolumeRecord[];
 }
 
 export interface DatabaseInitializeOptions {
@@ -166,9 +42,6 @@ export class DatabaseService {
 
   private _schema = createSchemaManager(this.dbRuntime);
   private _dailyVolumes = createDailyVolumesRepo(this.dbRuntime);
-  private _intervalVolumes = createIntervalVolumesRepo(this.dbRuntime);
-  private _dailyBuySellVolumes = createDailyBuySellVolumesRepo(this.dbRuntime);
-  private _dailyFeesVolumes = createDailyFeesVolumesRepo(this.dbRuntime);
   private _metrics = createMetricsRepo(this.dbRuntime);
   private _v06TradingActivity = createV06TradingActivityRepo(this.dbRuntime);
 
@@ -226,7 +99,6 @@ export class DatabaseService {
 
       if (ensureSchema) {
         await this._schema.createTables();
-        await this._schema.createAggregationFunctions();
       }
       
       this.isConnected = true;
@@ -326,241 +198,11 @@ export class DatabaseService {
   }
 
   // ============================================
-  // Schema management (delegated to SchemaManager)
-  // ============================================
-
-  async createAggregationFunctions(): Promise<void> {
-    return this._schema.createAggregationFunctions();
-  }
-
-  // ============================================
   // Daily volumes (delegated to DailyVolumesRepo)
   // ============================================
 
-  async getLatestDate(): Promise<string | null> {
-    return this._dailyVolumes.getLatestDate();
-  }
-
-  async getLatestDateForToken(token: string): Promise<string | null> {
-    return this._dailyVolumes.getLatestDateForToken(token);
-  }
-
-  async upsertDailyVolumes(records: DailyVolumeRecord[]): Promise<number> {
-    return this._dailyVolumes.upsertDailyVolumes(records);
-  }
-
-  async getDailyVolumesForToken(token: string): Promise<DailyVolumeRecord[]> {
-    return this._dailyVolumes.getDailyVolumesForToken(token);
-  }
-
-  async getDailyVolumesForTokens(tokens: string[]): Promise<Map<string, DailyVolumeRecord[]>> {
-    return this._dailyVolumes.getDailyVolumesForTokens(tokens);
-  }
-
-  async getAggregatedVolumes(tokens?: string[]): Promise<TokenVolumeAggregate[]> {
-    return this._dailyVolumes.getAggregatedVolumes(tokens);
-  }
-
-  async get24hVolumes(tokens?: string[]): Promise<Map<string, { base_volume: string; target_volume: string; high: string; low: string }>> {
-    return this._dailyVolumes.get24hVolumes(tokens);
-  }
-
-  async getRecordCount(): Promise<number> {
-    return this._dailyVolumes.getDailyRecordCount();
-  }
-
-  async getDailyRecordCount(): Promise<number> {
-    return this._dailyVolumes.getDailyRecordCount();
-  }
-
-  async getTokenCount(): Promise<number> {
-    return this._dailyVolumes.getTokenCount();
-  }
-
   async getV06Rolling24hMetrics(tokens?: string[]): Promise<Map<string, Rolling24hMetrics>> {
     return this._dailyVolumes.getV06Rolling24hMetrics(tokens);
-  }
-
-  // ============================================
-  // Interval volumes (delegated to IntervalVolumesRepo)
-  // ============================================
-
-  async setSyncMetadata(key: string, value: string): Promise<void> {
-    return this._intervalVolumes.setSyncMetadata(key, value);
-  }
-
-  async getSyncMetadata(key: string): Promise<string | null> {
-    return this._intervalVolumes.getSyncMetadata(key);
-  }
-
-  async getLatestHour(): Promise<string | null> {
-    return this._intervalVolumes.getLatestHour();
-  }
-
-  async getLatestCompleteHour(): Promise<string | null> {
-    return this._intervalVolumes.getLatestCompleteHour();
-  }
-
-  async upsertHourlyVolumes(records: HourlyVolumeRecord[], markComplete: boolean = false): Promise<number> {
-    return this._intervalVolumes.upsertHourlyVolumes(records, markComplete);
-  }
-
-  async markHoursComplete(beforeHour: string): Promise<void> {
-    return this._intervalVolumes.markHoursComplete(beforeHour);
-  }
-
-  async getRolling24hMetrics(tokens?: string[]): Promise<Map<string, Rolling24hMetrics>> {
-    return this._intervalVolumes.getRolling24hMetrics(tokens);
-  }
-
-  async getHourlyVolumes(startHour: string, endHour?: string, tokens?: string[]): Promise<HourlyVolumeRecord[]> {
-    return this._intervalVolumes.getHourlyVolumes(startHour, endHour, tokens);
-  }
-
-  async getHourlyRecordCount(): Promise<number> {
-    return this._intervalVolumes.getHourlyRecordCount();
-  }
-
-  async getHourlyTokenCount(): Promise<number> {
-    return this._intervalVolumes.getHourlyTokenCount();
-  }
-
-  async pruneOldHourlyData(keepHours: number = 48): Promise<number> {
-    return this._intervalVolumes.pruneOldHourlyData(keepHours);
-  }
-
-  async upsertTenMinuteVolumes(records: TenMinuteVolumeRecord[], markComplete: boolean = false): Promise<number> {
-    return this._intervalVolumes.upsertTenMinuteVolumes(records, markComplete);
-  }
-
-  async markTenMinuteBucketsComplete(beforeBucket: string): Promise<void> {
-    return this._intervalVolumes.markTenMinuteBucketsComplete(beforeBucket);
-  }
-
-  async backfillMissingFields(): Promise<{
-    tenMinuteUpdated: number;
-    hourlyUpdated: number;
-    dailyUpdated: number;
-  }> {
-    return this._intervalVolumes.backfillMissingFields();
-  }
-
-  async getRolling24hFromTenMinute(tokens?: string[]): Promise<Map<string, Rolling24hMetrics>> {
-    return this._intervalVolumes.getRolling24hFromTenMinute(tokens);
-  }
-
-  async aggregate10MinToHourly(token?: string, hour?: string): Promise<number> {
-    return this._intervalVolumes.aggregate10MinToHourly(token, hour);
-  }
-
-  async aggregateHourlyToDaily(token?: string, date?: string): Promise<number> {
-    return this._intervalVolumes.aggregateHourlyToDaily(token, date);
-  }
-
-  async getLatestTenMinuteBucket(): Promise<string | null> {
-    return this._intervalVolumes.getLatestTenMinuteBucket();
-  }
-
-  async getTenMinuteRecordCount(): Promise<number> {
-    return this._intervalVolumes.getTenMinuteRecordCount();
-  }
-
-  async pruneOldTenMinuteData(keepHours: number = 25): Promise<number> {
-    return this._intervalVolumes.pruneOldTenMinuteData(keepHours);
-  }
-
-  // ============================================
-  // Daily buy/sell volumes (delegated to DailyBuySellVolumesRepo)
-  // ============================================
-
-  async getLatestBuySellDate(): Promise<string | null> {
-    return this._dailyBuySellVolumes.getLatestBuySellDate();
-  }
-
-  async upsertDailyBuySellVolumes(records: DailyBuySellVolumeRecord[], markComplete: boolean = false): Promise<number> {
-    return this._dailyBuySellVolumes.upsertDailyBuySellVolumes(records, markComplete);
-  }
-
-  async getDailyBuySellVolumesWithCumulative(token?: string): Promise<CumulativeVolumeData[]> {
-    return this._dailyBuySellVolumes.getDailyBuySellVolumesWithCumulative(token);
-  }
-
-  async getDailyBuySellVolumes(options?: {
-    token?: string;
-    tokens?: string[];
-    startDate?: string;
-    endDate?: string;
-  }): Promise<{
-    token: string;
-    date: string;
-    base_volume: string;
-    target_volume: string;
-    buy_usdc_volume: string;
-    sell_token_volume: string;
-    high: string;
-    low: string;
-    trade_count: number;
-    average_price: string;
-    usdc_fees: string;
-    token_fees: string;
-    token_fees_usdc: string;
-    sell_volume_usdc: string;
-    sell_volume: string;
-    buy_volume: string;
-  }[]> {
-    return this._dailyBuySellVolumes.getDailyBuySellVolumes(options);
-  }
-
-  async getBuySellAggregates(tokens?: string[]): Promise<Map<string, {
-    total_buy_usdc: string;
-    total_sell_token: string;
-    total_base_volume: string;
-    total_target_volume: string;
-    first_date: string;
-    last_date: string;
-    trading_days: number;
-  }>> {
-    return this._dailyBuySellVolumes.getBuySellAggregates(tokens);
-  }
-
-  async getFirstTradeDates(): Promise<Map<string, string>> {
-    return this._dailyBuySellVolumes.getFirstTradeDates();
-  }
-
-  async getBuySellRecordCount(): Promise<number> {
-    return this._dailyBuySellVolumes.getBuySellRecordCount();
-  }
-
-  async markBuySellDaysComplete(beforeDate: string): Promise<void> {
-    return this._dailyBuySellVolumes.markBuySellDaysComplete(beforeDate);
-  }
-
-  // ============================================
-  // Daily fees volumes (delegated to DailyFeesVolumesRepo)
-  // ============================================
-
-  async getLatestFeesDate(): Promise<string | null> {
-    return this._dailyFeesVolumes.getLatestFeesDate();
-  }
-
-  async upsertDailyFeesVolumes(records: DailyFeesVolumeRecord[], markComplete: boolean = false): Promise<number> {
-    return this._dailyFeesVolumes.upsertDailyFeesVolumes(records, markComplete);
-  }
-
-  async getDailyFeesVolumes(options?: {
-    token?: string;
-    startDate?: string;
-    endDate?: string;
-  }): Promise<DailyFeesVolumeRecord[]> {
-    return this._dailyFeesVolumes.getDailyFeesVolumes(options);
-  }
-
-  async markFeesDaysComplete(beforeDate: string): Promise<void> {
-    return this._dailyFeesVolumes.markFeesDaysComplete(beforeDate);
-  }
-
-  async getFeesRecordCount(): Promise<number> {
-    return this._dailyFeesVolumes.getFeesRecordCount();
   }
 
   // ============================================

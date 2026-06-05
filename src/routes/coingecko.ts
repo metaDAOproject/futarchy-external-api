@@ -18,8 +18,8 @@ export function createCoinGeckoRouter(services: ServiceGetters): Router {
 
       const allDaos = await futarchyService.getAllDaos();
 
-      const firstTradeDates = databaseService?.isAvailable()
-        ? await databaseService.getFirstTradeDates()
+      const firstTradeDates = externalDatabaseService?.isAvailable()
+        ? await externalDatabaseService.getFirstTradeDates()
         : new Map<string, string>();
 
       const tokenToDaoMap = new Map<string, string>();

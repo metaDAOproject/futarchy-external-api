@@ -87,37 +87,6 @@ async function updateMetricsSnapshot(services: ServiceGetters): Promise<void> {
   const futarchyService = services.getFutarchyService();
 
   metricsService.setDatabaseConnected(databaseService.isAvailable());
-  
-  if (databaseService.isAvailable()) {
-    try {
-      const dailyCount = await databaseService.getDailyRecordCount();
-      const hourlyCount = await databaseService.getHourlyRecordCount();
-      const tenMinCount = await databaseService.getTenMinuteRecordCount();
-      const buySellCount = await databaseService.getBuySellRecordCount();
-      
-      metricsService.setDatabaseRecordCount('daily_volumes', dailyCount);
-      metricsService.setDatabaseRecordCount('hourly_volumes', hourlyCount);
-      metricsService.setDatabaseRecordCount('ten_minute_volumes', tenMinCount);
-      metricsService.setDatabaseRecordCount('daily_buy_sell_volumes', buySellCount);
-
-      const dailyTokens = await databaseService.getTokenCount();
-      const hourlyTokens = await databaseService.getHourlyTokenCount();
-      metricsService.setDatabaseTokenCount('daily_volumes', dailyTokens);
-      metricsService.setDatabaseTokenCount('hourly_volumes', hourlyTokens);
-
-      const latestDaily = await databaseService.getLatestDate();
-      const latestHourly = await databaseService.getLatestHour();
-      const latestTenMin = await databaseService.getLatestTenMinuteBucket();
-      const latestBuySell = await databaseService.getLatestBuySellDate();
-      
-      metricsService.setDatabaseLatestDate('daily_volumes', latestDaily);
-      metricsService.setDatabaseLatestDate('hourly_volumes', latestHourly);
-      metricsService.setDatabaseLatestDate('ten_minute_volumes', latestTenMin);
-      metricsService.setDatabaseLatestDate('daily_buy_sell_volumes', latestBuySell);
-    } catch (error) {
-      logger.error('[Metrics] Error fetching database metrics:', error);
-    }
-  }
 
   try {
     const daos = await futarchyService.getAllDaos();

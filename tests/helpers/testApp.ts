@@ -3,25 +3,31 @@ import { createApp, type Services } from '../../src/app.js';
 import type { FutarchyService } from '../../src/services/futarchyService.js';
 import type { PriceService } from '../../src/services/priceService.js';
 import type { DatabaseService } from '../../src/services/databaseService.js';
+import type { ExternalDatabaseService } from '../../src/services/externalDatabaseService.js';
 import type { SolanaService } from '../../src/services/solanaService.js';
 import type { LaunchpadService } from '../../src/services/launchpadService.js';
 
 export function createMockDatabaseService(): DatabaseService {
   return {
     isAvailable: () => true,
-    getFirstTradeDates: async () => new Map(),
+    getV06Rolling24hMetrics: async () => new Map(),
     getServiceHealthHistory: async () => [],
-    getHourlyRecordCount: async () => 0,
-    getTenMinuteRecordCount: async () => 0,
-    getDailyRecordCount: async () => 0,
-    getBuySellRecordCount: async () => 0,
-    getRolling24hFromTenMinute: async () => new Map(),
-    getRolling24hMetrics: async () => new Map(),
+    getRecentMetrics: async () => [],
     insertServiceHealthSnapshot: async () => {},
     insertMetricsBatch: async () => {},
     pruneOldMetrics: async () => {},
     close: async () => {},
   } as unknown as DatabaseService;
+}
+
+export function createMockExternalDatabaseService(): ExternalDatabaseService {
+  return {
+    isAvailable: () => true,
+    getSpotRolling24hMetrics: async () => new Map(),
+    getDailyMeteoraVolumes: async () => [],
+    getFirstTradeDates: async () => new Map(),
+    close: async () => {},
+  } as unknown as ExternalDatabaseService;
 }
 
 export function createMockFutarchyService(): FutarchyService {
@@ -66,6 +72,7 @@ export function createTestServices(overrides?: Partial<Services>): Services {
     futarchyService: createMockFutarchyService(),
     priceService: createMockPriceService(),
     databaseService: createMockDatabaseService(),
+    externalDatabaseService: createMockExternalDatabaseService(),
     solanaService: createMockSolanaService(),
     launchpadService: createMockLaunchpadService(),
     v06ReconciliationService: null,

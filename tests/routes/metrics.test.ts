@@ -79,7 +79,7 @@ describe('Metrics Routes', () => {
     it('should accept valid labels JSON', async () => {
       const response = await request(app)
         .get('/api/metrics/history/test_metric')
-        .query({ labels: '{"table":"daily_volumes"}' });
+        .query({ labels: '{"table":"v06_spot_ohlcv_1m"}' });
       
       // 200 if database connected, 503 if not, 500 if mock incomplete
       expect([200, 500, 503]).toContain(response.status);

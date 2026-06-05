@@ -103,15 +103,6 @@ export async function saveHealthSnapshots(services: ServiceGetters): Promise<voi
 
   if (!databaseService.isAvailable()) return;
 
-  const dailyCount = await databaseService.getDailyRecordCount();
-  const hourlyCount = await databaseService.getHourlyRecordCount();
-  const tenMinCount = await databaseService.getTenMinuteRecordCount();
-  const buySellCount = await databaseService.getBuySellRecordCount();
-
-  await databaseService.insertMetricsBatch([
-    { name: 'database_record_count', value: dailyCount, labels: { table: 'daily_volumes' } },
-    { name: 'database_record_count', value: hourlyCount, labels: { table: 'hourly_volumes' } },
-    { name: 'database_record_count', value: tenMinCount, labels: { table: 'ten_minute_volumes' } },
-    { name: 'database_record_count', value: buySellCount, labels: { table: 'daily_buy_sell_volumes' } },
-  ]);
+  // The Dune-sourced volume tables were removed; there are no per-table record
+  // counts to snapshot here anymore. DB connectivity is reported via /api/health.
 }
