@@ -153,11 +153,9 @@ Returns swap events in the given Solana slot range (both inclusive). Events are 
 
 Returns daily market data for the given date range, split by Futarchy AMM and Meteora sources.
 
-**Data source** is controlled by the `USE_DUNE_DATA` environment variable:
-- `USE_DUNE_DATA=false` — reads from `v06_fee_volume_daily_aggregate` (v0.6 indexer), providing spot + conditional volume breakdown with fee calculations and reconciliation status
-- `USE_DUNE_DATA=true` (default) — reads from `daily_volumes` (Dune pipeline)
-
-The response includes a `source` field (`"v06-indexer"` or `"dune"`) indicating which pipeline served the data.
+**Data sources** (Dune fully removed — all reads come from our own indexed/ETL data):
+- **FutarchyAMM** — `v06_fee_volume_daily_aggregate` (v0.6 indexer): spot + conditional volume breakdown with fee calculations and reconciliation status. Response `source` is always `"v06-indexer"`.
+- **Meteora** — read directly from the meteora accounting ETL's `futarchy.meteora_daily` view in the served indexer DB (via `externalDatabase`). The served DB is a hard dependency: if it's unreachable the endpoint returns `503` rather than reporting a DB outage as zero volume. Response `meteora.source` is `"etl-meteora-daily"`.
 
 ---
 
@@ -228,15 +226,10 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | **Database (App DB)** | | |
 | `COINGECKO_PG_URL` / `DATABASE_URL` | PostgreSQL connection string | — |
 | `DATABASE_SSL` | Enable SSL | `false` |
-| **External DB (v0.6 Indexer)** | | |
-| `EXTERNAL_DATABASE_URL` | Read-only connection to indexer DB | — |
+| **Served indexer DB (required)** | | |
+| `FRONTEND_READER_PG_URL` / `EXTERNAL_DATABASE_URL` | Read-only connection to the served indexer DB (Meteora, tickers, DexScreener, first-trade-dates). **Required** — `/api/market-data` returns 503 without it. | — |
 | `EXTERNAL_DATABASE_SSL` | Enable SSL | `false` |
-| **Dune** | | |
-| `DUNE_API_KEY` | Dune Analytics API key | — |
-| `DUNE_TEN_MINUTE_VOLUME_QUERY_ID` | 10-minute volume query ID | — |
-| `DUNE_METEORA_VOLUME_QUERY_ID` | Meteora volume query ID | — |
 | **Protocol** | | |
-| `USE_DUNE_DATA` | Use Dune pipeline for volume data (`true`/`false`) | `true` |
 | `PROTOCOL_FEE_RATE` | Protocol fee rate | `0.005` (0.5%) |
 | `EXCLUDED_DAOS` | Comma-separated DAO addresses to exclude | — |
 | **Alerts** | | |
@@ -257,7 +250,7 @@ src/
 │   ├── index.ts                  # Route registration
 │   ├── coingecko.ts              # GET /api/tickers
 │   ├── dexscreener.ts            # DexScreener adapter (4 endpoints)
-│   ├── market.ts                 # GET /api/market-data (v0.6 or Dune via USE_DUNE_DATA)
+│   ├── market.ts                 # GET /api/market-data (FutarchyAMM v0.6 + Meteora ETL)
 │   ├── supply.ts                 # GET /api/supply/*
 │   ├── health.ts                 # Health checks
 │   ├── metrics.ts                # Prometheus metrics
@@ -267,13 +260,7 @@ src/
 │   ├── priceService.ts           # Price, spread, liquidity calculations
 │   ├── databaseService.ts        # App DB (volumes, OHLCV, fees, metrics)
 │   ├── externalDatabaseService.ts # Read-only indexer DB connection
-│   ├── v06ReconciliationService.ts # Hourly v0.6 data reconciliation
-│   ├── tenMinuteVolumeFetcherService.ts # 10-min volume from Dune
-│   ├── hourlyAggregationService.ts     # Hourly rollups
-│   ├── dailyAggregationService.ts      # Daily rollups
-│   ├── meteoraVolumeFetcherService.ts  # Meteora pool volumes
-│   ├── duneCacheService.ts       # Dune API cache layer
-│   ├── duneService.ts            # Dune API client
+│   ├── v06ReconciliationService.ts # v0.6 data reconciliation (served DB → app-DB v0.6 aggregates)
 │   ├── solanaService.ts          # SPL token supply queries
 │   ├── launchpadService.ts       # Token allocation breakdown
 │   └── metricsService.ts         # Prometheus counters/histograms
@@ -284,30 +271,17 @@ src/
 │   ├── errorHandler.ts           # Error handling & asyncHandler
 │   └── requestId.ts              # Request ID injection
 ├── utils/                        # Logger, alerts, validation, scheduling
-└── schema/                       # Dune SQL queries, v0.6 DDL reference
+└── schema/                       # v0.6 DDL reference
 ```
 
 ## Data Pipeline
 
-### Volume Sources (priority order)
-The API process serves data from the app DB and read-only external indexer DB. It does not start indexing, Dune fetchers, rollups, reconciliation workers, or app-DB schema setup.
+### Sources (Dune fully removed)
+The API process serves data from the app DB (v0.6 aggregates: `v06_fee_volume_daily_aggregate`, `v06_spot_ohlcv_1m`) and the read-only served indexer DB (`futarchy.trades`, `futarchy.meteora_daily`, `v0_6_spot_swaps`). It does not start indexing, fetchers, rollups, or app-DB schema setup.
 
-Run the indexer process separately:
+The only remaining background job is **v0.6 reconciliation** (`bun run start:indexer`): reads `v0_6_spot_swaps` + `v0_6_conditional_swaps` from the served indexer DB and writes the v0.6 OHLCV + fee-breakdown aggregates to the app DB. (This is being phased out — the goal is for the API to read all FutarchyAMM aggregates directly from the served DB, with no indexer in this repo.)
 
-```bash
-bun run dev:indexer
-
-# production
-bun run start:indexer
-```
-
-Indexer-owned jobs:
-
-1. **10-minute volumes** — from Dune, stored in `ten_minute_volumes`, rolled up to hourly/daily
-2. **v0.6 Reconciliation** — hourly job reads `v0_6_spot_swaps` + `v0_6_conditional_swaps` from the external indexer DB, writes OHLCV and fee breakdowns to app DB
-3. **Dune cache health** — maintained only by the indexer runtime for compatibility with existing health/metrics views
-
-The API's `/api/tickers` reads 24h metrics directly from the app DB in priority order: `ten_minute_volumes` → `hourly_volumes` → optional legacy cache if a caller intentionally wires it.
+`/api/tickers` reads 24h metrics primarily from the served DB's `futarchy.trades` (direct), falling back to the app-DB v0.6 OHLCV.
 
 ### DexScreener Pipeline
 The DexScreener adapter reads **directly from the external indexer DB** (`v0_6_spot_swaps` + `v0_6_daos`) and serves real-time swap events indexed by Solana slot. No intermediate aggregation — raw swap data mapped to the DexScreener schema.
@@ -323,11 +297,6 @@ bun run backfill:v06 -- --since 2025-06-01
 
 # Chunked for large ranges
 bun run backfill:v06 -- --since 2025-01-01 --chunk-days 30
-
-# Legacy Dune-based backfills
-bun run backfill:daily
-bun run backfill:hourly
-bun run backfill:ten-minute
 ```
 
 ## Rate Limiting

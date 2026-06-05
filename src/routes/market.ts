@@ -43,14 +43,20 @@ export function createMarketRouter(services: ServiceGetters): Router {
       };
 
       // Meteora rows are served directly from our meteora accounting ETL
-      // (futarchy.meteora_daily in the served DB, via externalDatabase).
+      // (futarchy.meteora_daily in the served DB, via externalDatabase). The served DB is a
+      // hard dependency for Meteora — surface its absence/failure rather than masking it as
+      // empty (a financial feed must never read a DB outage as "zero volume").
       const externalDatabaseService = getExternalDatabaseService();
+      if (!externalDatabaseService || !externalDatabaseService.isAvailable()) {
+        return res.status(503).json({
+          error: 'Served database not available',
+          message: 'Meteora data source (served indexer DB) is not connected',
+        });
+      }
 
       const [futarchyData, meteoraData] = await Promise.all([
         databaseService.getDailyTradingActivity(queryOptions),
-        externalDatabaseService?.isAvailable()
-          ? externalDatabaseService.getDailyMeteoraVolumes(queryOptions)
-          : Promise.resolve([]),
+        externalDatabaseService.getDailyMeteoraVolumes(queryOptions),
       ]);
 
       res.json({

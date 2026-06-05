@@ -184,8 +184,12 @@ export class ExternalDatabaseService {
       );
       return result.rows;
     } catch (error: any) {
+      // Surface query/schema failures — do NOT mask as empty. For a financial endpoint,
+      // an empty array must mean "genuinely no rows", never "the query failed". The caller
+      // (market route) guards `isAvailable()` for the connection-down case and lets a real
+      // failure propagate to a 5xx instead of returning 200 with zero volume.
       logger.error('[ExternalDB] Error getting daily Meteora volumes from futarchy.meteora_daily:', error);
-      return [];
+      throw error;
     }
   }
 

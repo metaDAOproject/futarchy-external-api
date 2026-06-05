@@ -3,7 +3,7 @@ import type { ServiceGetters } from './types.js';
 
 export function createHealthRouter(services: ServiceGetters): Router {
   const router = Router();
-  const { getDatabaseService } = services;
+  const { getDatabaseService, getExternalDatabaseService } = services;
 
   // Basic health check
   router.get('/health', (req: Request, res: Response) => {
@@ -17,6 +17,10 @@ export function createHealthRouter(services: ServiceGetters): Router {
   // Comprehensive health check
   router.get('/api/health', async (req: Request, res: Response) => {
     const databaseService = getDatabaseService();
+    const externalDatabaseService = getExternalDatabaseService();
+    // The served (external) indexer DB now backs Meteora, tickers, DexScreener and
+    // first-trade-dates — it's a core dependency, so health must reflect it.
+    const externalConnected = !!externalDatabaseService?.isAvailable();
 
     const health: Record<string, any> = {
       status: 'healthy',
@@ -25,15 +29,21 @@ export function createHealthRouter(services: ServiceGetters): Router {
       database: {
         connected: databaseService.isAvailable(),
       },
+      externalDatabase: {
+        connected: externalConnected,
+      },
     };
 
     const hasUnhealthyService = Object.values(health.services).some(
       (s: any) => s.initialized === false
     );
-    
+
     if (!databaseService.isAvailable()) {
       health.status = 'degraded';
-      health.message = 'Database not connected';
+      health.message = 'App database not connected';
+    } else if (!externalConnected) {
+      health.status = 'degraded';
+      health.message = 'Served (external) indexer database not connected';
     } else if (hasUnhealthyService) {
       health.status = 'degraded';
       health.message = 'One or more services not initialized';
