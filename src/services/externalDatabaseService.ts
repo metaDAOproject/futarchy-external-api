@@ -10,10 +10,10 @@ pg.defaults.parseInputDatesAsUTC = true;
 const { Pool } = pg;
 
 /**
- * Read-only connection pool to the external indexer database.
- * Used by v0.6 reconciliation to query v0_6_spot_swaps,
- * v0_6_conditional_swaps, v0_6_daos, and v0_6_proposals, and by /api/tickers to
- * read rolling-24h spot metrics directly from futarchy.trades.
+ * Read-only connection pool to the served indexer database. All market-data reads
+ * come from the unified user_pool ETL output here: user_pool_daily (futarchy +
+ * meteora daily), user_pool_spot_ohlcv (24h metrics), and user_pool_swaps. Also
+ * reads the raw v0_6_* decoded tables for dexscreener per-swap event feeds.
  */
 export class ExternalDatabaseService {
   private pool: pg.Pool | null = null;
@@ -58,20 +58,21 @@ export class ExternalDatabaseService {
   }
 
   /**
-   * Rolling 24h spot-market volume metrics per DAO, read directly from the
-   * indexer's per-swap futarchy.trades table (no Dune, no app-DB rollup).
+   * Rolling 24h spot-market metrics per token, aggregated from the unified ETL's
+   * 1-minute candles (`futarchy.user_pool_spot_ohlcv`, source='futarchy_amm') in
+   * the served DB. These candles are already in HUMAN units (price = USD/token,
+   * base_volume = token, target_volume = USD), so no decimal scaling is needed.
    *
-   * Keyed by dao_addr (= the ticker's pool_id), so the caller needs no
-   * token→dao remap. Amounts are raw on-chain integers, so base/quote volume
-   * are scaled by each side's real decimals (futarchy.tokens.decimals, default
-   * 6) and price (raw quote/base) is rescaled to human units by
-   * 10^(baseDecimals − quoteDecimals) — matching the decimal-aware last_price.
+   * Keyed by token (base mint); the /api/tickers caller maps token→dao. This is
+   * the SINGLE source for 24h metrics — it replaces both the old futarchy.trades
+   * read and the app-DB v06_spot_ohlcv_1m fallback. Everything now comes from the
+   * user_pool ETL output.
    *
-   * Returns an empty Map if the connection is down or no spot trades exist in
-   * the window (caller treats that as "fall back to another source").
+   * Returns an empty Map if the connection is down or no spot candles exist in the
+   * window. Throws on query failure (never masks a failure as empty for a feed).
    */
-  async getSpotRolling24hMetrics(daoAddrs: string[]): Promise<Map<string, Rolling24hMetrics>> {
-    if (!this.pool || !this.isConnected || daoAddrs.length === 0) {
+  async getSpotRolling24hMetrics(tokens: string[]): Promise<Map<string, Rolling24hMetrics>> {
+    if (!this.pool || !this.isConnected || tokens.length === 0) {
       return new Map();
     }
 
@@ -80,27 +81,25 @@ export class ExternalDatabaseService {
     try {
       const result = await this.pool.query(
         `SELECT
-           t.dao_addr,
-           (SUM(t.base_amount)  / power(10::numeric, COALESCE(bt.decimals, 6)))::text  AS base_volume_24h,
-           (SUM(t.quote_amount) / power(10::numeric, COALESCE(qt.decimals, 6)))::text  AS target_volume_24h,
-           (MAX(t.price) * power(10::numeric, COALESCE(bt.decimals, 6) - COALESCE(qt.decimals, 6)))::text AS high_24h,
-           (MIN(t.price) FILTER (WHERE t.price > 0) * power(10::numeric, COALESCE(bt.decimals, 6) - COALESCE(qt.decimals, 6)))::text AS low_24h,
-           COUNT(*)::int AS trade_count_24h
-         FROM futarchy.trades t
-         JOIN futarchy.daos d ON d.dao_addr = t.dao_addr
-         LEFT JOIN futarchy.tokens bt ON bt.mint = d.base_mint
-         LEFT JOIN futarchy.tokens qt ON qt.mint = d.quote_mint
-         WHERE t.market_kind = 'spot'
-           AND t.block_time >= $1
-           AND t.dao_addr = ANY($2::text[])
-         GROUP BY t.dao_addr, bt.decimals, qt.decimals`,
-        [cutoff, daoAddrs]
+           token,
+           SUM(base_volume)::text                        AS base_volume_24h,
+           SUM(target_volume)::text                      AS target_volume_24h,
+           MAX(high)::text                               AS high_24h,
+           (MIN(low) FILTER (WHERE low > 0))::text       AS low_24h,
+           SUM(trade_count)::int                         AS trade_count_24h
+         FROM futarchy.user_pool_spot_ohlcv
+         WHERE source = 'futarchy_amm'
+           AND "interval" = '1m'
+           AND bucket_start >= $1
+           AND token = ANY($2::text[])
+         GROUP BY token`,
+        [cutoff, tokens]
       );
 
       const metricsMap = new Map<string, Rolling24hMetrics>();
       for (const row of result.rows) {
-        metricsMap.set(row.dao_addr, {
-          token: row.dao_addr,
+        metricsMap.set(row.token, {
+          token: row.token,
           base_volume_24h: row.base_volume_24h ?? '0',
           target_volume_24h: row.target_volume_24h ?? '0',
           high_24h: row.high_24h ?? '0',
@@ -112,24 +111,25 @@ export class ExternalDatabaseService {
     } catch (error: any) {
       // Surface query/schema failures (e.g. served-DB contract drift) instead of
       // masking them as an empty map — an empty map must mean "genuinely no spot
-      // trades in the window", not "the query failed". The /api/tickers handler is
-      // wrapped in asyncHandler, so this propagates to a clean 5xx rather than
-      // silently degrading to the v0.6 fallback and hiding the problem.
-      logger.error('[ExternalDB] Error getting spot rolling 24h metrics from futarchy.trades:', error);
+      // candles in the window", not "the query failed". The /api/tickers handler is
+      // wrapped in asyncHandler, so this propagates to a clean 5xx.
+      logger.error('[ExternalDB] Error getting spot rolling 24h metrics from user_pool_spot_ohlcv:', error);
       throw error;
     }
   }
 
   /**
-   * Daily Meteora volumes read DIRECTLY from the meteora accounting ETL's
-   * `futarchy.meteora_daily` view in our served DB — the source of truth that
-   * replaces the Dune-sourced `daily_meteora_volumes` app-DB table.
+   * Daily Meteora volumes from the unified `futarchy.user_pool_daily` (source=
+   * 'meteora') in the served DB — the user_pool ETL output (a faithful, v0_6_daos-
+   * filtered map of the meteora accounting ETL's meteora_daily view). Reading the
+   * unified table (not meteora_daily directly) keeps every market-data read on the
+   * one ETL output; validated row-exact vs meteora_daily.
    *
-   * Returns the SAME column contract as the old (Dune) path so /api/market-data
-   * consumers are unchanged: token (base mint), date, base_volume, target_volume,
-   * buy_volume, sell_volume, trade_count, average_price, usdc_fees, token_fees,
-   * token_fees_usdc, token_per_usdc. Returns an empty array if the connection is
-   * down (the route serves an empty meteora list in that case).
+   * Returns the SAME column contract so /api/market-data consumers are unchanged:
+   * token (base mint), date, base_volume, target_volume, buy_volume, sell_volume,
+   * trade_count, average_price, usdc_fees, token_fees, token_fees_usdc,
+   * token_per_usdc (derived = base_volume/target_volume = 1/average_price, since
+   * user_pool_daily doesn't store it). Empty array if the connection is down.
    */
   async getDailyMeteoraVolumes(options?: {
     token?: string;
@@ -166,7 +166,8 @@ export class ExternalDatabaseService {
       params.push(options.endDate);
       i++;
     }
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    // source='meteora' is always applied; user-supplied filters are AND-ed after it.
+    const whereClause = `WHERE source = 'meteora'${conditions.length > 0 ? ' AND ' + conditions.join(' AND ') : ''}`;
     try {
       const result = await this.pool.query(
         `SELECT
@@ -181,8 +182,8 @@ export class ExternalDatabaseService {
            usdc_fees::text,
            token_fees::text,
            token_fees_usdc::text,
-           token_per_usdc::text
-         FROM futarchy.meteora_daily
+           (base_volume / nullif(target_volume, 0))::text AS token_per_usdc
+         FROM futarchy.user_pool_daily
          ${whereClause}
          ORDER BY token, date ASC`,
         params
@@ -193,15 +194,107 @@ export class ExternalDatabaseService {
       // an empty array must mean "genuinely no rows", never "the query failed". The caller
       // (market route) guards `isAvailable()` for the connection-down case and lets a real
       // failure propagate to a 5xx instead of returning 200 with zero volume.
-      logger.error('[ExternalDB] Error getting daily Meteora volumes from futarchy.meteora_daily:', error);
+      logger.error('[ExternalDB] Error getting daily Meteora volumes from user_pool_daily:', error);
       throw error;
     }
   }
 
   /**
-   * First spot-trade date per token (base mint), from the v0.6 indexer's per-swap
-   * v0_6_spot_swaps in the served DB (replaces the frozen Dune buy/sell volumes table).
-   * Returns Map<token(base mint), 'YYYY-MM-DD'>. Empty map if the connection is down.
+   * Daily FutarchyAMM trading activity from `futarchy.user_pool_daily` (served DB) —
+   * the unified, ON-CHAIN-derived table that replaces the flat-0.5%
+   * `v06_fee_volume_daily_aggregate` (and the Dune-style `v06ReconciliationService`).
+   *
+   * user_pool_daily stores spot and conditional as SEPARATE rows (market_kind); we
+   * pivot them into the same spot / conditional / total column shape the old app-DB
+   * aggregate path returned, so /api/market-data consumers are unchanged.
+   * Values are already USD / token-UI (no /1e6). ADDS the protocol/LP fee split
+   * (collected-to-treasury vs retained), which the old flat-rate aggregate could not
+   * provide. Throws on query failure (never masks as empty for a financial feed).
+   */
+  async getFutarchyAmmDailyActivity(options?: {
+    token?: string;
+    tokens?: string[];
+    startDate?: string;
+    endDate?: string;
+  }): Promise<any[]> {
+    if (!this.pool || !this.isConnected) {
+      return [];
+    }
+    const conditions: string[] = [`source = 'futarchy_amm'`];
+    const params: any[] = [];
+    let i = 1;
+    if (options?.tokens && options.tokens.length > 0) {
+      conditions.push(`token = ANY($${i}::text[])`);
+      params.push(options.tokens);
+      i++;
+    } else if (options?.token) {
+      conditions.push(`token = $${i}`);
+      params.push(options.token);
+      i++;
+    }
+    if (options?.startDate) { conditions.push(`date >= $${i}`); params.push(options.startDate); i++; }
+    if (options?.endDate)   { conditions.push(`date <= $${i}`); params.push(options.endDate);   i++; }
+    const whereClause = `WHERE ${conditions.join(' AND ')}`;
+    try {
+      const result = await this.pool.query(
+        `WITH d AS (SELECT * FROM futarchy.user_pool_daily ${whereClause}),
+              spot AS (SELECT * FROM d WHERE market_kind = 'spot'),
+              cond AS (SELECT * FROM d WHERE market_kind = 'conditional')
+         SELECT
+           COALESCE(s.token, c.token)               AS token,
+           COALESCE(s.date,  c.date)::text          AS date,
+           (c.token IS NOT NULL)                    AS has_conditional_volume,
+           -- spot
+           COALESCE(s.buy_volume,0)::text           AS spot_buy_volume,
+           COALESCE(s.sell_volume,0)::text          AS spot_sell_volume,
+           COALESCE(s.base_volume,0)::text          AS spot_base_volume,
+           COALESCE(s.target_volume,0)::text        AS spot_target_volume,
+           COALESCE(s.trade_count,0)                AS spot_trade_count,
+           COALESCE(s.usdc_fees,0)::text            AS spot_usdc_fees,
+           COALESCE(s.token_fees,0)::text           AS spot_token_fees,
+           COALESCE(s.token_fees_usdc,0)::text      AS spot_token_fees_usdc,
+           COALESCE(s.futarchy_protocol_fee_usdc,0)::text AS spot_protocol_fee_usd,
+           COALESCE(s.futarchy_lp_fee_usdc,0)::text       AS spot_lp_fee_usd,
+           -- conditional (NULL when no conditional row for the day)
+           c.buy_volume::text                       AS conditional_buy_volume,
+           c.sell_volume::text                      AS conditional_sell_volume,
+           c.base_volume::text                      AS conditional_base_volume,
+           c.target_volume::text                    AS conditional_target_volume,
+           c.trade_count                            AS conditional_trade_count,
+           c.usdc_fees::text                        AS conditional_usdc_fees,
+           c.token_fees::text                       AS conditional_token_fees,
+           c.token_fees_usdc::text                  AS conditional_token_fees_usdc,
+           c.futarchy_protocol_fee_usdc::text       AS conditional_protocol_fee_usd,
+           c.futarchy_lp_fee_usdc::text             AS conditional_lp_fee_usd,
+           -- total = spot + conditional
+           (COALESCE(s.buy_volume,0)+COALESCE(c.buy_volume,0))::text       AS total_buy_volume,
+           (COALESCE(s.sell_volume,0)+COALESCE(c.sell_volume,0))::text     AS total_sell_volume,
+           (COALESCE(s.base_volume,0)+COALESCE(c.base_volume,0))::text     AS total_base_volume,
+           (COALESCE(s.target_volume,0)+COALESCE(c.target_volume,0))::text AS total_target_volume,
+           (COALESCE(s.trade_count,0)+COALESCE(c.trade_count,0))          AS total_trade_count,
+           (COALESCE(s.usdc_fees,0)+COALESCE(c.usdc_fees,0))::text         AS total_usdc_fees,
+           (COALESCE(s.token_fees,0)+COALESCE(c.token_fees,0))::text       AS total_token_fees,
+           (COALESCE(s.token_fees_usdc,0)+COALESCE(c.token_fees_usdc,0))::text AS total_token_fees_usdc,
+           (COALESCE(s.futarchy_protocol_fee_usdc,0)+COALESCE(c.futarchy_protocol_fee_usdc,0))::text AS total_protocol_fee_usd,
+           (COALESCE(s.futarchy_lp_fee_usdc,0)+COALESCE(c.futarchy_lp_fee_usdc,0))::text             AS total_lp_fee_usd,
+           COALESCE(c.conditional_reconciled, false) AS conditional_reconciled,
+           COALESCE(c.pending_open_proposals, 0)     AS pending_open_proposals
+         FROM spot s FULL OUTER JOIN cond c ON s.token = c.token AND s.date = c.date
+         ORDER BY token, date ASC`,
+        params
+      );
+      return result.rows;
+    } catch (error: any) {
+      logger.error('[ExternalDB] Error getting FutarchyAMM daily activity from user_pool_daily:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * First spot-trade date per token (base mint), from the unified ETL output
+   * `futarchy.user_pool_daily` (source='futarchy_amm', spot) — MIN(date) per token.
+   * Keeps every market-data read on the one ETL output. Returns
+   * Map<token(base mint), 'YYYY-MM-DD'>. Empty map if the connection is down.
    */
   async getFirstTradeDates(): Promise<Map<string, string>> {
     if (!this.pool || !this.isConnected) {
@@ -209,17 +302,16 @@ export class ExternalDatabaseService {
     }
     try {
       const result = await this.pool.query(
-        `SELECT d.base_mint_acct AS token,
-                MIN((to_timestamp(s.unix_timestamp) AT TIME ZONE 'UTC')::date)::text AS first_date
-           FROM v0_6_spot_swaps s
-           JOIN v0_6_daos d ON d.dao_addr = s.dao_addr
-          GROUP BY d.base_mint_acct`
+        `SELECT token, MIN(date)::text AS first_date
+           FROM futarchy.user_pool_daily
+          WHERE source = 'futarchy_amm' AND market_kind = 'spot'
+          GROUP BY token`
       );
       const m = new Map<string, string>();
       for (const row of result.rows) m.set(row.token, row.first_date);
       return m;
     } catch (error: any) {
-      logger.error('[ExternalDB] Error getting first trade dates from v0_6_spot_swaps:', error);
+      logger.error('[ExternalDB] Error getting first trade dates from user_pool_daily:', error);
       return new Map();
     }
   }

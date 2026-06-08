@@ -4,9 +4,7 @@ import { logger } from '../utils/logger.js';
 import { sendAlert } from '../utils/alerts.js';
 import type { DbRuntime } from './database/internal/dbRuntime.js';
 import { createSchemaManager } from './database/internal/schemaManager.js';
-import { createDailyVolumesRepo } from './database/internal/repos/dailyVolumesRepo.js';
 import { createMetricsRepo } from './database/internal/repos/metricsRepo.js';
-import { createV06TradingActivityRepo } from './database/internal/repos/v06TradingActivityRepo.js';
 
 // Force pg to serialize Date parameters as ISO-8601 UTC strings so PostgreSQL
 // doesn't receive un-parseable local-timezone names like "GMT-0700".
@@ -41,9 +39,7 @@ export class DatabaseService {
   };
 
   private _schema = createSchemaManager(this.dbRuntime);
-  private _dailyVolumes = createDailyVolumesRepo(this.dbRuntime);
   private _metrics = createMetricsRepo(this.dbRuntime);
-  private _v06TradingActivity = createV06TradingActivityRepo(this.dbRuntime);
 
   constructor() {
     // Only initialize if database config is provided
@@ -198,14 +194,6 @@ export class DatabaseService {
   }
 
   // ============================================
-  // Daily volumes (delegated to DailyVolumesRepo)
-  // ============================================
-
-  async getV06Rolling24hMetrics(tokens?: string[]): Promise<Map<string, Rolling24hMetrics>> {
-    return this._dailyVolumes.getV06Rolling24hMetrics(tokens);
-  }
-
-  // ============================================
   // Metrics (delegated to MetricsRepo)
   // ============================================
 
@@ -253,48 +241,5 @@ export class DatabaseService {
 
   async pruneOldMetrics(keepDays: number = 30): Promise<{ metricsDeleted: number; healthDeleted: number }> {
     return this._metrics.pruneOldMetrics(keepDays);
-  }
-
-  // ============================================
-  // V06 Trading Activity (delegated to V06TradingActivityRepo)
-  // ============================================
-
-  async getDailyTradingActivity(options?: {
-    token?: string;
-    tokens?: string[];
-    startDate?: string;
-    endDate?: string;
-  }): Promise<{
-    token: string;
-    date: string;
-    has_conditional_volume: boolean;
-    spot_buy_volume: string;
-    spot_sell_volume: string;
-    spot_base_volume: string;
-    spot_target_volume: string;
-    spot_trade_count: number;
-    spot_usdc_fees: string;
-    spot_token_fees: string;
-    spot_token_fees_usdc: string;
-    conditional_buy_volume: string | null;
-    conditional_sell_volume: string | null;
-    conditional_base_volume: string | null;
-    conditional_target_volume: string | null;
-    conditional_trade_count: number | null;
-    conditional_usdc_fees: string | null;
-    conditional_token_fees: string | null;
-    conditional_token_fees_usdc: string | null;
-    total_buy_volume: string;
-    total_sell_volume: string;
-    total_base_volume: string;
-    total_target_volume: string;
-    total_trade_count: number;
-    total_usdc_fees: string;
-    total_token_fees: string;
-    total_token_fees_usdc: string;
-    conditional_reconciled: boolean;
-    pending_open_proposals: number;
-  }[]> {
-    return this._v06TradingActivity.getDailyTradingActivity(options);
   }
 }

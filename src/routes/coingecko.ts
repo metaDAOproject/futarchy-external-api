@@ -7,13 +7,12 @@ import { sendAlert } from '../utils/alerts.js';
 
 export function createCoinGeckoRouter(services: ServiceGetters): Router {
   const router = Router();
-  const { getFutarchyService, getPriceService, getDatabaseService, getExternalDatabaseService } = services;
+  const { getFutarchyService, getPriceService, getExternalDatabaseService } = services;
 
   // CoinGecko Endpoint: /tickers
   router.get('/api/tickers', asyncHandler(async (req: Request, res: Response) => {
       const futarchyService = getFutarchyService();
       const priceService = getPriceService();
-      const databaseService = getDatabaseService();
       const externalDatabaseService = getExternalDatabaseService();
 
       const allDaos = await futarchyService.getAllDaos();
@@ -28,15 +27,17 @@ export function createCoinGeckoRouter(services: ServiceGetters): Router {
       }
 
       const volumeMetricsMap = new Map<string, { base_volume_24h: string; target_volume_24h: string; high_24h: string; low_24h: string }>();
-      let volumeSource = 'none';
 
-      // Primary: read rolling-24h spot metrics straight from the indexer DB
-      // (futarchy.trades, keyed by dao_addr). No Dune, no app-DB rollup.
+      // Single source: rolling-24h spot metrics from the unified user_pool ETL
+      // candles (user_pool_spot_ohlcv via the served DB), keyed by token (base
+      // mint) → mapped to dao (= pool_id). No futarchy.trades, no app-DB fallback.
       if (externalDatabaseService?.isAvailable()) {
-        const daoAddresses = allDaos.map(dao => dao.daoAddress.toString());
-        const spotMetrics = await externalDatabaseService.getSpotRolling24hMetrics(daoAddresses);
+        const baseMints = allDaos.map(dao => dao.baseMint.toString());
+        const spotMetrics = await externalDatabaseService.getSpotRolling24hMetrics(baseMints);
 
-        for (const [daoAddress, metrics] of spotMetrics.entries()) {
+        for (const [token, metrics] of spotMetrics.entries()) {
+          const daoAddress = tokenToDaoMap.get(token);
+          if (!daoAddress) continue;
           volumeMetricsMap.set(daoAddress, {
             base_volume_24h: metrics.base_volume_24h,
             target_volume_24h: metrics.target_volume_24h,
@@ -44,50 +45,16 @@ export function createCoinGeckoRouter(services: ServiceGetters): Router {
             low_24h: metrics.low_24h,
           });
         }
-
-        if (volumeMetricsMap.size > 0) {
-          volumeSource = 'futarchy-trades-db';
-          logger.debug('Using indexer futarchy.trades rolling 24h metrics', { daoCount: volumeMetricsMap.size, requestId: req.requestId });
-        }
-      }
-
-      // Fallback: v0.6 indexer OHLCV (app DB) for ONLY the DAOs the primary
-      // (futarchy.trades) didn't cover — per-DAO merge, not all-or-nothing. This
-      // covers the window before futarchy.trades is populated for a given DAO
-      // without zeroing out the DAOs that the primary did return.
-      const missingDaos = allDaos.filter(dao => !volumeMetricsMap.has(dao.daoAddress.toString()));
-      if (missingDaos.length > 0 && databaseService?.isAvailable()) {
-        const missingBaseMints = missingDaos.map(dao => dao.baseMint.toString());
-        const v06Metrics = await databaseService.getV06Rolling24hMetrics(missingBaseMints);
-
-        let filled = 0;
-        for (const [tokenAddress, metrics] of v06Metrics.entries()) {
-          const daoAddress = tokenToDaoMap.get(tokenAddress);
-          if (daoAddress && !volumeMetricsMap.has(daoAddress)) {
-            volumeMetricsMap.set(daoAddress, {
-              base_volume_24h: metrics.base_volume_24h,
-              target_volume_24h: metrics.target_volume_24h,
-              high_24h: metrics.high_24h,
-              low_24h: metrics.low_24h,
-            });
-            filled++;
-          }
-        }
-
-        if (filled > 0) {
-          volumeSource = volumeSource === 'futarchy-trades-db' ? 'futarchy-trades-db+v06-fallback' : 'v06-indexer-fallback';
-          logger.debug('Filled missing DAOs from v0.6 indexer rolling 24h metrics', { filled, requestId: req.requestId });
-        }
       }
 
       if (volumeMetricsMap.size === 0) {
         logger.warn('No volume metrics available', { requestId: req.requestId });
         sendAlert(
-          'No volume metrics available — all sources returned empty',
+          'No volume metrics available — user_pool_spot_ohlcv returned empty',
           { cooldownKey: 'no-volume-data', cooldownMs: 10 * 60 * 1000 }
         );
       } else {
-        logger.debug('Volume source selected', { volumeSource, daoCount: volumeMetricsMap.size, requestId: req.requestId });
+        logger.debug('Volume source: user_pool ETL (user_pool_spot_ohlcv)', { daoCount: volumeMetricsMap.size, requestId: req.requestId });
       }
       
       const tickers: CoinGeckoTicker[] = [];

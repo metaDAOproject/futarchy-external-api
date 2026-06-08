@@ -57,13 +57,11 @@ const mockPriceService = {
 
 const mockDatabaseService = {
   isAvailable: jest.fn().mockReturnValue(true),
-  // v0.6 indexer fallback for /api/tickers 24h volume
-  getV06Rolling24hMetrics: jest.fn().mockResolvedValue(new Map()),
 } as unknown as DatabaseService;
 
-// Primary /api/tickers source: rolling-24h spot metrics read straight from the
-// indexer DB (futarchy.trades), keyed by dao_addr. First-trade dates (startDate)
-// also come from the served (external) DB now.
+// /api/tickers 24h metrics come from the unified user_pool ETL candles
+// (user_pool_spot_ohlcv), keyed by token (base mint). First-trade dates (startDate)
+// also come from the served (external) DB. Single source, no app-DB fallback.
 const mockExternalDatabaseService = {
   isAvailable: jest.fn().mockReturnValue(true),
   getSpotRolling24hMetrics: jest.fn().mockResolvedValue(new Map()),
@@ -130,10 +128,10 @@ describe('CoinGecko API', () => {
       }
     });
 
-    it('should read 24h volume from the indexer DB (futarchy.trades) keyed by dao_addr', async () => {
+    it('should read 24h volume from user_pool_spot_ohlcv keyed by token (base mint)', async () => {
       (mockExternalDatabaseService as any).getSpotRolling24hMetrics.mockResolvedValueOnce(new Map([
-        [mockDaoAddress.toString(), {
-          token: mockDaoAddress.toString(),
+        [mockBaseMint.toString(), {
+          token: mockBaseMint.toString(),
           base_volume_24h: '12.5',
           target_volume_24h: '125',
           high_24h: '0.06',
@@ -171,24 +169,6 @@ describe('CoinGecko API', () => {
       expect(response.body[0]).not.toHaveProperty('startDate');
     });
 
-    it('should fall back to v0.6 indexer metrics when futarchy.trades is empty', async () => {
-      (mockDatabaseService as any).getV06Rolling24hMetrics.mockResolvedValueOnce(new Map([
-        [mockBaseMint.toString(), {
-          token: mockBaseMint.toString(),
-          base_volume_24h: '7',
-          target_volume_24h: '70',
-          high_24h: '0.06',
-          low_24h: '0.04',
-          trade_count_24h: 3,
-        }],
-      ]));
-
-      const response = await request(app).get('/api/tickers');
-
-      expect(response.status).toBe(200);
-      expect(response.body[0].base_volume).toBe('7');
-      expect(response.body[0].target_volume).toBe('70');
-    });
   });
 
   describe('GET /health', () => {
