@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import type { CoinGeckoTicker } from '../types/coingecko.js';
 import type { ServiceGetters } from './types.js';
-import { asyncHandler } from '../middleware/errorHandler.js';
+import { AppError, asyncHandler } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 import { sendAlert } from '../utils/alerts.js';
 
@@ -15,11 +15,21 @@ export function createCoinGeckoRouter(services: ServiceGetters): Router {
       const priceService = getPriceService();
       const externalDatabaseService = getExternalDatabaseService();
 
+      if (!externalDatabaseService?.isAvailable()) {
+        logger.warn('Served database unavailable for /api/tickers', { requestId: req.requestId });
+        sendAlert(
+          'Served database unavailable for /api/tickers — refusing to report zero volume',
+          { cooldownKey: 'tickers-served-db-unavailable', cooldownMs: 10 * 60 * 1000 }
+        );
+        throw AppError.serviceUnavailable(
+          'Served database not available',
+          'SERVED_DB_UNAVAILABLE'
+        );
+      }
+
       const allDaos = await futarchyService.getAllDaos();
 
-      const firstTradeDates = externalDatabaseService?.isAvailable()
-        ? await externalDatabaseService.getFirstTradeDates()
-        : new Map<string, string>();
+      const firstTradeDates = await externalDatabaseService.getFirstTradeDates();
 
       const tokenToDaoMap = new Map<string, string>();
       for (const dao of allDaos) {
@@ -31,20 +41,18 @@ export function createCoinGeckoRouter(services: ServiceGetters): Router {
       // Single source: rolling-24h spot metrics from the unified user_pool ETL
       // candles (user_pool_spot_ohlcv via the served DB), keyed by token (base
       // mint) → mapped to dao (= pool_id). No futarchy.trades, no app-DB fallback.
-      if (externalDatabaseService?.isAvailable()) {
-        const baseMints = allDaos.map(dao => dao.baseMint.toString());
-        const spotMetrics = await externalDatabaseService.getSpotRolling24hMetrics(baseMints);
+      const baseMints = allDaos.map(dao => dao.baseMint.toString());
+      const spotMetrics = await externalDatabaseService.getSpotRolling24hMetrics(baseMints);
 
-        for (const [token, metrics] of spotMetrics.entries()) {
-          const daoAddress = tokenToDaoMap.get(token);
-          if (!daoAddress) continue;
-          volumeMetricsMap.set(daoAddress, {
-            base_volume_24h: metrics.base_volume_24h,
-            target_volume_24h: metrics.target_volume_24h,
-            high_24h: metrics.high_24h,
-            low_24h: metrics.low_24h,
-          });
-        }
+      for (const [token, metrics] of spotMetrics.entries()) {
+        const daoAddress = tokenToDaoMap.get(token);
+        if (!daoAddress) continue;
+        volumeMetricsMap.set(daoAddress, {
+          base_volume_24h: metrics.base_volume_24h,
+          target_volume_24h: metrics.target_volume_24h,
+          high_24h: metrics.high_24h,
+          low_24h: metrics.low_24h,
+        });
       }
 
       if (volumeMetricsMap.size === 0) {

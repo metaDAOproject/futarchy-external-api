@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { parseDateParam, parseCommaSeparatedList } from '../utils/validation.js';
+import { logger } from '../utils/logger.js';
 import type { ServiceGetters } from './types.js';
 
 export function createMarketRouter(services: ServiceGetters): Router {
@@ -7,8 +8,8 @@ export function createMarketRouter(services: ServiceGetters): Router {
   const { getExternalDatabaseService } = services;
 
   // Daily market data with date range + optional token filtering.
-  // BOTH FutarchyAMM and Meteora are served from the unified, on-chain-derived ETL in
-  // the served DB (futarchy.user_pool_daily / futarchy.meteora_daily), via externalDatabase.
+  // BOTH FutarchyAMM and Meteora are served from the unified user_pool ETL in
+  // the served DB (futarchy.user_pool_daily), via externalDatabase.
   // FutarchyAMM no longer reads the flat-0.5% app-DB v06_fee_volume_daily_aggregate.
   router.get('/api/market-data', async (req: Request, res: Response) => {
     // The served DB is the source of truth for market data; surface its absence/failure
@@ -70,9 +71,13 @@ export function createMarketRouter(services: ServiceGetters): Router {
         },
       });
     } catch (error: any) {
+      // Log the detail server-side; do NOT return raw error.message to the client
+      // (it can leak SQL/schema internals). Mirrors the global errorHandler's
+      // generic-500 behavior for unexpected errors.
+      logger.error('Failed to get market data', error, { requestId: req.requestId });
       res.status(500).json({
         error: 'Failed to get market data',
-        message: error.message,
+        requestId: req.requestId,
       });
     }
   });

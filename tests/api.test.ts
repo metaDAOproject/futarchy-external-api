@@ -66,6 +66,11 @@ const mockExternalDatabaseService = {
   isAvailable: jest.fn().mockReturnValue(true),
   getSpotRolling24hMetrics: jest.fn().mockResolvedValue(new Map()),
   getFirstTradeDates: jest.fn().mockResolvedValue(new Map()),
+  checkServedDataContract: jest.fn().mockResolvedValue({
+    ok: true,
+    checkedAt: '2024-01-01T00:00:00.000Z',
+    missing: [],
+  }),
 } as unknown as ExternalDatabaseService;
 
 function createMockServices(): Services {
@@ -126,6 +131,16 @@ describe('CoinGecko API', () => {
         expect(response.body[0].base_volume).toBe('0');
         expect(response.body[0].target_volume).toBe('0');
       }
+    });
+
+    it('should return 503 instead of zero volume when the served DB is unavailable', async () => {
+      (mockExternalDatabaseService as any).isAvailable.mockReturnValueOnce(false);
+
+      const response = await request(app).get('/api/tickers');
+
+      expect(response.status).toBe(503);
+      expect(response.body.error).toBe('Served database not available');
+      expect(response.body.code).toBe('SERVED_DB_UNAVAILABLE');
     });
 
     it('should read 24h volume from user_pool_spot_ohlcv keyed by token (base mint)', async () => {

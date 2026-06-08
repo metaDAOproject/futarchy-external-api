@@ -9,11 +9,18 @@ pg.defaults.parseInputDatesAsUTC = true;
 
 const { Pool } = pg;
 
+export interface ServedDataContractStatus {
+  ok: boolean;
+  checkedAt: string;
+  missing: string[];
+}
+
 /**
- * Read-only connection pool to the served indexer database. All market-data reads
- * come from the unified user_pool ETL output here: user_pool_daily (futarchy +
- * meteora daily), user_pool_spot_ohlcv (24h metrics), and user_pool_swaps. Also
- * reads the raw v0_6_* decoded tables for dexscreener per-swap event feeds.
+ * Read-only connection pool to the served indexer database. ALL reads come from
+ * the unified user_pool ETL output here: user_pool_daily (futarchy + meteora
+ * daily), user_pool_spot_ohlcv (24h metrics), and user_pool_swaps (DEX Screener
+ * per-swap events + post-swap reserves). Single source of truth — no raw v0_6_*,
+ * no app-DB rollups, no futarchy.trades.
  */
 export class ExternalDatabaseService {
   private pool: pg.Pool | null = null;
@@ -26,7 +33,7 @@ export class ExternalDatabaseService {
 
   async initialize(): Promise<boolean> {
     if (!config.externalDatabase.connectionString) {
-      logger.info('[ExternalDB] No EXTERNAL_DATABASE_URL configured — v0.6 reconciliation disabled');
+      logger.info('[ExternalDB] No EXTERNAL_DATABASE_URL or FRONTEND_READER_PG_URL configured');
       return false;
     }
 
@@ -68,12 +75,15 @@ export class ExternalDatabaseService {
    * read and the app-DB v06_spot_ohlcv_1m fallback. Everything now comes from the
    * user_pool ETL output.
    *
-   * Returns an empty Map if the connection is down or no spot candles exist in the
-   * window. Throws on query failure (never masks a failure as empty for a feed).
+   * Returns an empty Map if no spot candles exist in the window. Throws if the
+   * connection is down or the query fails (never masks a failure as empty).
    */
   async getSpotRolling24hMetrics(tokens: string[]): Promise<Map<string, Rolling24hMetrics>> {
-    if (!this.pool || !this.isConnected || tokens.length === 0) {
+    if (tokens.length === 0) {
       return new Map();
+    }
+    if (!this.pool || !this.isConnected) {
+      throw new Error('External database not connected');
     }
 
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -129,7 +139,7 @@ export class ExternalDatabaseService {
    * token (base mint), date, base_volume, target_volume, buy_volume, sell_volume,
    * trade_count, average_price, usdc_fees, token_fees, token_fees_usdc,
    * token_per_usdc (derived = base_volume/target_volume = 1/average_price, since
-   * user_pool_daily doesn't store it). Empty array if the connection is down.
+   * user_pool_daily doesn't store it). Throws on connection or query failure.
    */
   async getDailyMeteoraVolumes(options?: {
     token?: string;
@@ -142,7 +152,7 @@ export class ExternalDatabaseService {
     usdc_fees: string; token_fees: string; token_fees_usdc: string; token_per_usdc: string;
   }>> {
     if (!this.pool || !this.isConnected) {
-      return [];
+      throw new Error('External database not connected');
     }
     const conditions: string[] = [];
     const params: any[] = [];
@@ -209,7 +219,8 @@ export class ExternalDatabaseService {
    * aggregate path returned, so /api/market-data consumers are unchanged.
    * Values are already USD / token-UI (no /1e6). ADDS the protocol/LP fee split
    * (collected-to-treasury vs retained), which the old flat-rate aggregate could not
-   * provide. Throws on query failure (never masks as empty for a financial feed).
+   * provide. Throws on connection or query failure (never masks as empty for a
+   * financial feed).
    */
   async getFutarchyAmmDailyActivity(options?: {
     token?: string;
@@ -218,7 +229,7 @@ export class ExternalDatabaseService {
     endDate?: string;
   }): Promise<any[]> {
     if (!this.pool || !this.isConnected) {
-      return [];
+      throw new Error('External database not connected');
     }
     const conditions: string[] = [`source = 'futarchy_amm'`];
     const params: any[] = [];
@@ -294,11 +305,11 @@ export class ExternalDatabaseService {
    * First spot-trade date per token (base mint), from the unified ETL output
    * `futarchy.user_pool_daily` (source='futarchy_amm', spot) — MIN(date) per token.
    * Keeps every market-data read on the one ETL output. Returns
-   * Map<token(base mint), 'YYYY-MM-DD'>. Empty map if the connection is down.
+   * Map<token(base mint), 'YYYY-MM-DD'>. Throws on connection or query failure.
    */
   async getFirstTradeDates(): Promise<Map<string, string>> {
     if (!this.pool || !this.isConnected) {
-      return new Map();
+      throw new Error('External database not connected');
     }
     try {
       const result = await this.pool.query(
@@ -312,7 +323,104 @@ export class ExternalDatabaseService {
       return m;
     } catch (error: any) {
       logger.error('[ExternalDB] Error getting first trade dates from user_pool_daily:', error);
-      return new Map();
+      throw error;
+    }
+  }
+
+  async checkServedDataContract(): Promise<ServedDataContractStatus> {
+    const checkedAt = new Date().toISOString();
+    if (!this.pool || !this.isConnected) {
+      return {
+        ok: false,
+        checkedAt,
+        missing: ['connection'],
+      };
+    }
+
+    const requiredColumns = new Map<string, string[]>([
+      ['user_pool_daily', [
+        'source',
+        'market_kind',
+        'token',
+        'date',
+        'base_volume',
+        'target_volume',
+        'trade_count',
+        'usdc_fees',
+      ]],
+      ['user_pool_spot_ohlcv', [
+        'source',
+        'interval',
+        'token',
+        'bucket_start',
+        'base_volume',
+        'target_volume',
+        'high',
+        'low',
+        'trade_count',
+      ]],
+      ['user_pool_swaps', [
+        'source',
+        'market_kind',
+        'dao_addr',
+        'base_mint',
+        'quote_mint',
+        'slot',
+        'block_time',
+        'signature',
+        'user_addr',
+        'side',
+        'base_amount',
+        'quote_amount',
+        'amm_base_reserves',
+        'amm_quote_reserves',
+        'inner_group',
+        'inner_ix',
+      ]],
+    ]);
+
+    try {
+      const result = await this.pool.query(
+        `SELECT table_name, column_name
+           FROM information_schema.columns
+          WHERE table_schema = 'futarchy'
+            AND table_name = ANY($1::text[])`,
+        [Array.from(requiredColumns.keys())]
+      );
+
+      const observed = new Map<string, Set<string>>();
+      for (const row of result.rows) {
+        const tableName = row.table_name as string;
+        if (!observed.has(tableName)) observed.set(tableName, new Set());
+        observed.get(tableName)!.add(row.column_name as string);
+      }
+
+      const missing: string[] = [];
+      for (const [tableName, columns] of requiredColumns.entries()) {
+        const observedColumns = observed.get(tableName);
+        if (!observedColumns) {
+          missing.push(`futarchy.${tableName}`);
+          continue;
+        }
+        for (const column of columns) {
+          if (!observedColumns.has(column)) {
+            missing.push(`futarchy.${tableName}.${column}`);
+          }
+        }
+      }
+
+      return {
+        ok: missing.length === 0,
+        checkedAt,
+        missing,
+      };
+    } catch (error: any) {
+      logger.error('[ExternalDB] Error checking served ETL contract:', error);
+      return {
+        ok: false,
+        checkedAt,
+        missing: ['contract-check-query'],
+      };
     }
   }
 

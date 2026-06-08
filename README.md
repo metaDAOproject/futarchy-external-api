@@ -55,13 +55,14 @@ Returns all DAO tickers with pricing, volume, and liquidity information. Automat
 | `high_24h` / `low_24h` | 24h high/low (when available) |
 | `startDate` | First trade date for the token |
 
-**Volume sources** (priority order): 10-minute DB → hourly DB → optional legacy cache.
+**Volume source**: `futarchy.user_pool_spot_ohlcv` in the served ETL DB. If the
+served DB is unavailable, the endpoint returns `503` instead of reporting zero volume.
 
 ---
 
 ### DexScreener Adapter Endpoints
 
-Implements the [DexScreener Adapter Spec v1.1](https://dexscreener.notion.site/DEX-Screener-Adapter-Specs-cc1223cdf6e74a7799599106b65dcd0e). All endpoints are served under `/dexscreener/`. Requires `EXTERNAL_DATABASE_URL` to be configured (v0.6 indexer DB).
+Implements the [DexScreener Adapter Spec v1.1](https://dexscreener.notion.site/DEX-Screener-Adapter-Specs-cc1223cdf6e74a7799599106b65dcd0e). All endpoints are served under `/dexscreener/`. Requires `FRONTEND_READER_PG_URL` or `EXTERNAL_DATABASE_URL` to be configured for the served DB.
 
 #### GET `/dexscreener/latest-block`
 
@@ -153,9 +154,13 @@ Returns swap events in the given Solana slot range (both inclusive). Events are 
 
 Returns daily market data for the given date range, split by Futarchy AMM and Meteora sources.
 
-**Data sources** (Dune fully removed — all reads come from our own indexed/ETL data):
-- **FutarchyAMM** — `v06_fee_volume_daily_aggregate` (v0.6 indexer): spot + conditional volume breakdown with fee calculations and reconciliation status. Response `source` is always `"v06-indexer"`.
-- **Meteora** — read directly from the meteora accounting ETL's `futarchy.meteora_daily` view in the served indexer DB (via `externalDatabase`). The served DB is a hard dependency: if it's unreachable the endpoint returns `503` rather than reporting a DB outage as zero volume. Response `meteora.source` is `"etl-meteora-daily"`.
+**Data source**: both FutarchyAMM and Meteora data come from the unified
+`futarchy.user_pool_daily` ETL table in the served DB. The served DB is a hard
+dependency: if it's unreachable the endpoint returns `503` rather than reporting
+a DB outage as zero volume.
+
+- **FutarchyAMM** — `source = 'futarchy_amm'`, pivoted into spot, conditional, and total daily columns. Response `futarchyAMM.source` is `"etl-user-pool-daily"`.
+- **Meteora** — `source = 'meteora'`, with the same daily accounting contract. Response `meteora.source` is `"etl-meteora-daily"`.
 
 ---
 
@@ -243,7 +248,7 @@ src/
 │   ├── index.ts                  # Route registration
 │   ├── coingecko.ts              # GET /api/tickers
 │   ├── dexscreener.ts            # DexScreener adapter (4 endpoints)
-│   ├── market.ts                 # GET /api/market-data (FutarchyAMM v0.6 + Meteora ETL)
+│   ├── market.ts                 # GET /api/market-data (user_pool ETL)
 │   ├── supply.ts                 # GET /api/supply/*
 │   ├── health.ts                 # Health checks
 │   ├── metrics.ts                # Prometheus metrics
@@ -251,8 +256,8 @@ src/
 ├── services/
 │   ├── futarchyService.ts        # On-chain DAO/pool/token data
 │   ├── priceService.ts           # Price, spread, liquidity calculations
-│   ├── databaseService.ts        # App DB (volumes, OHLCV, fees, metrics)
-│   ├── externalDatabaseService.ts # Read-only indexer DB connection
+│   ├── databaseService.ts        # App DB metrics and health history
+│   ├── externalDatabaseService.ts # Read-only served ETL DB connection
 │   ├── solanaService.ts          # SPL token supply queries
 │   ├── launchpadService.ts       # Token allocation breakdown
 │   └── metricsService.ts         # Prometheus counters/histograms
@@ -262,18 +267,20 @@ src/
 ├── middleware/
 │   ├── errorHandler.ts           # Error handling & asyncHandler
 │   └── requestId.ts              # Request ID injection
-├── utils/                        # Logger, alerts, validation, scheduling
-└── schema/                       # v0.6 DDL reference
+└── utils/                        # Logger, alerts, validation, scheduling
 ```
 
 ## Data Pipeline
 
 ### Sources (Dune fully removed)
-The API process serves data from the app DB (v0.6 aggregates: `v06_fee_volume_daily_aggregate`, `v06_spot_ohlcv_1m`) and the read-only served indexer DB (`futarchy.trades`, `futarchy.meteora_daily`, `v0_6_spot_swaps`). It does not start indexing, fetchers, rollups, or app-DB schema setup.
+The API process serves market data from the read-only served ETL DB:
 
-This is a pure read-only API with no in-process indexing: FutarchyAMM v0.6 aggregates are read from the app DB, while Meteora data and tickers are read from the served indexer DB.
+- `/api/tickers` reads rolling 24h metrics from `futarchy.user_pool_spot_ohlcv`.
+- `/api/market-data` reads FutarchyAMM and Meteora daily rows from `futarchy.user_pool_daily`.
+- DexScreener routes read raw indexed v0.6 swap/DAO tables from the same served DB.
 
-`/api/tickers` reads 24h metrics primarily from the served DB's `futarchy.trades` (direct), falling back to the app-DB v0.6 OHLCV.
+The app DB is used for API metrics and health history only. The API does not start
+indexing, fetchers, rollups, or app-DB schema setup in production.
 
 ### DexScreener Pipeline
 The DexScreener adapter reads **directly from the external indexer DB** (`v0_6_spot_swaps` + `v0_6_daos`) and serves real-time swap events indexed by Solana slot. No intermediate aggregation — raw swap data mapped to the DexScreener schema.

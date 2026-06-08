@@ -4,8 +4,8 @@
  * Provides mapping from Meteora pool owner addresses to token (baseMint) addresses.
  * This mapping is used to normalize Meteora pool data to match existing table structures.
  *
- * DAMM v2 pool addresses for base/USDC use the v0.6 Meteora config (same as existing
- * tracked launches in the Dune query); v0.7 config yields a different pool PDA.
+ * DAMM v2 pool addresses for base/USDC use the v0.6 Meteora config used by the
+ * tracked launches; v0.7 config yields a different pool PDA.
  */
 
 /**

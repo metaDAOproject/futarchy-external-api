@@ -49,7 +49,7 @@ describe('Root Routes', () => {
     it('describes itself as a read-only, Dune-free API', async () => {
       const response = await request(app).get('/');
 
-      // The stale Dune-cache block was removed; root now carries a `note` and no caching/Dune cruft.
+      // The stale cache block was removed; root now carries a `note` and no caching fields.
       expect(response.body).toHaveProperty('note');
       expect(response.body.note).toContain('no Dune');
       expect(response.body).not.toHaveProperty('caching');

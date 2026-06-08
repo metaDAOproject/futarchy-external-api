@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from 'express';
+import { logger } from '../utils/logger.js';
 import type { ServiceGetters } from './types.js';
 
 export function createHealthRouter(services: ServiceGetters): Router {
@@ -21,6 +22,13 @@ export function createHealthRouter(services: ServiceGetters): Router {
     // The served (external) indexer DB now backs Meteora, tickers, DexScreener and
     // first-trade-dates — it's a core dependency, so health must reflect it.
     const externalConnected = !!externalDatabaseService?.isAvailable();
+    const servedDataContract = externalConnected
+      ? await externalDatabaseService!.checkServedDataContract()
+      : {
+          ok: false,
+          checkedAt: new Date().toISOString(),
+          missing: ['connection'],
+        };
 
     const health: Record<string, any> = {
       status: 'healthy',
@@ -31,6 +39,7 @@ export function createHealthRouter(services: ServiceGetters): Router {
       },
       externalDatabase: {
         connected: externalConnected,
+        servedDataContract,
       },
     };
 
@@ -44,6 +53,9 @@ export function createHealthRouter(services: ServiceGetters): Router {
     } else if (!externalConnected) {
       health.status = 'degraded';
       health.message = 'Served (external) indexer database not connected';
+    } else if (!servedDataContract.ok) {
+      health.status = 'degraded';
+      health.message = 'Served ETL contract check failed';
     } else if (hasUnhealthyService) {
       health.status = 'degraded';
       health.message = 'One or more services not initialized';
@@ -76,9 +88,10 @@ export function createHealthRouter(services: ServiceGetters): Router {
         data,
       });
     } catch (error: any) {
+      logger.error('Failed to get health history', error, { requestId: req.requestId });
       res.status(500).json({
         error: 'Failed to get health history',
-        message: error.message,
+        requestId: req.requestId,
       });
     }
   });
@@ -97,9 +110,10 @@ export function createHealthRouter(services: ServiceGetters): Router {
       await saveHealthSnapshots(services);
       res.json({ message: 'Health snapshot saved successfully' });
     } catch (error: any) {
+      logger.error('Failed to save health snapshot', error, { requestId: req.requestId });
       res.status(500).json({
         error: 'Failed to save health snapshot',
-        message: error.message,
+        requestId: req.requestId,
       });
     }
   });

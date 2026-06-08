@@ -72,11 +72,11 @@ describe('Health Routes', () => {
     });
 
     it('should accept service parameter', async () => {
-      const response = await request(app).get('/api/health/history?service=dune_cache');
+      const response = await request(app).get('/api/health/history?service=external_database');
       
       expect([200, 503]).toContain(response.status);
       if (response.status === 200) {
-        expect(response.body.service).toBe('dune_cache');
+        expect(response.body.service).toBe('external_database');
       }
     });
   });

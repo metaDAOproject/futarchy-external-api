@@ -1,6 +1,6 @@
 import { PublicKey } from '@solana/web3.js';
 export const config = {
-  // Development mode - disables external Dune API calls
+  // Development mode flag retained for compatibility with existing deployments.
   devMode: process.env.DEV_MODE === 'true',
   solana: {
     rpcUrl: process.env.RPCPOOL_RPC_URL || process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
@@ -62,7 +62,7 @@ export const config = {
     ssl: process.env.DATABASE_SSL === 'true',
   },
   externalDatabase: {
-    // Read-only connection to the external indexer DB (v0_6_* tables)
+    // Read-only connection to the served ETL DB.
     connectionString: process.env.FRONTEND_READER_PG_URL || process.env.EXTERNAL_DATABASE_URL || '',
     ssl: process.env.EXTERNAL_DATABASE_SSL === 'true',
   },

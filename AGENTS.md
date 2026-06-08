@@ -12,11 +12,9 @@
 - **`bun test`** - Run all tests
 - **`bun run <script>`** - Run any script from package.json
 
-### Backfill Commands
-- **`bun run backfill`** - Run full backfill
-- **`bun run backfill:daily`** - Backfill daily data
-- **`bun run backfill:hourly`** - Backfill hourly data
-- **`bun run backfill:ten-minute`** - Backfill 10-minute data
+### Data Serving
+- Market data and ticker volume are served from the external user_pool ETL DB.
+- This API does not run local backfills, Dune fetchers, or indexer workers.
 
 ## Project Structure
 
@@ -25,9 +23,8 @@ src/
 ├── server.ts           # Express server entry point
 ├── config.ts           # Configuration & environment variables
 ├── services/           # Business logic & data processing
-│   ├── tenMinuteVolumeService.ts
+│   ├── externalDatabaseService.ts
 │   └── [other services]
-├── schema/             # Database schema & types
 └── types/              # TypeScript type definitions
 ```
 
@@ -52,7 +49,7 @@ src/
 
 1. Copy `example.env` to `.env`
 2. Configure PostgreSQL connection and API keys
-3. Run backfill if needed: `bun run backfill`
+3. Configure `FRONTEND_READER_PG_URL` or `EXTERNAL_DATABASE_URL` for served ETL reads
 
 ## Important Notes
 
@@ -79,9 +76,9 @@ src/
 ## Database
 
 - Uses PostgreSQL with pg driver
-- Schema defined in `src/schema/`
-- Connection configured via .env (DATABASE_URL)
-- Backfill scripts in `scripts/` directory
+- App DB connection configured via `.env` (`COINGECKO_PG_URL` or `DATABASE_URL`)
+- Served ETL DB connection configured via `.env` (`FRONTEND_READER_PG_URL` or `EXTERNAL_DATABASE_URL`)
+- No local backfill scripts or Dune fetchers run in this API
 
 ## Common Issues
 

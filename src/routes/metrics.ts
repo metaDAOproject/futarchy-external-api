@@ -71,9 +71,10 @@ export function createMetricsRouter(services: ServiceGetters): Router {
         data,
       });
     } catch (error: any) {
+      logger.error('Failed to get metrics history', error, { requestId: req.requestId });
       res.status(500).json({
         error: 'Failed to get metrics history',
-        message: error.message,
+        requestId: req.requestId,
       });
     }
   });

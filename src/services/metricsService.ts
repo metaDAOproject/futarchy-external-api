@@ -132,38 +132,6 @@ export const httpRequestsInFlight = new client.Gauge({
 });
 
 // ============================================
-// DUNE API METRICS
-// ============================================
-
-export const duneQueriesTotal = new client.Counter({
-  name: 'futarchy_dune_queries_total',
-  help: 'Total number of Dune API queries executed',
-  labelNames: ['query_type', 'status'],
-  registers: [register],
-});
-
-export const duneQueryDuration = new client.Histogram({
-  name: 'futarchy_dune_query_duration_seconds',
-  help: 'Dune query execution duration in seconds',
-  labelNames: ['query_type'],
-  buckets: [1, 5, 10, 30, 60, 120, 300, 600],
-  registers: [register],
-});
-
-export const duneCreditsUsed = new client.Counter({
-  name: 'futarchy_dune_credits_used_total',
-  help: 'Total Dune API credits used',
-  registers: [register],
-});
-
-export const duneRowsFetched = new client.Counter({
-  name: 'futarchy_dune_rows_fetched_total',
-  help: 'Total number of rows fetched from Dune',
-  labelNames: ['query_type'],
-  registers: [register],
-});
-
-// ============================================
 // SOLANA RPC METRICS
 // ============================================
 
@@ -318,20 +286,6 @@ export class MetricsService {
 
   decrementHttpRequestsInFlight(): void {
     httpRequestsInFlight.dec();
-  }
-
-  /**
-   * Record Dune API query
-   */
-  recordDuneQuery(queryType: string, success: boolean, durationSeconds: number, rowCount: number = 0, credits: number = 0): void {
-    duneQueriesTotal.labels(queryType, success ? 'success' : 'error').inc();
-    duneQueryDuration.labels(queryType).observe(durationSeconds);
-    if (rowCount > 0) {
-      duneRowsFetched.labels(queryType).inc(rowCount);
-    }
-    if (credits > 0) {
-      duneCreditsUsed.inc(credits);
-    }
   }
 
   /**

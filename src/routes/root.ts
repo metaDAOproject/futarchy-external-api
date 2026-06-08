@@ -13,15 +13,15 @@ export function createRootRouter(_services: ServiceGetters): Router {
       documentation: 'https://docs.coingecko.com/reference/exchanges-list',
       endpoints: {
         tickers: '/api/tickers - Returns all DAO tickers with pricing and volume',
-        market_data: '/api/market-data - Daily market data (futarchy AMM + Meteora); FutarchyAMM served from the v0.6 indexer',
+        market_data: '/api/market-data - Daily market data from the served user_pool ETL',
         supply: '/api/supply/:mintAddress - Returns complete supply breakdown with allocation details',
         supply_total: '/api/supply/:mintAddress/total - Returns total supply only',
         supply_circulating: '/api/supply/:mintAddress/circulating - Returns circulating supply (excludes team performance package)',
         health: '/health',
-        health_detailed: '/api/health - Comprehensive health with DB and data freshness',
+        health_detailed: '/api/health - Comprehensive health with app DB and served ETL contract checks',
       },
       dexscreener: {
-        description: 'DexScreener Adapter (v1.1) — requires EXTERNAL_DATABASE_URL',
+        description: 'DexScreener Adapter (v1.1) — requires FRONTEND_READER_PG_URL or EXTERNAL_DATABASE_URL',
         latest_block: '/dexscreener/latest-block - Latest indexed Solana slot',
         asset: '/dexscreener/asset?id=:mintAddress - Token metadata',
         pair: '/dexscreener/pair?id=:daoAddress - Pair info',
@@ -39,7 +39,7 @@ export function createRootRouter(_services: ServiceGetters): Router {
         futarchyAmmLiquidity: 'Tokens in the internal FutarchyAMM for spot trading - IS circulating',
         meteoraLpLiquidity: 'Tokens in the external Meteora DAMM pool (POL) - IS circulating',
       },
-      note: 'Read-only API. Data is served from our own indexed/ETL data (served indexer DB + app-DB v0.6 aggregates); no Dune, no in-process indexing.',
+      note: 'Read-only API. Market data and ticker volume are served from the user_pool ETL in the served DB; no Dune, no in-process indexing.',
     });
   });
 

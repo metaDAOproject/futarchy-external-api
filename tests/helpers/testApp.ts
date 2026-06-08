@@ -26,6 +26,11 @@ export function createMockExternalDatabaseService(): ExternalDatabaseService {
     getDailyMeteoraVolumes: async () => [],
     getFutarchyAmmDailyActivity: async () => [],
     getFirstTradeDates: async () => new Map(),
+    checkServedDataContract: async () => ({
+      ok: true,
+      checkedAt: new Date().toISOString(),
+      missing: [],
+    }),
     close: async () => {},
   } as unknown as ExternalDatabaseService;
 }
