@@ -16,6 +16,7 @@ import {
   LAUNCHPAD_V0_7_MAINNET_METEORA_CONFIG as MAINNET_METEORA_CONFIG_V07,
 } from "@metadaoproject/programs";
 import { getAccount, getAssociatedTokenAddress } from '@solana/spl-token';
+import { isTokenAccountAbsent } from '../utils/solanaErrors.js';
 import { config } from '../config.js';
 import BN from 'bn.js';
 import { logger } from '../utils/logger.js';
@@ -188,8 +189,16 @@ export class LaunchpadService {
         return { launch, version };
       }
     } catch (error: any) {
+      // ONLY a genuinely-absent account means "no launch of this version" → null
+      // (the caller then tries the other version, and a token with no launch at all
+      // correctly gets an empty allocation breakdown). ANY OTHER error (RPC /
+      // network / timeout) MUST propagate: a silent null here makes
+      // getTokenAllocationBreakdown treat a launched token as un-launched → ZERO
+      // locked allocations → circulating supply = total supply (hugely overstated
+      // market cap on a transient RPC blip).
       if (!error.message?.includes('Account does not exist')) {
         logger.info(`[Launchpad] Error fetching ${version} launch at ${launchAddress.toString()}: ${error.message}`);
+        throw error;
       }
     }
     return null;
@@ -507,7 +516,10 @@ export class LaunchpadService {
 
       return { amount, vaultAddress };
     } catch (error) {
-      logger.error(`[Launchpad] Error fetching FutarchyAMM liquidity for DAO ${daoAddress.toString()}`, error);
+      // Only treat a genuinely-absent vault as 0 liquidity. An RPC failure here
+      // would UNDERCOUNT locked AMM liquidity → OVERSTATE circulating supply →
+      // wrong market cap, so it must propagate (the supply endpoint errors out).
+      if (!isTokenAccountAbsent(error)) throw error;
       return { amount: new BN(0) };
     }
   }
@@ -545,9 +557,10 @@ export class LaunchpadService {
       logger.info(`[Meteora] Found ${amount.toString()} tokens in Meteora ${version} pool`);
       return { amount, poolAddress, vaultAddress };
     } catch (error: any) {
-      logger.info(`[Meteora] ${version} pool lookup failed for ${baseMint.toString()}: ${error.message || 'Unknown error'}`);
-      
-      // If we tried v0.7 and failed, don't try v0.6 as fallback - the version is determined by the launch
+      // Genuinely-absent pool vault → 0 LP is correct. An RPC failure must NOT be
+      // read as 0 (it would overstate circulating supply / market cap) → propagate.
+      if (!isTokenAccountAbsent(error)) throw error;
+      logger.info(`[Meteora] ${version} pool not present for ${baseMint.toString()} — 0 LP`);
       return { amount: new BN(0) };
     }
   }
@@ -616,8 +629,12 @@ export class LaunchpadService {
         performancePackageLockedAmount = new BN(ppTokenAccount.amount.toString());
         logger.info(`[Launchpad] Performance package at ${performancePackageAddress.toString()} holds ${performancePackageLockedAmount.toString()} tokens (configured: ${launch.performancePackageTokenAmount.toString()})`);
       } catch (error: any) {
-        // Token account doesn't exist or is empty — all tokens unlocked/claimed
-        logger.info(`[Launchpad] Performance package token account not found for ${performancePackageAddress.toString()}, assuming 0 locked: ${error.message}`);
+        // Account genuinely absent → all tokens unlocked/claimed → 0 locked (correct).
+        // An RPC failure must propagate: treating it as 0 locked would OVERSTATE
+        // circulating supply (the live-balance approach exists precisely to avoid
+        // mis-subtracting — so a silent 0 on outage is the exact failure to avoid).
+        if (!isTokenAccountAbsent(error)) throw error;
+        logger.info(`[Launchpad] Performance package token account not found for ${performancePackageAddress.toString()}, 0 locked`);
       }
 
       // Get FutarchyAMM liquidity
@@ -665,7 +682,10 @@ export class LaunchpadService {
           };
           logger.info(`[Launchpad] DAO treasury holds ${daoTreasuryTokens.amount.toString()} base tokens in vault ${vaultAddress.toString()}`);
         } catch (error: any) {
-          logger.info(`[Launchpad] No base token account in DAO treasury vault: ${error.message}`);
+          // Genuinely-absent treasury ATA → 0 treasury tokens (correct). An RPC
+          // failure must propagate (a silent 0 here overstates circulating supply).
+          if (!isTokenAccountAbsent(error)) throw error;
+          logger.info(`[Launchpad] No base token account in DAO treasury vault`);
         }
       }
 
