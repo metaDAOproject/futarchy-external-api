@@ -157,7 +157,10 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
               slot, extract(epoch FROM block_time)::bigint AS unix_timestamp, signature
        FROM futarchy.user_pool_swaps
        WHERE source = 'futarchy_amm' AND market_kind = 'spot' AND dao_addr = $1
-       ORDER BY slot ASC, inner_group ASC, inner_ix ASC
+       -- signature in the tie-break: separate txns in one slot can share (inner_group,
+       -- inner_ix) (those are within-txn coords), so order it too for a deterministic
+       -- "first swap" → stable createdAtTxnId.
+       ORDER BY slot ASC, signature ASC, inner_group ASC, inner_ix ASC
        LIMIT 1`,
       [id],
     );
@@ -216,8 +219,13 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
     // side (Buy: USDC in / token out; Sell: token in / USDC out). amm_base/quote
     // reserves are our decoded post-swap reserves — non-NULL for EVERY spot swap
     // (validated dollar-exact vs the live feed), unlike the nullable raw column.
-    // Ordered by on-chain execution order (slot, inner_group, inner_ix) for stable
-    // txnIndex/eventIndex.
+    // Ordered by (slot, signature, inner_group, inner_ix): signature MUST be in the
+    // key because inner_group/inner_ix are within-transaction coordinates — two
+    // distinct txns in one slot can share the same (inner_group, inner_ix), so
+    // ordering without signature both is non-deterministic AND interleaves one txn's
+    // events with another's, which makes the txnIndex builder below assign the same
+    // signature two different txnIndex values. Grouping by signature keeps each txn's
+    // events contiguous → stable, consistent txnIndex/eventIndex.
     const result = await extDb.query(
       `SELECT
          u.id,
@@ -235,7 +243,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
        WHERE u.source = 'futarchy_amm' AND u.market_kind = 'spot'
          AND u.slot >= $1 AND u.slot <= $2
          AND u.base_amount > 0 AND u.quote_amount > 0
-       ORDER BY u.slot ASC, u.inner_group ASC, u.inner_ix ASC`,
+       ORDER BY u.slot ASC, u.signature ASC, u.inner_group ASC, u.inner_ix ASC`,
       [fromBlock, toBlock],
     );
 
