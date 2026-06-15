@@ -9,7 +9,7 @@ export function createRootRouter(_services: ServiceGetters): Router {
   router.get('/', (req: Request, res: Response) => {
     res.json({
       name: 'Futarchy AMM - CoinGecko API',
-      version: '1.0.0',
+      version: '2.0.0',
       documentation: 'https://docs.coingecko.com/reference/exchanges-list',
       endpoints: {
         tickers: '/api/tickers - Returns all DAO tickers with pricing and volume',

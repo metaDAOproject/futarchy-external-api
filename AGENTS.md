@@ -20,12 +20,17 @@
 
 ```
 src/
-├── server.ts           # Express server entry point
+├── main.ts             # API entry point (server startup, graceful shutdown)
+├── app.ts              # Express app setup & middleware (rate limit, metrics, CORS)
 ├── config.ts           # Configuration & environment variables
-├── services/           # Business logic & data processing
-│   ├── externalDatabaseService.ts
+├── runtime/            # Service composition + background heartbeat
+├── routes/             # Route handlers (tickers, market, supply, dexscreener, health)
+├── services/           # Business logic & data access
+│   ├── externalDatabaseService.ts   # Served ETL DB — the ONLY database
 │   └── [other services]
-└── types/              # TypeScript type definitions
+├── middleware/         # errorHandler (AppError/asyncHandler), requestId
+├── types/              # TypeScript type definitions
+└── utils/              # Logger, alerts, validation, scheduling, resilience
 ```
 
 ## Key Technologies
@@ -55,11 +60,13 @@ src/
 
 - **Package Manager**: This project uses Bun exclusively. Do NOT run `npm install`, `npm run`, `pnpm`, or `yarn`.
 - **TypeScript**: Target is ESNext, compiled to dist/ via `bun run build`
-- **Main files**: 
-  - `index.ts` - Module entry point
-  - `src/server.ts` - Server startup
+- **Main files**:
+  - `src/main.ts` - Server startup (entry point)
   - `tsconfig.json` - Compiler config
 - **Lock file**: `bun.lock` - commit this, not node_modules
+- **Serving invariant**: infrastructure failures (RPC/DB) must surface as 5xx —
+  never as 200 with zero/empty/total-as-circulating data. Do not add catch
+  blocks that convert unknown errors into default values in financial paths.
 
 ## Testing
 
@@ -76,8 +83,10 @@ src/
 ## Database
 
 - Uses PostgreSQL with pg driver
-- App DB connection configured via `.env` (`COINGECKO_PG_URL` or `DATABASE_URL`)
-- Served ETL DB connection configured via `.env` (`FRONTEND_READER_PG_URL` or `EXTERNAL_DATABASE_URL`)
+- ONE database: the read-only served ETL DB, configured via `.env`
+  (`FRONTEND_READER_PG_URL` or `EXTERNAL_DATABASE_URL`)
+- The legacy app DB (`COINGECKO_PG_URL`/`DATABASE_URL`) is REMOVED — do not
+  reintroduce it; if a write is ever needed it goes to the prod DB
 - No local backfill scripts or Dune fetchers run in this API
 
 ## Common Issues
@@ -85,13 +94,11 @@ src/
 | Issue | Solution |
 |-------|----------|
 | Dependencies missing | `bun install` |
-| TypeScript errors | `bun run build` to see full errors |
+| TypeScript errors | `bun run typecheck` to see full errors |
 | Tests fail | `bun test` to run suite |
 | ENV vars missing | Copy example.env to .env and fill values |
 
 ## Related Files
 
-- `README.md` - Project overview
-- `ARCHITECTURE_COMPARISON.md` - Architecture decisions
-- `IMPROVEMENTS.md` - Recent improvements made
-- `CODE_REVIEW_README.md` - Code review guidelines
+- `README.md` - Project overview and public API documentation
+- `docs/tickers-volume-cutover-validation.md` - Serving contract for ticker volume

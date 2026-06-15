@@ -1,7 +1,6 @@
 import pg from 'pg';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
-import type { Rolling24hMetrics } from './databaseService.js';
 
 // Force pg to serialize Date parameters as ISO-8601 UTC strings so PostgreSQL
 // doesn't receive un-parseable local-timezone names like "GMT-0700".
@@ -9,10 +8,26 @@ pg.defaults.parseInputDatesAsUTC = true;
 
 const { Pool } = pg;
 
+export interface Rolling24hMetrics {
+  token: string;
+  base_volume_24h: string;
+  target_volume_24h: string;
+  high_24h: string;
+  low_24h: string;
+  trade_count_24h: number;
+}
+
 export interface ServedDataContractStatus {
   ok: boolean;
   checkedAt: string;
   missing: string[];
+}
+
+export interface ServedDataFreshness {
+  /** ISO timestamp of the newest swap in the served DB, or null if the table is empty. */
+  latestSwapAt: string | null;
+  /** Age of that swap in seconds, or null if the table is empty. */
+  ageSeconds: number | null;
 }
 
 /**
@@ -327,6 +342,32 @@ export class ExternalDatabaseService {
     }
   }
 
+  /**
+   * Freshness of the served pipeline: age of the newest row in
+   * futarchy.user_pool_swaps (any source). Used by the heartbeat and
+   * /api/health to distinguish "connected but stale ETL" from healthy.
+   * Throws on connection or query failure.
+   */
+  async getServedDataFreshness(): Promise<ServedDataFreshness> {
+    if (!this.pool || !this.isConnected) {
+      throw new Error('External database not connected');
+    }
+    const result = await this.pool.query(
+      `SELECT
+         MAX(block_time) AS latest_swap_at,
+         extract(epoch FROM now() - MAX(block_time))::bigint AS age_seconds
+       FROM futarchy.user_pool_swaps`
+    );
+    const row = result.rows[0];
+    if (!row || row.latest_swap_at == null) {
+      return { latestSwapAt: null, ageSeconds: null };
+    }
+    return {
+      latestSwapAt: new Date(row.latest_swap_at).toISOString(),
+      ageSeconds: Number(row.age_seconds),
+    };
+  }
+
   async checkServedDataContract(): Promise<ServedDataContractStatus> {
     const checkedAt = new Date().toISOString();
     if (!this.pool || !this.isConnected) {
@@ -485,9 +526,27 @@ export class ExternalDatabaseService {
   }
 
   private createPool(): void {
+    // SSL verifies the server certificate by default (system CAs, or
+    // EXTERNAL_DATABASE_CA_CERT for a private CA). The unverified mode — which
+    // permits MITM on the financial source of truth — requires the explicit
+    // EXTERNAL_DATABASE_SSL_NO_VERIFY opt-out and logs loudly.
+    let ssl: pg.PoolConfig['ssl'] = false;
+    if (config.externalDatabase.caCert) {
+      ssl = { ca: config.externalDatabase.caCert, rejectUnauthorized: true };
+    } else if (config.externalDatabase.ssl) {
+      if (config.externalDatabase.sslNoVerify) {
+        logger.warn(
+          '[ExternalDB] EXTERNAL_DATABASE_SSL_NO_VERIFY is set — TLS is encrypted but the server is NOT authenticated. Provide EXTERNAL_DATABASE_CA_CERT to enable verification.'
+        );
+        ssl = { rejectUnauthorized: false };
+      } else {
+        ssl = { rejectUnauthorized: true };
+      }
+    }
+
     this.pool = new Pool({
       connectionString: config.externalDatabase.connectionString,
-      ssl: config.externalDatabase.ssl ? { rejectUnauthorized: false } : false,
+      ssl,
       max: 5,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 10_000,

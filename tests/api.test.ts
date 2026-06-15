@@ -4,7 +4,6 @@ import { PublicKey } from '@solana/web3.js';
 import { createApp, type Services } from '../src/app.js';
 import type { FutarchyService, DaoTickerData } from '../src/services/futarchyService.js';
 import type { PriceService } from '../src/services/priceService.js';
-import type { DatabaseService } from '../src/services/databaseService.js';
 import type { ExternalDatabaseService } from '../src/services/externalDatabaseService.js';
 
 // Mock DAO data
@@ -39,7 +38,6 @@ const mockFutarchyService = {
     baseProtocolFees: new BN('100000000'),
     quoteProtocolFees: new BN('5000000'),
   }),
-  getTotalLiquidity: jest.fn().mockResolvedValue(new BN('100000000000')),
 } as unknown as FutarchyService;
 
 const mockPriceService = {
@@ -49,15 +47,7 @@ const mockPriceService = {
     ask: '0.05025',
   })),
   calculateLiquidityUSD: jest.fn(() => '100000.00'),
-  calculateVolumeFromFees: jest.fn(() => ({
-    baseVolume: '40.00000000',
-    targetVolume: '2.00000000',
-  })),
 } as unknown as PriceService;
-
-const mockDatabaseService = {
-  isAvailable: jest.fn().mockReturnValue(true),
-} as unknown as DatabaseService;
 
 // /api/tickers 24h metrics come from the unified user_pool ETL candles
 // (user_pool_spot_ohlcv), keyed by token (base mint). First-trade dates (startDate)
@@ -77,7 +67,6 @@ function createMockServices(): Services {
   return {
     futarchyService: mockFutarchyService,
     priceService: mockPriceService,
-    databaseService: mockDatabaseService,
     externalDatabaseService: mockExternalDatabaseService,
     solanaService: undefined,
     launchpadService: undefined,

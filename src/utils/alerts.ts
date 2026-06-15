@@ -16,6 +16,11 @@ export async function sendAlert(
   message: string,
   options?: { cooldownKey?: string; cooldownMs?: number },
 ): Promise<void> {
+  // Never fire real webhooks from the test runner (bun test sets NODE_ENV=test):
+  // the default WEBHOOK_URL points at the production Telegram relay.
+  if (process.env.NODE_ENV === 'test') return;
+  if (!WEBHOOK_URL) return;
+
   const cooldownKey = options?.cooldownKey;
   const cooldownMs = options?.cooldownMs ?? DEFAULT_COOLDOWN_MS;
 

@@ -2,7 +2,6 @@ import type { FutarchyService } from '../services/futarchyService.js';
 import type { PriceService } from '../services/priceService.js';
 import type { SolanaService } from '../services/solanaService.js';
 import type { LaunchpadService } from '../services/launchpadService.js';
-import type { DatabaseService } from '../services/databaseService.js';
 import type { ExternalDatabaseService } from '../services/externalDatabaseService.js';
 import { AppError } from '../middleware/errorHandler.js';
 
@@ -17,7 +16,6 @@ import { AppError } from '../middleware/errorHandler.js';
 export interface Services {
   futarchyService: FutarchyService;
   priceService: PriceService;
-  databaseService: DatabaseService;
 
   externalDatabaseService: ExternalDatabaseService | null;
 
@@ -35,7 +33,6 @@ export interface ServiceGetters {
   getPriceService: () => PriceService;
   getSolanaService: () => SolanaService;
   getLaunchpadService: () => LaunchpadService;
-  getDatabaseService: () => DatabaseService;
   getExternalDatabaseService: () => ExternalDatabaseService | null;
 }
 
@@ -52,7 +49,6 @@ export function createServiceGetters(services: Services): ServiceGetters {
   return {
     getFutarchyService: () => services.futarchyService,
     getPriceService: () => services.priceService,
-    getDatabaseService: () => services.databaseService,
 
     getExternalDatabaseService: () => optionalService(services.externalDatabaseService),
 

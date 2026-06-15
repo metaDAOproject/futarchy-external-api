@@ -361,6 +361,18 @@ export class FutarchyService {
     const cached = this.getCached<DaoTickerData[]>(cacheKey, config.cache.tickersTTL);
     if (cached) return cached;
 
+    // Single-flight: concurrent callers after cache expiry share one scan instead
+    // of each launching a full DAO+RPC sweep (cache stampede against the RPC).
+    if (this.allDaosInFlight) return this.allDaosInFlight;
+    this.allDaosInFlight = this.fetchAllDaos(cacheKey).finally(() => {
+      this.allDaosInFlight = null;
+    });
+    return this.allDaosInFlight;
+  }
+
+  private allDaosInFlight: Promise<DaoTickerData[]> | null = null;
+
+  private async fetchAllDaos(cacheKey: string): Promise<DaoTickerData[]> {
     try {
       // Fetch all DAO accounts with retry logic
       let daoAccounts: any[];
@@ -496,12 +508,4 @@ export class FutarchyService {
     }
   }
 
-  async getTotalLiquidity(daoAddress?: PublicKey): Promise<BN> {
-    const daoPubkey = daoAddress;
-    if (!daoPubkey) {
-      throw new Error('DAO address is required. Provide daoAddress parameter or set DAO_PUBLIC_KEY environment variable.');
-    }
-    const dao = await this.client.getDao(daoPubkey);
-    return new BN(dao.amm.totalLiquidity);
-  }
 }

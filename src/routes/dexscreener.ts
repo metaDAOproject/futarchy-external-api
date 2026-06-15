@@ -23,10 +23,22 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
   const { getFutarchyService, getExternalDatabaseService, getSolanaService, getLaunchpadService } =
     services;
 
-  // In-memory TTL caches for mostly-static endpoints
+  // In-memory TTL caches for mostly-static endpoints. Bounded: the keys are
+  // caller-supplied ids, so without a cap a scanner cycling through arbitrary
+  // valid pubkeys would grow these maps (and burn RPC per miss) without limit.
   const assetCache = new Map<string, { data: DexScreenerAssetResponse; expiresAt: number }>();
   const pairCache = new Map<string, { data: DexScreenerPairResponse; expiresAt: number }>();
   const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  const CACHE_MAX_ENTRIES = 1000;
+
+  function cachePut<T>(cache: Map<string, T>, key: string, value: T): void {
+    if (cache.size >= CACHE_MAX_ENTRIES) {
+      // Evict oldest insertion (Map preserves insertion order)
+      const oldest = cache.keys().next().value;
+      if (oldest !== undefined) cache.delete(oldest);
+    }
+    cache.set(key, value);
+  }
 
   // ---------------------------------------------------------------
   // GET /dexscreener/latest-block
@@ -125,7 +137,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       },
     };
 
-    assetCache.set(id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
+    cachePut(assetCache, id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
     res.json(response);
   }));
 
@@ -184,7 +196,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       },
     };
 
-    pairCache.set(id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
+    cachePut(pairCache, id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
     res.json(response);
   }));
 

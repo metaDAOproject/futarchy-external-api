@@ -2,22 +2,9 @@ import BN from 'bn.js';
 import { createApp, type Services } from '../../src/app.js';
 import type { FutarchyService } from '../../src/services/futarchyService.js';
 import type { PriceService } from '../../src/services/priceService.js';
-import type { DatabaseService } from '../../src/services/databaseService.js';
 import type { ExternalDatabaseService } from '../../src/services/externalDatabaseService.js';
 import type { SolanaService } from '../../src/services/solanaService.js';
 import type { LaunchpadService } from '../../src/services/launchpadService.js';
-
-export function createMockDatabaseService(): DatabaseService {
-  return {
-    isAvailable: () => true,
-    getServiceHealthHistory: async () => [],
-    getRecentMetrics: async () => [],
-    insertServiceHealthSnapshot: async () => {},
-    insertMetricsBatch: async () => {},
-    pruneOldMetrics: async () => {},
-    close: async () => {},
-  } as unknown as DatabaseService;
-}
 
 export function createMockExternalDatabaseService(): ExternalDatabaseService {
   return {
@@ -26,6 +13,10 @@ export function createMockExternalDatabaseService(): ExternalDatabaseService {
     getDailyMeteoraVolumes: async () => [],
     getFutarchyAmmDailyActivity: async () => [],
     getFirstTradeDates: async () => new Map(),
+    getServedDataFreshness: async () => ({
+      latestSwapAt: new Date().toISOString(),
+      ageSeconds: 30,
+    }),
     checkServedDataContract: async () => ({
       ok: true,
       checkedAt: new Date().toISOString(),
@@ -76,7 +67,6 @@ export function createTestServices(overrides?: Partial<Services>): Services {
   return {
     futarchyService: createMockFutarchyService(),
     priceService: createMockPriceService(),
-    databaseService: createMockDatabaseService(),
     externalDatabaseService: createMockExternalDatabaseService(),
     solanaService: createMockSolanaService(),
     launchpadService: createMockLaunchpadService(),

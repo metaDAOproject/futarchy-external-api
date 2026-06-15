@@ -1,4 +1,7 @@
-FROM oven/bun:latest
+# Pin the base image to the same Bun version as packageManager in package.json.
+# (`latest` would silently change the runtime under us between builds.)
+FROM oven/bun:1.3.14
+
 WORKDIR /app
 
 COPY package.json bun.lock ./
@@ -18,6 +21,13 @@ RUN chmod +x /usr/local/bin/vault-entrypoint.sh
 
 COPY src/ src/
 COPY tsconfig.json ./
+
+# Fail the build on type errors — the container runs raw TS, so without this
+# nothing between the editor and production checks types.
+RUN bun run typecheck
+
+# Run as the unprivileged user the bun image ships with.
+USER bun
 
 EXPOSE 3000
 ENTRYPOINT ["/usr/local/bin/vault-entrypoint.sh"]

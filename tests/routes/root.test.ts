@@ -17,7 +17,7 @@ describe('Root Routes', () => {
       expect(response.body).toHaveProperty('name');
       expect(response.body).toHaveProperty('version');
       expect(response.body.name).toBe('Futarchy AMM - CoinGecko API');
-      expect(response.body.version).toBe('1.0.0');
+      expect(response.body.version).toBe('2.0.0');
     });
 
     it('should list available endpoints', async () => {

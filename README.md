@@ -184,9 +184,20 @@ Returns circulating supply — total minus team performance package.
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /health` | Basic health check (status, uptime, cache status) |
-| `GET /api/health` | Comprehensive health with DB, volume services, and data freshness |
-| `GET /metrics` | Prometheus metrics |
+| `GET /health` | Liveness: process status and uptime (no dependency checks) |
+| `GET /api/health` | Readiness: served DB connectivity, ETL data contract, and data freshness |
+| `GET /metrics` | Prometheus metrics (HTTP, served-DB health gauges, heartbeat) |
+
+`/api/health` reports `status: "degraded"` (with a `message`) when the served DB
+is unreachable, the served-data contract check fails, or the freshness query fails.
+
+**Heartbeat**: a background self-check runs every `HEARTBEAT_INTERVAL_MS` (default
+1 min). It verifies served-DB connectivity, alerts when the newest swap is older
+than `HEARTBEAT_MAX_DATA_AGE_SECONDS` (default 6h — a stalled ETL with a healthy
+connection is still an outage), and re-checks the data contract every 10th tick.
+Failures push webhook alerts (with cooldowns) and update the
+`futarchy_served_db_connected` / `futarchy_served_contract_ok` /
+`futarchy_served_data_age_seconds` Prometheus gauges.
 
 ---
 
@@ -220,14 +231,18 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | **Server** | | |
 | `PORT` | Server port | `3000` |
 | `SERVER_REQUEST_TIMEOUT` | Request timeout (ms) | `300000` |
+| `TRUST_PROXY_HOPS` | Reverse-proxy hops in front of the API (needed for per-IP rate limiting behind a LB) | `0` |
 | `TRUSTED_API_KEYS` | Comma-separated allowlist of trusted partner keys | — |
 | `TRUSTED_RATE_LIMIT_MAX` | Per-bucket request count per minute for trusted keys | `600` |
-| **Database (App DB)** | | |
-| `COINGECKO_PG_URL` / `DATABASE_URL` | PostgreSQL connection string | — |
-| `DATABASE_SSL` | Enable SSL | `false` |
-| **Served indexer DB (required)** | | |
+| `CACHE_TICKERS_TTL` | On-chain data cache TTL (ms) | `55000` |
+| **Served indexer DB (required — the only database this API uses)** | | |
 | `FRONTEND_READER_PG_URL` / `EXTERNAL_DATABASE_URL` | Read-only connection to the served indexer DB (Meteora, tickers, DexScreener, first-trade-dates). **Required** — `/api/market-data` returns 503 without it. | — |
-| `EXTERNAL_DATABASE_SSL` | Enable SSL | `false` |
+| `EXTERNAL_DATABASE_SSL` | Enable SSL (server cert verified against system CAs) | `false` |
+| `EXTERNAL_DATABASE_CA_CERT` | PEM CA cert content for private-CA verification | — |
+| `EXTERNAL_DATABASE_SSL_NO_VERIFY` | Explicit opt-out of TLS verification (stopgap only) | `false` |
+| **Heartbeat** | | |
+| `HEARTBEAT_INTERVAL_MS` | Background self-check cadence (0 disables) | `60000` |
+| `HEARTBEAT_MAX_DATA_AGE_SECONDS` | Stale-data alert threshold (0 disables) | `21600` |
 | **Protocol** | | |
 | `PROTOCOL_FEE_RATE` | Protocol fee rate | `0.005` (0.5%) |
 | `EXCLUDED_DAOS` | Comma-separated DAO addresses to exclude | — |
@@ -242,7 +257,8 @@ src/
 ├── app.ts                        # Express app setup & middleware
 ├── main.ts                       # API entry point (serves routes, no indexing workers)
 ├── runtime/
-│   └── services.ts               # API service composition
+│   ├── services.ts               # API service composition
+│   └── heartbeat.ts              # Background self-check (served DB, freshness, contract)
 ├── config.ts                     # Environment variables & configuration
 ├── routes/
 │   ├── index.ts                  # Route registration
@@ -250,14 +266,13 @@ src/
 │   ├── dexscreener.ts            # DexScreener adapter (4 endpoints)
 │   ├── market.ts                 # GET /api/market-data (user_pool ETL)
 │   ├── supply.ts                 # GET /api/supply/*
-│   ├── health.ts                 # Health checks
+│   ├── health.ts                 # Liveness + readiness checks
 │   ├── metrics.ts                # Prometheus metrics
 │   └── root.ts                   # GET / (API info)
 ├── services/
 │   ├── futarchyService.ts        # On-chain DAO/pool/token data
 │   ├── priceService.ts           # Price, spread, liquidity calculations
-│   ├── databaseService.ts        # App DB metrics and health history
-│   ├── externalDatabaseService.ts # Read-only served ETL DB connection
+│   ├── externalDatabaseService.ts # Read-only served ETL DB connection (the only DB)
 │   ├── solanaService.ts          # SPL token supply queries
 │   ├── launchpadService.ts       # Token allocation breakdown
 │   └── metricsService.ts         # Prometheus counters/histograms
@@ -279,8 +294,9 @@ The API process serves market data from the read-only served ETL DB:
 - `/api/market-data` reads FutarchyAMM and Meteora daily rows from `futarchy.user_pool_daily`.
 - DexScreener routes read raw indexed v0.6 swap/DAO tables from the same served DB.
 
-The app DB is used for API metrics and health history only. The API does not start
-indexing, fetchers, rollups, or app-DB schema setup in production.
+The served ETL DB is the **only** database this API connects to (the legacy app DB
+is fully removed). The API does not start indexing, fetchers, rollups, or any
+schema setup — it is serve-only.
 
 ### DexScreener Pipeline
 The DexScreener adapter reads **directly from the external indexer DB** (`v0_6_spot_swaps` + `v0_6_daos`) and serves real-time swap events indexed by Solana slot. No intermediate aggregation — raw swap data mapped to the DexScreener schema.
@@ -288,6 +304,7 @@ The DexScreener adapter reads **directly from the external indexer DB** (`v0_6_s
 ## Rate Limiting
 
 - **Anonymous (default):** 60 requests per minute per IP. Returns `429 Too Many Requests` when exceeded.
+  - **Behind a proxy/load balancer, set `TRUST_PROXY_HOPS`** to the real hop count — otherwise every anonymous client resolves to the proxy's IP and shares a single bucket.
 - **Trusted partners:** 600 requests per minute per key (configurable via `TRUSTED_RATE_LIMIT_MAX`). Send the issued key in the `X-API-Key` header. Each key has its own bucket — partners do not share quota.
 - Requests sent with an `X-API-Key` header that does not match the server-side allowlist receive `401 Unauthorized` with `code: "INVALID_API_KEY"`.
 - Keys are issued out-of-band by the team. Contact us if you need elevated access.
