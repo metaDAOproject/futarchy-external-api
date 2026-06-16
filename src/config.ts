@@ -1,10 +1,7 @@
 import { PublicKey } from '@solana/web3.js';
 export const config = {
-  // Development mode flag retained for compatibility with existing deployments.
-  devMode: process.env.DEV_MODE === 'true',
   solana: {
     rpcUrl: process.env.RPCPOOL_RPC_URL || process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
-    wsUrl: process.env.RPCPOOL_WS_URL || process.env.SOLANA_WS_URL || 'wss://api.mainnet-beta.solana.com',
   },
   server: {
     port: parseInt(process.env.PORT || '3000'),
@@ -51,7 +48,7 @@ export const config = {
     .filter(addr => addr.length > 0)
     .map(addr => new PublicKey(addr)),
   fees: {
-    // Protocol fee rate (0.005 = 0.5%)
+    // Protocol fee rate (0.005 = 0.5%); used to report fee bps on DexScreener routes.
     protocolFeeRate: parseFloat(process.env.PROTOCOL_FEE_RATE || '0.005'),
   },
   alerts: {
