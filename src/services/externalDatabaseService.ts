@@ -164,7 +164,7 @@ export class ExternalDatabaseService {
   }): Promise<Array<{
     token: string; date: string; base_volume: string; target_volume: string;
     buy_volume: string; sell_volume: string; trade_count: number; average_price: string;
-    usdc_fees: string; token_fees: string; token_fees_usdc: string; token_per_usdc: string;
+    usdc_fees: string; token_fees: string; token_fees_usdc: string; token_per_usdc: string | null;
   }>> {
     if (!this.pool || !this.isConnected) {
       throw new Error('External database not connected');
@@ -379,6 +379,9 @@ export class ExternalDatabaseService {
     }
 
     const requiredColumns = new Map<string, string[]>([
+      // Must cover EVERY column getFutarchyAmmDailyActivity + getDailyMeteoraVolumes
+      // + getFirstTradeDates actually SELECT — otherwise the health check reports
+      // ok:true while a dropped column makes every market-data query throw at runtime.
       ['user_pool_daily', [
         'source',
         'market_kind',
@@ -386,8 +389,17 @@ export class ExternalDatabaseService {
         'date',
         'base_volume',
         'target_volume',
+        'buy_volume',
+        'sell_volume',
         'trade_count',
         'usdc_fees',
+        'token_fees',
+        'token_fees_usdc',
+        'average_price',
+        'futarchy_protocol_fee_usdc',
+        'futarchy_lp_fee_usdc',
+        'conditional_reconciled',
+        'pending_open_proposals',
       ]],
       ['user_pool_spot_ohlcv', [
         'source',

@@ -12,18 +12,9 @@ export function createMarketRouter(services: ServiceGetters): Router {
   // the served DB (futarchy.user_pool_daily), via externalDatabase.
   // FutarchyAMM no longer reads the flat-0.5% app-DB v06_fee_volume_daily_aggregate.
   router.get('/api/market-data', async (req: Request, res: Response) => {
-    // The served DB is the source of truth for market data; surface its absence/failure
-    // rather than masking it as empty (a financial feed must never read a DB outage as
-    // "zero volume").
-    const externalDatabaseService = getExternalDatabaseService();
-    if (!externalDatabaseService || !externalDatabaseService.isAvailable()) {
-      return res.status(503).json({
-        error: 'Served database not available',
-        message: 'Market data source (served indexer DB) is not connected',
-      });
-    }
-
-    // Validate date parameters
+    // Validate client input BEFORE touching the served DB, so a malformed/missing
+    // parameter always returns a 400 — independent of DB state. (Checking DB
+    // availability first would turn a client error into a 503 during an outage.)
     const startDateResult = parseDateParam(req.query.startDate as string, 'startDate', { required: true });
     if (!startDateResult.success) {
       return res.status(400).json(startDateResult.error);
@@ -34,10 +25,20 @@ export function createMarketRouter(services: ServiceGetters): Router {
       return res.status(400).json(endDateResult.error);
     }
 
-    // Validate tokens list
     const tokensResult = parseCommaSeparatedList(req.query.tokens as string, 'tokens');
     if (!tokensResult.success) {
       return res.status(400).json(tokensResult.error);
+    }
+
+    // The served DB is the source of truth for market data; surface its absence/failure
+    // rather than masking it as empty (a financial feed must never read a DB outage as
+    // "zero volume").
+    const externalDatabaseService = getExternalDatabaseService();
+    if (!externalDatabaseService || !externalDatabaseService.isAvailable()) {
+      return res.status(503).json({
+        error: 'Served database not available',
+        message: 'Market data source (served indexer DB) is not connected',
+      });
     }
 
     try {
