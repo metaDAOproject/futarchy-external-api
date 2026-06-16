@@ -21,7 +21,7 @@ export function createRootRouter(_services: ServiceGetters): Router {
         health_detailed: '/api/health - Comprehensive health with app DB and served ETL contract checks',
       },
       dexscreener: {
-        description: 'DexScreener Adapter (v1.1) — requires FRONTEND_READER_PG_URL or EXTERNAL_DATABASE_URL',
+        description: 'DexScreener Adapter (v1.1) — requires DATABASE_PG_URL',
         latest_block: '/dexscreener/latest-block - Latest indexed Solana slot',
         asset: '/dexscreener/asset?id=:mintAddress - Token metadata',
         pair: '/dexscreener/pair?id=:daoAddress - Pair info',

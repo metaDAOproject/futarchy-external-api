@@ -54,7 +54,7 @@ src/
 
 1. Copy `example.env` to `.env`
 2. Configure PostgreSQL connection and API keys
-3. Configure `FRONTEND_READER_PG_URL` or `EXTERNAL_DATABASE_URL` for served ETL reads
+3. Configure `DATABASE_PG_URL` for served ETL reads
 
 ## Important Notes
 
@@ -84,7 +84,7 @@ src/
 
 - Uses PostgreSQL with pg driver
 - ONE database: the read-only served ETL DB, configured via `.env`
-  (`FRONTEND_READER_PG_URL` or `EXTERNAL_DATABASE_URL`)
+  (`DATABASE_PG_URL`)
 - The legacy app DB (`COINGECKO_PG_URL`/`DATABASE_URL`) is REMOVED — do not
   reintroduce it; if a write is ever needed it goes to the prod DB
 - No local backfill scripts or Dune fetchers run in this API

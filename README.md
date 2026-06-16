@@ -62,7 +62,7 @@ served DB is unavailable, the endpoint returns `503` instead of reporting zero v
 
 ### DexScreener Adapter Endpoints
 
-Implements the [DexScreener Adapter Spec v1.1](https://dexscreener.notion.site/DEX-Screener-Adapter-Specs-cc1223cdf6e74a7799599106b65dcd0e). All endpoints are served under `/dexscreener/`. Requires `FRONTEND_READER_PG_URL` or `EXTERNAL_DATABASE_URL` to be configured for the served DB.
+Implements the [DexScreener Adapter Spec v1.1](https://dexscreener.notion.site/DEX-Screener-Adapter-Specs-cc1223cdf6e74a7799599106b65dcd0e). All endpoints are served under `/dexscreener/`. Requires `DATABASE_PG_URL` to be configured for the served DB.
 
 #### GET `/dexscreener/latest-block`
 
@@ -236,10 +236,10 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | `TRUSTED_RATE_LIMIT_MAX` | Per-bucket request count per minute for trusted keys | `600` |
 | `CACHE_TICKERS_TTL` | On-chain data cache TTL (ms) | `55000` |
 | **Served indexer DB (required — the only database this API uses)** | | |
-| `FRONTEND_READER_PG_URL` / `EXTERNAL_DATABASE_URL` | Read-only connection to the served indexer DB (Meteora, tickers, DexScreener, first-trade-dates). **Required** — `/api/market-data` returns 503 without it. | — |
-| `EXTERNAL_DATABASE_SSL` | Enable SSL (server cert verified against system CAs) | `false` |
-| `EXTERNAL_DATABASE_CA_CERT` | PEM CA cert content for private-CA verification | — |
-| `EXTERNAL_DATABASE_SSL_NO_VERIFY` | Explicit opt-out of TLS verification (stopgap only) | `false` |
+| `DATABASE_PG_URL` | Read-only connection to the served indexer DB (Meteora, tickers, DexScreener, first-trade-dates). **Required** — `/api/market-data` returns 503 without it. | — |
+| `DATABASE_PG_SSL` | Enable SSL (server cert verified against system CAs) | `false` |
+| `DATABASE_PG_CA_CERT` | PEM CA cert content for private-CA verification | — |
+| `DATABASE_PG_SSL_NO_VERIFY` | Explicit opt-out of TLS verification (stopgap only) | `false` |
 | **Heartbeat** | | |
 | `HEARTBEAT_INTERVAL_MS` | Background self-check cadence (0 disables) | `60000` |
 | `HEARTBEAT_MAX_DATA_AGE_SECONDS` | Stale-data alert threshold (0 disables) | `21600` |

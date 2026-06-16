@@ -48,7 +48,7 @@ export class ExternalDatabaseService {
 
   async initialize(): Promise<boolean> {
     if (!config.externalDatabase.connectionString) {
-      logger.info('[ExternalDB] No EXTERNAL_DATABASE_URL or FRONTEND_READER_PG_URL configured');
+      logger.info('[ExternalDB] No DATABASE_PG_URL configured');
       return false;
     }
 
@@ -539,16 +539,16 @@ export class ExternalDatabaseService {
 
   private createPool(): void {
     // SSL verifies the server certificate by default (system CAs, or
-    // EXTERNAL_DATABASE_CA_CERT for a private CA). The unverified mode — which
+    // DATABASE_PG_CA_CERT for a private CA). The unverified mode — which
     // permits MITM on the financial source of truth — requires the explicit
-    // EXTERNAL_DATABASE_SSL_NO_VERIFY opt-out and logs loudly.
+    // DATABASE_PG_SSL_NO_VERIFY opt-out and logs loudly.
     let ssl: pg.PoolConfig['ssl'] = false;
     if (config.externalDatabase.caCert) {
       ssl = { ca: config.externalDatabase.caCert, rejectUnauthorized: true };
     } else if (config.externalDatabase.ssl) {
       if (config.externalDatabase.sslNoVerify) {
         logger.warn(
-          '[ExternalDB] EXTERNAL_DATABASE_SSL_NO_VERIFY is set — TLS is encrypted but the server is NOT authenticated. Provide EXTERNAL_DATABASE_CA_CERT to enable verification.'
+          '[ExternalDB] DATABASE_PG_SSL_NO_VERIFY is set — TLS is encrypted but the server is NOT authenticated. Provide DATABASE_PG_CA_CERT to enable verification.'
         );
         ssl = { rejectUnauthorized: false };
       } else {

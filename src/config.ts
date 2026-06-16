@@ -58,14 +58,14 @@ export const config = {
   externalDatabase: {
     // Read-only connection to the served ETL DB — the ONLY database this API uses.
     // (The old app DB is fully removed; any future write goes to the prod DB.)
-    connectionString: process.env.FRONTEND_READER_PG_URL || process.env.EXTERNAL_DATABASE_URL || '',
-    ssl: process.env.EXTERNAL_DATABASE_SSL === 'true',
+    connectionString: process.env.DATABASE_PG_URL || '',
+    ssl: process.env.DATABASE_PG_SSL === 'true',
     // PEM CA certificate (the cert content, not a path) for verifying a server
     // signed by a private CA. With SSL on and no CA cert, system CAs are used.
-    caCert: process.env.EXTERNAL_DATABASE_CA_CERT || '',
+    caCert: process.env.DATABASE_PG_CA_CERT || '',
     // Explicit opt-out of TLS server verification (legacy/self-signed setups).
     // Encrypts but does NOT authenticate the server — set only as a stopgap.
-    sslNoVerify: process.env.EXTERNAL_DATABASE_SSL_NO_VERIFY === 'true',
+    sslNoVerify: process.env.DATABASE_PG_SSL_NO_VERIFY === 'true',
   },
   heartbeat: {
     // Background self-check cadence (served DB connectivity, data freshness,
