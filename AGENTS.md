@@ -12,23 +12,25 @@
 - **`bun test`** - Run all tests
 - **`bun run <script>`** - Run any script from package.json
 
-### Backfill Commands
-- **`bun run backfill`** - Run full backfill
-- **`bun run backfill:daily`** - Backfill daily data
-- **`bun run backfill:hourly`** - Backfill hourly data
-- **`bun run backfill:ten-minute`** - Backfill 10-minute data
+### Data Serving
+- Market data and ticker volume are served from the external user_pool ETL DB.
+- This API does not run local backfills, Dune fetchers, or indexer workers.
 
 ## Project Structure
 
 ```
 src/
-├── server.ts           # Express server entry point
+├── main.ts             # API entry point (server startup, graceful shutdown)
+├── app.ts              # Express app setup & middleware (rate limit, metrics, CORS)
 ├── config.ts           # Configuration & environment variables
-├── services/           # Business logic & data processing
-│   ├── tenMinuteVolumeService.ts
+├── runtime/            # Service composition + background heartbeat
+├── routes/             # Route handlers (tickers, market, supply, dexscreener, health)
+├── services/           # Business logic & data access
+│   ├── externalDatabaseService.ts   # Served ETL DB — the ONLY database
 │   └── [other services]
-├── schema/             # Database schema & types
-└── types/              # TypeScript type definitions
+├── middleware/         # errorHandler (AppError/asyncHandler), requestId
+├── types/              # TypeScript type definitions
+└── utils/              # Logger, alerts, validation, scheduling, resilience
 ```
 
 ## Key Technologies
@@ -52,17 +54,19 @@ src/
 
 1. Copy `example.env` to `.env`
 2. Configure PostgreSQL connection and API keys
-3. Run backfill if needed: `bun run backfill`
+3. Configure `DATABASE_PG_URL` for served ETL reads
 
 ## Important Notes
 
 - **Package Manager**: This project uses Bun exclusively. Do NOT run `npm install`, `npm run`, `pnpm`, or `yarn`.
 - **TypeScript**: Target is ESNext, compiled to dist/ via `bun run build`
-- **Main files**: 
-  - `index.ts` - Module entry point
-  - `src/server.ts` - Server startup
+- **Main files**:
+  - `src/main.ts` - Server startup (entry point)
   - `tsconfig.json` - Compiler config
 - **Lock file**: `bun.lock` - commit this, not node_modules
+- **Serving invariant**: infrastructure failures (RPC/DB) must surface as 5xx —
+  never as 200 with zero/empty/total-as-circulating data. Do not add catch
+  blocks that convert unknown errors into default values in financial paths.
 
 ## Testing
 
@@ -79,22 +83,22 @@ src/
 ## Database
 
 - Uses PostgreSQL with pg driver
-- Schema defined in `src/schema/`
-- Connection configured via .env (DATABASE_URL)
-- Backfill scripts in `scripts/` directory
+- ONE database: the read-only served ETL DB, configured via `.env`
+  (`DATABASE_PG_URL`)
+- The legacy app DB (`COINGECKO_PG_URL`/`DATABASE_URL`) is REMOVED — do not
+  reintroduce it; if a write is ever needed it goes to the prod DB
+- No local backfill scripts or Dune fetchers run in this API
 
 ## Common Issues
 
 | Issue | Solution |
 |-------|----------|
 | Dependencies missing | `bun install` |
-| TypeScript errors | `bun run build` to see full errors |
+| TypeScript errors | `bun run typecheck` to see full errors |
 | Tests fail | `bun test` to run suite |
 | ENV vars missing | Copy example.env to .env and fill values |
 
 ## Related Files
 
-- `README.md` - Project overview
-- `ARCHITECTURE_COMPARISON.md` - Architecture decisions
-- `IMPROVEMENTS.md` - Recent improvements made
-- `CODE_REVIEW_README.md` - Code review guidelines
+- `README.md` - Project overview and public API documentation
+- `docs/tickers-volume-cutover-validation.md` - Serving contract for ticker volume

@@ -2,24 +2,28 @@ import BN from 'bn.js';
 import { createApp, type Services } from '../../src/app.js';
 import type { FutarchyService } from '../../src/services/futarchyService.js';
 import type { PriceService } from '../../src/services/priceService.js';
-import type { DatabaseService } from '../../src/services/databaseService.js';
+import type { ExternalDatabaseService } from '../../src/services/externalDatabaseService.js';
 import type { SolanaService } from '../../src/services/solanaService.js';
 import type { LaunchpadService } from '../../src/services/launchpadService.js';
 
-export function createMockDatabaseService(): DatabaseService {
+export function createMockExternalDatabaseService(): ExternalDatabaseService {
   return {
     isAvailable: () => true,
+    getSpotRolling24hMetrics: async () => new Map(),
+    getDailyMeteoraVolumes: async () => [],
+    getFutarchyAmmDailyActivity: async () => [],
     getFirstTradeDates: async () => new Map(),
-    getServiceHealthHistory: async () => [],
-    getHourlyRecordCount: async () => 0,
-    getTenMinuteRecordCount: async () => 0,
-    getDailyRecordCount: async () => 0,
-    getBuySellRecordCount: async () => 0,
-    insertServiceHealthSnapshot: async () => {},
-    insertMetricsBatch: async () => {},
-    pruneOldMetrics: async () => {},
+    getServedDataFreshness: async () => ({
+      latestSwapAt: new Date().toISOString(),
+      ageSeconds: 30,
+    }),
+    checkServedDataContract: async () => ({
+      ok: true,
+      checkedAt: new Date().toISOString(),
+      missing: [],
+    }),
     close: async () => {},
-  } as unknown as DatabaseService;
+  } as unknown as ExternalDatabaseService;
 }
 
 export function createMockFutarchyService(): FutarchyService {
@@ -63,15 +67,9 @@ export function createTestServices(overrides?: Partial<Services>): Services {
   return {
     futarchyService: createMockFutarchyService(),
     priceService: createMockPriceService(),
-    databaseService: createMockDatabaseService(),
-    duneService: null,
-    duneCacheService: null,
+    externalDatabaseService: createMockExternalDatabaseService(),
     solanaService: createMockSolanaService(),
     launchpadService: createMockLaunchpadService(),
-    hourlyAggregationService: null,
-    tenMinuteVolumeFetcherService: null,
-    dailyAggregationService: null,
-    meteoraVolumeFetcherService: null,
     ...overrides,
   };
 }

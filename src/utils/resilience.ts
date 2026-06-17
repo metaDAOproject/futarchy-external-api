@@ -1,6 +1,6 @@
 /**
  * Resilience utilities for handling external API calls.
- * Provides timeout and retry mechanisms for Dune, Solana RPC, and other external services.
+ * Provides timeout and retry mechanisms for Solana RPC and other external services.
  */
 
 import { logger } from './logger.js';
@@ -152,12 +152,12 @@ export async function retry<T>(
  * 
  * @example
  * const data = await withRetryAndTimeout(
- *   () => fetchDuneData(queryId),
+ *   () => fetchExternalData(),
  *   {
  *     timeoutMs: 30000,
  *     maxRetries: 2,
  *     isRetryable: isTransientError,
- *     onRetry: (attempt, err, delay) => console.log(`[Dune] Retry ${attempt}`),
+ *     onRetry: (attempt, err, delay) => console.log(`Retry ${attempt}`),
  *   }
  * );
  */
@@ -232,7 +232,7 @@ export function isTransientError(error: unknown): boolean {
 
 /**
  * Create a logger function for retry attempts.
- * @param prefix - Log prefix (e.g., '[Dune]', '[Solana]')
+ * @param prefix - Log prefix (e.g., '[ExternalDB]', '[Solana]')
  */
 export function createRetryLogger(prefix: string) {
   return (attempt: number, error: unknown, nextDelayMs: number): void => {

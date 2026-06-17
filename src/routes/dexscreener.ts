@@ -23,10 +23,22 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
   const { getFutarchyService, getExternalDatabaseService, getSolanaService, getLaunchpadService } =
     services;
 
-  // In-memory TTL caches for mostly-static endpoints
+  // In-memory TTL caches for mostly-static endpoints. Bounded: the keys are
+  // caller-supplied ids, so without a cap a scanner cycling through arbitrary
+  // valid pubkeys would grow these maps (and burn RPC per miss) without limit.
   const assetCache = new Map<string, { data: DexScreenerAssetResponse; expiresAt: number }>();
   const pairCache = new Map<string, { data: DexScreenerPairResponse; expiresAt: number }>();
   const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  const CACHE_MAX_ENTRIES = 1000;
+
+  function cachePut<T>(cache: Map<string, T>, key: string, value: T): void {
+    if (cache.size >= CACHE_MAX_ENTRIES) {
+      // Evict oldest insertion (Map preserves insertion order)
+      const oldest = cache.keys().next().value;
+      if (oldest !== undefined) cache.delete(oldest);
+    }
+    cache.set(key, value);
+  }
 
   // ---------------------------------------------------------------
   // GET /dexscreener/latest-block
@@ -38,8 +50,9 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
     }
 
     const result = await extDb.query(`
-      SELECT slot, unix_timestamp
-      FROM v0_6_spot_swaps
+      SELECT slot, extract(epoch FROM block_time)::bigint AS unix_timestamp
+      FROM futarchy.user_pool_swaps
+      WHERE source = 'futarchy_amm' AND market_kind = 'spot'
       ORDER BY slot DESC
       LIMIT 1
     `);
@@ -124,7 +137,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       },
     };
 
-    assetCache.set(id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
+    cachePut(assetCache, id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
     res.json(response);
   }));
 
@@ -147,48 +160,43 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       return res.status(503).json({ error: 'External database not available' });
     }
 
-    // Look up the pair (DAO) in the external DB
-    const daoResult = await extDb.query(
-      `SELECT dao_addr, base_mint_acct, quote_mint_acct
-       FROM v0_6_daos
-       WHERE dao_addr = $1`,
-      [id],
-    );
-
-    if (daoResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Pair not found' });
-    }
-
-    const dao = daoResult.rows[0];
-
-    // Get creation info (first swap for this pair)
-    const creationResult = await extDb.query(
-      `SELECT slot, unix_timestamp, signature
-       FROM v0_6_spot_swaps
-       WHERE dao_addr = $1
-       ORDER BY slot ASC, id ASC
+    // Pair identity + creation (first spot swap) from the unified ETL output. One
+    // query: the earliest futarchy spot swap for the DAO carries its base/quote
+    // mints AND the creation block/txn. A DAO with no spot swaps has no tradeable
+    // pair → 404 (same status the old v0_6_daos miss returned).
+    const pairResult = await extDb.query(
+      `SELECT dao_addr, base_mint, quote_mint,
+              slot, extract(epoch FROM block_time)::bigint AS unix_timestamp, signature
+       FROM futarchy.user_pool_swaps
+       WHERE source = 'futarchy_amm' AND market_kind = 'spot' AND dao_addr = $1
+       -- signature in the tie-break: separate txns in one slot can share (inner_group,
+       -- inner_ix) (those are within-txn coords), so order it too for a deterministic
+       -- "first swap" → stable createdAtTxnId.
+       ORDER BY slot ASC, signature ASC, inner_group ASC, inner_ix ASC
        LIMIT 1`,
       [id],
     );
+
+    if (pairResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Pair not found' });
+    }
+
+    const dao = pairResult.rows[0];
 
     const response: DexScreenerPairResponse = {
       pair: {
         id: dao.dao_addr,
         dexKey: DEX_KEY,
-        asset0Id: dao.base_mint_acct,
-        asset1Id: dao.quote_mint_acct,
+        asset0Id: dao.base_mint,
+        asset1Id: dao.quote_mint,
         feeBps: FEE_BPS,
+        createdAtBlockNumber: Number(dao.slot),
+        createdAtBlockTimestamp: Number(dao.unix_timestamp),
+        createdAtTxnId: dao.signature,
       },
     };
 
-    if (creationResult.rows.length > 0) {
-      const creation = creationResult.rows[0];
-      response.pair.createdAtBlockNumber = Number(creation.slot);
-      response.pair.createdAtBlockTimestamp = Number(creation.unix_timestamp);
-      response.pair.createdAtTxnId = creation.signature;
-    }
-
-    pairCache.set(id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
+    cachePut(pairCache, id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
     res.json(response);
   }));
 
@@ -217,26 +225,37 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       return res.status(503).json({ error: 'External database not available' });
     }
 
-    // Query swap events in the slot range (both inclusive)
-    // amm_base_amount / amm_quote_amount = post-swap pool reserves (nullable for older rows)
+    // Query swap events in the slot range (both inclusive) from the unified ETL
+    // output. Columns are aliased to the legacy v0_6 shape so the builder below is
+    // unchanged: side→swap_type, and input/output reconstructed from base/quote +
+    // side (Buy: USDC in / token out; Sell: token in / USDC out). amm_base/quote
+    // reserves are our decoded post-swap reserves — non-NULL for EVERY spot swap
+    // (validated dollar-exact vs the live feed), unlike the nullable raw column.
+    // Ordered by (slot, signature, inner_group, inner_ix): signature MUST be in the
+    // key because inner_group/inner_ix are within-transaction coordinates — two
+    // distinct txns in one slot can share the same (inner_group, inner_ix), so
+    // ordering without signature both is non-deterministic AND interleaves one txn's
+    // events with another's, which makes the txnIndex builder below assign the same
+    // signature two different txnIndex values. Grouping by signature keeps each txn's
+    // events contiguous → stable, consistent txnIndex/eventIndex.
     const result = await extDb.query(
       `SELECT
-         s.id,
-         s.signature,
-         s.slot,
-         s.unix_timestamp,
-         s.dao_addr,
-         s.user_addr,
-         s.swap_type,
-         s.input_amount,
-         s.output_amount,
-         s.amm_base_amount,
-         s.amm_quote_amount
-       FROM v0_6_spot_swaps s
-       WHERE s.slot >= $1 AND s.slot <= $2
-         AND s.input_amount > 0 AND s.output_amount > 0
-         AND LOWER(TRIM(s.swap_type)) IN ('buy', 'sell')
-       ORDER BY s.slot ASC, s.id ASC`,
+         u.id,
+         u.signature,
+         u.slot,
+         extract(epoch FROM u.block_time)::bigint                       AS unix_timestamp,
+         u.dao_addr,
+         u.user_addr,
+         u.side                                                         AS swap_type,
+         CASE WHEN u.side = 'buy' THEN u.quote_amount ELSE u.base_amount  END AS input_amount,
+         CASE WHEN u.side = 'buy' THEN u.base_amount  ELSE u.quote_amount END AS output_amount,
+         u.amm_base_reserves                                            AS amm_base_amount,
+         u.amm_quote_reserves                                           AS amm_quote_amount
+       FROM futarchy.user_pool_swaps u
+       WHERE u.source = 'futarchy_amm' AND u.market_kind = 'spot'
+         AND u.slot >= $1 AND u.slot <= $2
+         AND u.base_amount > 0 AND u.quote_amount > 0
+       ORDER BY u.slot ASC, u.signature ASC, u.inner_group ASC, u.inner_ix ASC`,
       [fromBlock, toBlock],
     );
 

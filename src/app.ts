@@ -24,6 +24,18 @@ export interface AppOptions {
 function createRateLimitMiddleware() {
   const buckets = new Map<string, { count: number; resetTime: number }>();
 
+  // Evict expired buckets so the map doesn't grow without bound across
+  // distinct client IPs/keys. unref() keeps the sweep from holding the
+  // process (or test runner) open.
+  const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+  const sweep = setInterval(() => {
+    const now = Date.now();
+    for (const [key, bucket] of buckets) {
+      if (now > bucket.resetTime) buckets.delete(key);
+    }
+  }, SWEEP_INTERVAL_MS);
+  sweep.unref?.();
+
   return (req: Request, res: Response, next: NextFunction): void => {
     const apiKey = req.header('x-api-key');
     let tier: { windowMs: number; maxRequests: number };
@@ -92,6 +104,14 @@ export function createApp(options: AppOptions): Application {
   const { services } = options;
   const serviceGetters = createServiceGetters(services);
 
+  // Resolve the real client IP from X-Forwarded-For when behind a reverse
+  // proxy. Without this, every anonymous client shares the proxy's IP — and
+  // therefore one collective rate-limit bucket. Uses an explicit hop count
+  // (never `true`) so clients can't spoof their IP via XFF.
+  if (config.server.trustProxyHops > 0) {
+    app.set('trust proxy', config.server.trustProxyHops);
+  }
+
   app.use(express.json());
 
   app.use(requestIdMiddleware);
@@ -102,8 +122,9 @@ export function createApp(options: AppOptions): Application {
     next();
   });
 
-  app.use(createRateLimitMiddleware());
+  // Metrics BEFORE the rate limiter so 429/401 responses are recorded too.
   app.use(createMetricsMiddleware());
+  app.use(createRateLimitMiddleware());
 
   // Mount all routes
   app.use(createRoutes(serviceGetters));

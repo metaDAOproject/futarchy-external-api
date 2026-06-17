@@ -239,15 +239,15 @@ export class FutarchyService {
     const cached = this.getCached<number>(cacheKey, config.cache.tickersTTL * 10); // Cache decimals longer
     if (cached !== null) return cached;
 
-    try {
-      const mintInfo = await this.retryWithBackoff(() => getMint(this.connection, mintAddress));
-      const decimals = mintInfo.decimals;
-      this.setCache(cacheKey, decimals);
-      return decimals;
-    } catch (error: any) {
-      // Default to 9 decimals if we can't fetch (common for Solana tokens)
-      return 9;
-    }
+    // No fallback default: a wrong decimals value silently scales price by
+    // 10^(±n) (e.g. assuming 9 for a 6-decimal token makes the served price 1000x
+    // wrong). On an RPC failure this MUST throw so the caller drops/fails rather
+    // than serving a mispriced ticker. Decimals are immutable, so the long cache
+    // above already shields the steady state from RPC blips.
+    const mintInfo = await this.retryWithBackoff(() => getMint(this.connection, mintAddress));
+    const decimals = mintInfo.decimals;
+    this.setCache(cacheKey, decimals);
+    return decimals;
   }
 
   private async findMetadataPDA(mintAddress: PublicKey): Promise<PublicKey> {
@@ -361,6 +361,18 @@ export class FutarchyService {
     const cached = this.getCached<DaoTickerData[]>(cacheKey, config.cache.tickersTTL);
     if (cached) return cached;
 
+    // Single-flight: concurrent callers after cache expiry share one scan instead
+    // of each launching a full DAO+RPC sweep (cache stampede against the RPC).
+    if (this.allDaosInFlight) return this.allDaosInFlight;
+    this.allDaosInFlight = this.fetchAllDaos(cacheKey).finally(() => {
+      this.allDaosInFlight = null;
+    });
+    return this.allDaosInFlight;
+  }
+
+  private allDaosInFlight: Promise<DaoTickerData[]> | null = null;
+
+  private async fetchAllDaos(cacheKey: string): Promise<DaoTickerData[]> {
     try {
       // Fetch all DAO accounts with retry logic
       let daoAccounts: any[];
@@ -378,7 +390,8 @@ export class FutarchyService {
       
       // Process DAOs sequentially with delays to avoid rate limiting
       const validDaoData: DaoTickerData[] = [];
-      
+      let perDaoErrors = 0;
+
       for (let i = 0; i < daoAccounts.length; i++) {
         const daoAccount = daoAccounts[i];
         if (!daoAccount) continue;
@@ -459,6 +472,10 @@ export class FutarchyService {
             treasuryVaultAddress,
           });
         } catch (error: any) {
+          // A per-DAO fetch failed (RPC/decimals/pool/metadata). Skip THIS dao so
+          // one flaky account doesn't take down the whole feed — but count it, so
+          // we can refuse to serve a silently-shrunken list below (see guard).
+          perDaoErrors++;
           const isRateLimited = this.isRateLimitError(error);
           if (isRateLimited) {
             // Wait longer if rate limited
@@ -467,11 +484,22 @@ export class FutarchyService {
           // Continue processing other DAOs
         }
       }
-      
+
       if (this.rateLimitErrors > 0) {
         logger.warn(`⚠️  Encountered ${this.rateLimitErrors} rate limit errors during processing`);
       }
-      
+
+      // Don't serve an empty (or all-failed) ticker set as if it were real: if we
+      // had DAOs to process and produced ZERO results while errors occurred, that's
+      // an infrastructure problem (RPC degraded), not a genuinely empty market.
+      // Throw so /api/tickers returns an error the poller retries — never an empty
+      // 200 that reads as "everything delisted / zero volume".
+      if (validDaoData.length === 0 && daoAccounts.length > 0 && perDaoErrors > 0) {
+        throw new Error(
+          `getAllDaos produced 0 tickers from ${daoAccounts.length} DAOs with ${perDaoErrors} fetch errors — refusing to serve an empty set`,
+        );
+      }
+
       this.setCache(cacheKey, validDaoData);
       return validDaoData;
     } catch (error) {
@@ -480,12 +508,4 @@ export class FutarchyService {
     }
   }
 
-  async getTotalLiquidity(daoAddress?: PublicKey): Promise<BN> {
-    const daoPubkey = daoAddress;
-    if (!daoPubkey) {
-      throw new Error('DAO address is required. Provide daoAddress parameter or set DAO_PUBLIC_KEY environment variable.');
-    }
-    const dao = await this.client.getDao(daoPubkey);
-    return new BN(dao.amm.totalLiquidity);
-  }
 }

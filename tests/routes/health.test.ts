@@ -1,90 +1,94 @@
 import { describe, it, expect } from 'bun:test';
 import request from 'supertest';
-import { createTestApp } from '../helpers/testApp.js';
+import { createTestApp, createMockExternalDatabaseService } from '../helpers/testApp.js';
+import type { ExternalDatabaseService } from '../../src/services/externalDatabaseService.js';
 
 const app = createTestApp();
 
 describe('Health Routes', () => {
-  describe('GET /health', () => {
+  describe('GET /health (liveness)', () => {
     it('should return 200 with healthy status', async () => {
       const response = await request(app).get('/health');
-      
+
       expect(response.status).toBe(200);
       expect(response.body.status).toBe('healthy');
     });
 
     it('should include timestamp', async () => {
       const response = await request(app).get('/health');
-      
+
       expect(response.body.timestamp).toBeDefined();
       expect(new Date(response.body.timestamp).getTime()).not.toBeNaN();
     });
 
     it('should include uptime', async () => {
       const response = await request(app).get('/health');
-      
+
       expect(response.body.uptime).toBeDefined();
       expect(typeof response.body.uptime).toBe('number');
       expect(response.body.uptime).toBeGreaterThanOrEqual(0);
     });
-
-    it('should include duneCache info when available', async () => {
-      const response = await request(app).get('/health');
-      
-      // duneCache may be null if not configured
-      expect(response.body).toHaveProperty('duneCache');
-    });
   });
 
-  describe('GET /api/health', () => {
-    it('should return 200 with comprehensive health status', async () => {
+  describe('GET /api/health (readiness)', () => {
+    it('reports healthy with served DB connected, contract ok, and freshness', async () => {
       const response = await request(app).get('/api/health');
-      
+
       expect(response.status).toBe(200);
-      expect(response.body).toHaveProperty('status');
-      expect(response.body).toHaveProperty('timestamp');
-      expect(response.body).toHaveProperty('services');
-      expect(response.body).toHaveProperty('database');
+      expect(response.body.status).toBe('healthy');
+      expect(response.body.servedDatabase.connected).toBe(true);
+      expect(response.body.servedDatabase.servedDataContract.ok).toBe(true);
+      expect(response.body.servedDatabase.freshness.ageSeconds).toBe(30);
+      expect(response.body.servedDatabase.freshness.latestSwapAt).toBeDefined();
     });
 
-    it('should report database connection status', async () => {
-      const response = await request(app).get('/api/health');
-      
-      expect(response.body.database).toHaveProperty('connected');
-      expect(typeof response.body.database.connected).toBe('boolean');
+    it('reports degraded when the served DB is not connected', async () => {
+      const extDb = {
+        ...createMockExternalDatabaseService(),
+        isAvailable: () => false,
+      } as unknown as ExternalDatabaseService;
+      const degradedApp = createTestApp({ externalDatabaseService: extDb });
+
+      const response = await request(degradedApp).get('/api/health');
+
+      expect(response.status).toBe(200);
+      expect(response.body.status).toBe('degraded');
+      expect(response.body.servedDatabase.connected).toBe(false);
+      expect(response.body.servedDatabase.servedDataContract.missing).toContain('connection');
+      expect(response.body.message).toContain('not connected');
     });
 
-    it('should return services object', async () => {
-      const response = await request(app).get('/api/health');
-      
-      expect(typeof response.body.services).toBe('object');
-    });
-  });
+    it('reports degraded when the served data contract check fails', async () => {
+      const extDb = {
+        ...createMockExternalDatabaseService(),
+        checkServedDataContract: async () => ({
+          ok: false,
+          checkedAt: new Date().toISOString(),
+          missing: ['futarchy.user_pool_swaps.inner_group'],
+        }),
+      } as unknown as ExternalDatabaseService;
+      const degradedApp = createTestApp({ externalDatabaseService: extDb });
 
-  describe('GET /api/health/history', () => {
-    it('should return history or error', async () => {
-      const response = await request(app).get('/api/health/history');
-      
-      // 200 if database connected, 503 if not
-      expect([200, 503]).toContain(response.status);
-    });
+      const response = await request(degradedApp).get('/api/health');
 
-    it('should accept hours parameter', async () => {
-      const response = await request(app).get('/api/health/history?hours=12');
-      
-      expect([200, 503]).toContain(response.status);
-      if (response.status === 200) {
-        expect(response.body.hours).toBe(12);
-      }
+      expect(response.body.status).toBe('degraded');
+      expect(response.body.message).toContain('contract');
     });
 
-    it('should accept service parameter', async () => {
-      const response = await request(app).get('/api/health/history?service=dune_cache');
-      
-      expect([200, 503]).toContain(response.status);
-      if (response.status === 200) {
-        expect(response.body.service).toBe('dune_cache');
-      }
+    it('reports degraded when the freshness query fails (never masks a failure)', async () => {
+      const extDb = {
+        ...createMockExternalDatabaseService(),
+        getServedDataFreshness: async () => {
+          throw new Error('query failed');
+        },
+      } as unknown as ExternalDatabaseService;
+      const degradedApp = createTestApp({ externalDatabaseService: extDb });
+
+      const response = await request(degradedApp).get('/api/health');
+
+      expect(response.body.status).toBe('degraded');
+      expect(response.body.servedDatabase.freshness).toBeNull();
+      expect(response.body.message).toContain('freshness');
     });
   });
 });

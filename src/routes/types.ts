@@ -1,16 +1,8 @@
 import type { FutarchyService } from '../services/futarchyService.js';
 import type { PriceService } from '../services/priceService.js';
-import type { DuneService } from '../services/duneService.js';
-import type { DuneCacheService } from '../services/duneCacheService.js';
 import type { SolanaService } from '../services/solanaService.js';
 import type { LaunchpadService } from '../services/launchpadService.js';
-import type { DatabaseService } from '../services/databaseService.js';
-import type { HourlyAggregationService } from '../services/hourlyAggregationService.js';
-import type { TenMinuteVolumeFetcherService } from '../services/tenMinuteVolumeFetcherService.js';
-import type { DailyAggregationService } from '../services/dailyAggregationService.js';
-import type { MeteoraVolumeFetcherService } from '../services/meteoraVolumeFetcherService.js';
 import type { ExternalDatabaseService } from '../services/externalDatabaseService.js';
-import type { V06ReconciliationService } from '../services/v06ReconciliationService.js';
 import { AppError } from '../middleware/errorHandler.js';
 
 /**
@@ -24,16 +16,8 @@ import { AppError } from '../middleware/errorHandler.js';
 export interface Services {
   futarchyService: FutarchyService;
   priceService: PriceService;
-  databaseService: DatabaseService;
 
   externalDatabaseService: ExternalDatabaseService | null;
-  duneService: DuneService | null;
-  duneCacheService: DuneCacheService | null;
-  hourlyAggregationService: HourlyAggregationService | null;
-  tenMinuteVolumeFetcherService: TenMinuteVolumeFetcherService | null;
-  dailyAggregationService: DailyAggregationService | null;
-  meteoraVolumeFetcherService: MeteoraVolumeFetcherService | null;
-  v06ReconciliationService: V06ReconciliationService | null;
 
   solanaService?: SolanaService;
   launchpadService?: LaunchpadService;
@@ -47,15 +31,8 @@ export interface Services {
 export interface ServiceGetters {
   getFutarchyService: () => FutarchyService;
   getPriceService: () => PriceService;
-  getDuneService: () => DuneService | null;
-  getDuneCacheService: () => DuneCacheService | null;
   getSolanaService: () => SolanaService;
   getLaunchpadService: () => LaunchpadService;
-  getDatabaseService: () => DatabaseService;
-  getHourlyAggregationService: () => HourlyAggregationService | null;
-  getTenMinuteVolumeFetcherService: () => TenMinuteVolumeFetcherService | null;
-  getDailyAggregationService: () => DailyAggregationService | null;
-  getMeteoraVolumeFetcherService: () => MeteoraVolumeFetcherService | null;
   getExternalDatabaseService: () => ExternalDatabaseService | null;
 }
 
@@ -72,14 +49,7 @@ export function createServiceGetters(services: Services): ServiceGetters {
   return {
     getFutarchyService: () => services.futarchyService,
     getPriceService: () => services.priceService,
-    getDatabaseService: () => services.databaseService,
 
-    getDuneService: () => optionalService(services.duneService),
-    getDuneCacheService: () => optionalService(services.duneCacheService),
-    getHourlyAggregationService: () => optionalService(services.hourlyAggregationService),
-    getTenMinuteVolumeFetcherService: () => optionalService(services.tenMinuteVolumeFetcherService),
-    getDailyAggregationService: () => optionalService(services.dailyAggregationService),
-    getMeteoraVolumeFetcherService: () => optionalService(services.meteoraVolumeFetcherService),
     getExternalDatabaseService: () => optionalService(services.externalDatabaseService),
 
     getSolanaService: () => requireService(services.solanaService, 'Solana'),

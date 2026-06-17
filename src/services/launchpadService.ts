@@ -1,5 +1,5 @@
 import { Connection, PublicKey, Keypair } from '@solana/web3.js';
-import { AnchorProvider, Wallet, Program } from '@coral-xyz/anchor';
+import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
 import {
   LaunchpadClient as LaunchpadClientV06,
   getLaunchSignerAddr,
@@ -16,6 +16,7 @@ import {
   LAUNCHPAD_V0_7_MAINNET_METEORA_CONFIG as MAINNET_METEORA_CONFIG_V07,
 } from "@metadaoproject/programs";
 import { getAccount, getAssociatedTokenAddress } from '@solana/spl-token';
+import { isTokenAccountAbsent } from '../utils/solanaErrors.js';
 import { config } from '../config.js';
 import BN from 'bn.js';
 import { logger } from '../utils/logger.js';
@@ -84,26 +85,12 @@ export interface LaunchData {
   additionalTokensClaimed?: boolean;
 }
 
-export type LaunchState = 
+export type LaunchState =
   | { initialized: Record<string, never> }
   | { active: Record<string, never> }
   | { closed: Record<string, never> }
   | { completed: Record<string, never> }
   | { cancelled: Record<string, never> };
-
-export interface PerformancePackageData {
-  performancePackageAddress: PublicKey;
-  totalTokenAmount: BN;
-  alreadyUnlockedAmount: BN;
-  recipient: PublicKey;
-  tokenMint: PublicKey;
-  state: PerformancePackageState;
-}
-
-export type PerformancePackageState = 
-  | { locked: Record<string, never> }
-  | { unlocking: { startAggregator: BN; startTimestamp: BN } }
-  | { unlocked: Record<string, never> };
 
 export class LaunchpadService {
   private connection: Connection;
@@ -132,18 +119,6 @@ export class LaunchpadService {
     this.clientV07 = LaunchpadClientV07.createClient({ provider });
     this.futarchyClient = FutarchyClient.createClient({ provider });
     this.cache = new Map();
-  }
-
-  /**
-   * Detect the launchpad version for a launch based on account fields.
-   * v0.7 launches have additionalTokensAmount field.
-   */
-  private detectLaunchVersion(launch: any): LaunchpadVersion {
-    // v0.7 has additionalTokensAmount and additionalTokensRecipient fields
-    if ('additionalTokensAmount' in launch || 'additionalTokensRecipient' in launch) {
-      return 'v0.7';
-    }
-    return 'v0.6';
   }
 
   private getCached<T>(key: string, ttl: number): T | null {
@@ -188,57 +163,19 @@ export class LaunchpadService {
         return { launch, version };
       }
     } catch (error: any) {
+      // ONLY a genuinely-absent account means "no launch of this version" → null
+      // (the caller then tries the other version, and a token with no launch at all
+      // correctly gets an empty allocation breakdown). ANY OTHER error (RPC /
+      // network / timeout) MUST propagate: a silent null here makes
+      // getTokenAllocationBreakdown treat a launched token as un-launched → ZERO
+      // locked allocations → circulating supply = total supply (hugely overstated
+      // market cap on a transient RPC blip).
       if (!error.message?.includes('Account does not exist')) {
         logger.info(`[Launchpad] Error fetching ${version} launch at ${launchAddress.toString()}: ${error.message}`);
+        throw error;
       }
     }
     return null;
-  }
-
-  /**
-   * Fetch a Launch account by its address
-   * Tries v0.7 first, falls back to v0.6 for older launches
-   */
-  async getLaunch(launchAddress: PublicKey): Promise<LaunchData | null> {
-    const cacheKey = `launch_${launchAddress.toString()}`;
-    const cached = this.getCached<LaunchData>(cacheKey, config.cache.tickersTTL * 10);
-    if (cached) return cached;
-
-    try {
-      // Try v0.7 first, then v0.6
-      let result = await this.fetchLaunchFromProgram(launchAddress, 'v0.7');
-      if (!result) {
-        result = await this.fetchLaunchFromProgram(launchAddress, 'v0.6');
-      }
-      
-      if (!result) {
-        return null;
-      }
-
-      const { launch, version } = result;
-
-      const launchData: LaunchData = {
-        launchAddress,
-        baseMint: launch.baseMint,
-        performancePackageGrantee: launch.performancePackageGrantee,
-        performancePackageTokenAmount: new BN(launch.performancePackageTokenAmount.toString()),
-        state: launch.state as LaunchState,
-        dao: launch.dao || undefined,
-        version,
-        // v0.7 specific fields
-        additionalTokensAmount: launch.additionalTokensAmount 
-          ? new BN(launch.additionalTokensAmount.toString()) 
-          : undefined,
-        additionalTokensRecipient: launch.additionalTokensRecipient || undefined,
-        additionalTokensClaimed: launch.additionalTokensClaimed || undefined,
-      };
-
-      this.setCache(cacheKey, launchData);
-      return launchData;
-    } catch (error) {
-      logger.error(`Error fetching launch ${launchAddress.toString()}`, error);
-      return null;
-    }
   }
 
   /**
@@ -290,108 +227,6 @@ export class LaunchpadService {
 
     this.setCache(cacheKey, launchData);
     return launchData;
-  }
-
-  /**
-   * Fetch all Launch accounts from both v0.6 and v0.7 programs
-   */
-  async getAllLaunches(): Promise<LaunchData[]> {
-    const cacheKey = 'all_launches';
-    const cached = this.getCached<LaunchData[]>(cacheKey, config.cache.tickersTTL);
-    if (cached) return cached;
-
-    try {
-      const launches: LaunchData[] = [];
-      const seenAddresses = new Set<string>();
-
-      // Fetch from v0.7 program first (includes all fields)
-      try {
-        const v07Accounts = await this.clientV07.launchpad.account.launch.all();
-        for (const account of v07Accounts) {
-          const launch = account.account;
-          const version = this.detectLaunchVersion(launch);
-          seenAddresses.add(account.publicKey.toString());
-          launches.push({
-            launchAddress: account.publicKey,
-            baseMint: launch.baseMint,
-            performancePackageGrantee: launch.performancePackageGrantee,
-            performancePackageTokenAmount: new BN(launch.performancePackageTokenAmount.toString()),
-            state: launch.state as LaunchState,
-            dao: launch.dao || undefined,
-            version,
-            additionalTokensAmount: (launch as any).additionalTokensAmount 
-              ? new BN((launch as any).additionalTokensAmount.toString()) 
-              : undefined,
-            additionalTokensRecipient: (launch as any).additionalTokensRecipient || undefined,
-            additionalTokensClaimed: (launch as any).additionalTokensClaimed || undefined,
-          });
-        }
-      } catch (error) {
-        logger.warn('[Launchpad] Error fetching v0.7 launches', { error: error instanceof Error ? error.message : String(error) });
-      }
-
-      // Fetch from v0.6 program (older launches)
-      try {
-        const v06Accounts = await this.clientV06.launchpad.account.launch.all();
-        for (const account of v06Accounts) {
-          // Skip if already seen from v0.7
-          if (seenAddresses.has(account.publicKey.toString())) {
-            continue;
-          }
-          const launch = account.account;
-          launches.push({
-            launchAddress: account.publicKey,
-            baseMint: launch.baseMint,
-            performancePackageGrantee: launch.performancePackageGrantee,
-            performancePackageTokenAmount: new BN(launch.performancePackageTokenAmount.toString()),
-            state: launch.state as LaunchState,
-            dao: launch.dao || undefined,
-            version: 'v0.6',
-          });
-        }
-      } catch (error) {
-        logger.warn('[Launchpad] Error fetching v0.6 launches', { error: error instanceof Error ? error.message : String(error) });
-      }
-
-      this.setCache(cacheKey, launches);
-      return launches;
-    } catch (error) {
-      logger.error('[Launchpad] Error fetching all launches', error);
-      return [];
-    }
-  }
-
-  /**
-   * Fetch a PerformancePackage account by its address
-   */
-  async getPerformancePackage(performancePackageAddress: PublicKey): Promise<PerformancePackageData | null> {
-    const cacheKey = `performance_package_${performancePackageAddress.toString()}`;
-    const cached = this.getCached<PerformancePackageData>(cacheKey, config.cache.tickersTTL * 10);
-    if (cached) return cached;
-
-    try {
-      // Try v0.7 first, then v0.6
-      const pkgV07 = await this.clientV07.priceBasedUnlock.getPerformancePackage(performancePackageAddress);
-      const pkg = pkgV07 ?? await this.clientV06.priceBasedUnlock.getPerformancePackage(performancePackageAddress);
-      if (!pkg) {
-        return null;
-      }
-
-      const packageData: PerformancePackageData = {
-        performancePackageAddress,
-        totalTokenAmount: pkg.totalTokenAmount,
-        alreadyUnlockedAmount: pkg.alreadyUnlockedAmount,
-        recipient: pkg.recipient,
-        tokenMint: pkg.tokenMint,
-        state: pkg.state as PerformancePackageState,
-      };
-
-      this.setCache(cacheKey, packageData);
-      return packageData;
-    } catch (error) {
-      logger.error(`[Launchpad] Error fetching performance package ${performancePackageAddress.toString()}`, error);
-      return null;
-    }
   }
 
   /**
@@ -507,7 +342,10 @@ export class LaunchpadService {
 
       return { amount, vaultAddress };
     } catch (error) {
-      logger.error(`[Launchpad] Error fetching FutarchyAMM liquidity for DAO ${daoAddress.toString()}`, error);
+      // Only treat a genuinely-absent vault as 0 liquidity. An RPC failure here
+      // would UNDERCOUNT locked AMM liquidity → OVERSTATE circulating supply →
+      // wrong market cap, so it must propagate (the supply endpoint errors out).
+      if (!isTokenAccountAbsent(error)) throw error;
       return { amount: new BN(0) };
     }
   }
@@ -545,9 +383,10 @@ export class LaunchpadService {
       logger.info(`[Meteora] Found ${amount.toString()} tokens in Meteora ${version} pool`);
       return { amount, poolAddress, vaultAddress };
     } catch (error: any) {
-      logger.info(`[Meteora] ${version} pool lookup failed for ${baseMint.toString()}: ${error.message || 'Unknown error'}`);
-      
-      // If we tried v0.7 and failed, don't try v0.6 as fallback - the version is determined by the launch
+      // Genuinely-absent pool vault → 0 LP is correct. An RPC failure must NOT be
+      // read as 0 (it would overstate circulating supply / market cap) → propagate.
+      if (!isTokenAccountAbsent(error)) throw error;
+      logger.info(`[Meteora] ${version} pool not present for ${baseMint.toString()} — 0 LP`);
       return { amount: new BN(0) };
     }
   }
@@ -576,242 +415,146 @@ export class LaunchpadService {
       totalNonCirculating: new BN(0),
     };
 
-    try {
-      const launch = await this.getLaunchByBaseMint(baseMint);
-      if (!launch) {
-        // Token was not launched via launchpad
-        return emptyBreakdown;
-      }
-
-      if (!launch.dao) {
-        // Launch not yet completed
-        return {
-          ...emptyBreakdown,
-          version: launch.version,
-          launchAddress: launch.launchAddress,
-        };
-      }
-
-      // Get DAO to find quote mint
-      const dao = await this.futarchyClient.fetchDao(launch.dao);
-      const quoteMint = dao?.quoteMint;
-
-      // Derive the performance package address and fetch its actual on-chain token balance
-      // We use the live balance rather than launch.performancePackageTokenAmount because
-      // tokens may have been unlocked/claimed (e.g. ZKFG, Loyal), making the configured
-      // amount stale and over-subtracting from circulating supply.
-      const performancePackageAddress = this.getPerformancePackageAddress(
-        launch.launchAddress, 
-        launch.version
-      );
-
-      let performancePackageLockedAmount = new BN(0);
-      try {
-        const ppAta = await getAssociatedTokenAddress(
-          baseMint,
-          performancePackageAddress,
-          true
-        );
-        const ppTokenAccount = await getAccount(this.connection, ppAta);
-        performancePackageLockedAmount = new BN(ppTokenAccount.amount.toString());
-        logger.info(`[Launchpad] Performance package at ${performancePackageAddress.toString()} holds ${performancePackageLockedAmount.toString()} tokens (configured: ${launch.performancePackageTokenAmount.toString()})`);
-      } catch (error: any) {
-        // Token account doesn't exist or is empty — all tokens unlocked/claimed
-        logger.info(`[Launchpad] Performance package token account not found for ${performancePackageAddress.toString()}, assuming 0 locked: ${error.message}`);
-      }
-
-      // Get FutarchyAMM liquidity
-      const futarchyAmm = await this.getFutarchyAmmLiquidity(launch.dao);
-
-      // Get Meteora LP liquidity (if quote mint is available)
-      // Use the correct Meteora config based on launch version
-      let meteoraLp: { amount: BN; poolAddress?: PublicKey; vaultAddress?: PublicKey } = { amount: new BN(0) };
-      if (quoteMint) {
-        meteoraLp = await this.getMeteoraLpLiquidity(baseMint, quoteMint, launch.version);
-      }
-
-      // Handle additional token allocation (v0.7+ only)
-      let additionalTokenAllocation: AdditionalTokenAllocation | undefined;
-      if (launch.version === 'v0.7' && launch.additionalTokensRecipient && launch.additionalTokensAmount) {
-        // Get the token account address for the additional tokens recipient
-        let tokenAccountAddress: PublicKey | undefined;
-        try {
-          tokenAccountAddress = await getAssociatedTokenAddress(
-            baseMint,
-            launch.additionalTokensRecipient
-          );
-        } catch (error) {
-          logger.warn(`[Launchpad] Could not derive additional tokens account for ${launch.additionalTokensRecipient.toString()}`);
-        }
-
-        additionalTokenAllocation = {
-          recipient: launch.additionalTokensRecipient,
-          amount: launch.additionalTokensAmount,
-          claimed: launch.additionalTokensClaimed || false,
-          tokenAccountAddress,
-        };
-      }
-
-      // Get DAO treasury base token balance (tokens held by the squads vault)
-      let daoTreasuryTokens: { amount: BN; vaultAddress?: PublicKey } = { amount: new BN(0) };
-      if (dao && (dao as any).squadsMultisigVault) {
-        try {
-          const vaultAddress = new PublicKey((dao as any).squadsMultisigVault);
-          const vaultAta = await getAssociatedTokenAddress(baseMint, vaultAddress, true);
-          const tokenAccount = await getAccount(this.connection, vaultAta);
-          daoTreasuryTokens = {
-            amount: new BN(tokenAccount.amount.toString()),
-            vaultAddress,
-          };
-          logger.info(`[Launchpad] DAO treasury holds ${daoTreasuryTokens.amount.toString()} base tokens in vault ${vaultAddress.toString()}`);
-        } catch (error: any) {
-          logger.info(`[Launchpad] No base token account in DAO treasury vault: ${error.message}`);
-        }
-      }
-
-      // Calculate total non-circulating supply using live on-chain balance
-      let totalNonCirculating = performancePackageLockedAmount;
-      
-      // Add additional tokens if not yet claimed (they're still locked)
-      if (additionalTokenAllocation && !additionalTokenAllocation.claimed) {
-        totalNonCirculating = totalNonCirculating.add(additionalTokenAllocation.amount);
-      }
-
-      // Add DAO treasury tokens (protocol-controlled, not circulating)
-      totalNonCirculating = totalNonCirculating.add(daoTreasuryTokens.amount);
-
-      const breakdown: TokenAllocationBreakdown = {
-        version: launch.version,
-        teamPerformancePackage: {
-          amount: performancePackageLockedAmount,
-          address: performancePackageAddress,
-        },
-        futarchyAmmLiquidity: {
-          amount: futarchyAmm.amount,
-          vaultAddress: futarchyAmm.vaultAddress,
-        },
-        meteoraLpLiquidity: {
-          amount: meteoraLp.amount,
-          poolAddress: meteoraLp.poolAddress,
-          vaultAddress: meteoraLp.vaultAddress,
-        },
-        additionalTokenAllocation,
-        daoTreasuryTokens,
-        daoAddress: launch.dao,
-        launchAddress: launch.launchAddress,
-        totalNonCirculating,
-      };
-
-      this.setCache(cacheKey, breakdown);
-      return breakdown;
-    } catch (error) {
-      logger.error(`Error getting token allocation breakdown for ${baseMint.toString()}`, error);
+    // No catch-all below: an empty breakdown is returned ONLY for the two
+    // genuinely-empty cases (token never launched / launch not completed).
+    // Every infrastructure failure (RPC, network, timeout) propagates to the
+    // caller — swallowing it here would zero out every locked allocation and
+    // serve circulating supply = total supply on a transient outage, which is
+    // the exact mispricing the isTokenAccountAbsent contract exists to prevent.
+    const launch = await this.getLaunchByBaseMint(baseMint);
+    if (!launch) {
+      // Token was not launched via launchpad
       return emptyBreakdown;
     }
-  }
 
+    if (!launch.dao) {
+      // Launch not yet completed
+      return {
+        ...emptyBreakdown,
+        version: launch.version,
+        launchAddress: launch.launchAddress,
+      };
+    }
 
-  /**
-   * Build a map of baseMint -> lockedAmount for all launched tokens
-   * Includes performance package + unclaimed additional tokens
-   * More efficient when you need to check multiple tokens
-   */
-  async buildLockedAmountsMap(): Promise<Map<string, BN>> {
-    const cacheKey = 'locked_amounts_map';
-    const cached = this.getCached<Map<string, BN>>(cacheKey, config.cache.tickersTTL);
-    if (cached) return cached;
+    // Get DAO to find quote mint
+    const dao = await this.futarchyClient.fetchDao(launch.dao);
+    const quoteMint = dao?.quoteMint;
 
-    const lockedAmountsMap = new Map<string, BN>();
-    
+    // Derive the performance package address and fetch its actual on-chain token balance
+    // We use the live balance rather than launch.performancePackageTokenAmount because
+    // tokens may have been unlocked/claimed (e.g. ZKFG, Loyal), making the configured
+    // amount stale and over-subtracting from circulating supply.
+    const performancePackageAddress = this.getPerformancePackageAddress(
+      launch.launchAddress, 
+      launch.version
+    );
+
+    let performancePackageLockedAmount = new BN(0);
     try {
-      const allLaunches = await this.getAllLaunches();
-      
-      for (const launch of allLaunches) {
-        // Only include completed launches (those with a DAO set)
-        if (launch.dao) {
-          let totalLocked = launch.performancePackageTokenAmount;
-          
-          // Add unclaimed additional tokens (v0.7+ only)
-          if (launch.version === 'v0.7' && 
-              launch.additionalTokensAmount && 
-              !launch.additionalTokensClaimed) {
-            totalLocked = totalLocked.add(launch.additionalTokensAmount);
-          }
-          
-          lockedAmountsMap.set(
-            launch.baseMint.toString(),
-            totalLocked
-          );
-        }
+      const ppAta = await getAssociatedTokenAddress(
+        baseMint,
+        performancePackageAddress,
+        true
+      );
+      const ppTokenAccount = await getAccount(this.connection, ppAta);
+      performancePackageLockedAmount = new BN(ppTokenAccount.amount.toString());
+      logger.info(`[Launchpad] Performance package at ${performancePackageAddress.toString()} holds ${performancePackageLockedAmount.toString()} tokens (configured: ${launch.performancePackageTokenAmount.toString()})`);
+    } catch (error: any) {
+      // Account genuinely absent → all tokens unlocked/claimed → 0 locked (correct).
+      // An RPC failure must propagate: treating it as 0 locked would OVERSTATE
+      // circulating supply (the live-balance approach exists precisely to avoid
+      // mis-subtracting — so a silent 0 on outage is the exact failure to avoid).
+      if (!isTokenAccountAbsent(error)) throw error;
+      logger.info(`[Launchpad] Performance package token account not found for ${performancePackageAddress.toString()}, 0 locked`);
+    }
+
+    // Get FutarchyAMM liquidity
+    const futarchyAmm = await this.getFutarchyAmmLiquidity(launch.dao);
+
+    // Get Meteora LP liquidity (if quote mint is available)
+    // Use the correct Meteora config based on launch version
+    let meteoraLp: { amount: BN; poolAddress?: PublicKey; vaultAddress?: PublicKey } = { amount: new BN(0) };
+    if (quoteMint) {
+      meteoraLp = await this.getMeteoraLpLiquidity(baseMint, quoteMint, launch.version);
+    }
+
+    // Handle additional token allocation (v0.7+ only)
+    let additionalTokenAllocation: AdditionalTokenAllocation | undefined;
+    if (launch.version === 'v0.7' && launch.additionalTokensRecipient && launch.additionalTokensAmount) {
+      // Get the token account address for the additional tokens recipient
+      let tokenAccountAddress: PublicKey | undefined;
+      try {
+        tokenAccountAddress = await getAssociatedTokenAddress(
+          baseMint,
+          launch.additionalTokensRecipient
+        );
+      } catch (error) {
+        logger.warn(`[Launchpad] Could not derive additional tokens account for ${launch.additionalTokensRecipient.toString()}`);
       }
 
-      this.setCache(cacheKey, lockedAmountsMap);
-      return lockedAmountsMap;
-    } catch (error) {
-      logger.error('Error building locked amounts map', error);
-      return lockedAmountsMap;
+      additionalTokenAllocation = {
+        recipient: launch.additionalTokensRecipient,
+        amount: launch.additionalTokensAmount,
+        claimed: launch.additionalTokensClaimed || false,
+        tokenAccountAddress,
+      };
     }
-  }
 
-  /**
-   * Get detailed locked amounts breakdown including additional token allocations
-   */
-  async buildLockedAmountsDetailedMap(): Promise<Map<string, {
-    performancePackage: BN;
-    additionalTokens?: {
-      amount: BN;
-      recipient: PublicKey;
-      claimed: boolean;
+    // Get DAO treasury base token balance (tokens held by the squads vault)
+    let daoTreasuryTokens: { amount: BN; vaultAddress?: PublicKey } = { amount: new BN(0) };
+    if (dao && (dao as any).squadsMultisigVault) {
+      try {
+        const vaultAddress = new PublicKey((dao as any).squadsMultisigVault);
+        const vaultAta = await getAssociatedTokenAddress(baseMint, vaultAddress, true);
+        const tokenAccount = await getAccount(this.connection, vaultAta);
+        daoTreasuryTokens = {
+          amount: new BN(tokenAccount.amount.toString()),
+          vaultAddress,
+        };
+        logger.info(`[Launchpad] DAO treasury holds ${daoTreasuryTokens.amount.toString()} base tokens in vault ${vaultAddress.toString()}`);
+      } catch (error: any) {
+        // Genuinely-absent treasury ATA → 0 treasury tokens (correct). An RPC
+        // failure must propagate (a silent 0 here overstates circulating supply).
+        if (!isTokenAccountAbsent(error)) throw error;
+        logger.info(`[Launchpad] No base token account in DAO treasury vault`);
+      }
+    }
+
+    // Calculate total non-circulating supply using live on-chain balance
+    let totalNonCirculating = performancePackageLockedAmount;
+    
+    // Add additional tokens if not yet claimed (they're still locked)
+    if (additionalTokenAllocation && !additionalTokenAllocation.claimed) {
+      totalNonCirculating = totalNonCirculating.add(additionalTokenAllocation.amount);
+    }
+
+    // Add DAO treasury tokens (protocol-controlled, not circulating)
+    totalNonCirculating = totalNonCirculating.add(daoTreasuryTokens.amount);
+
+    const breakdown: TokenAllocationBreakdown = {
+      version: launch.version,
+      teamPerformancePackage: {
+        amount: performancePackageLockedAmount,
+        address: performancePackageAddress,
+      },
+      futarchyAmmLiquidity: {
+        amount: futarchyAmm.amount,
+        vaultAddress: futarchyAmm.vaultAddress,
+      },
+      meteoraLpLiquidity: {
+        amount: meteoraLp.amount,
+        poolAddress: meteoraLp.poolAddress,
+        vaultAddress: meteoraLp.vaultAddress,
+      },
+      additionalTokenAllocation,
+      daoTreasuryTokens,
+      daoAddress: launch.dao,
+      launchAddress: launch.launchAddress,
+      totalNonCirculating,
     };
-    totalLocked: BN;
-    version: LaunchpadVersion;
-  }>> {
-    const cacheKey = 'locked_amounts_detailed_map';
-    const cached = this.getCached<Map<string, any>>(cacheKey, config.cache.tickersTTL);
-    if (cached) return cached;
 
-    const detailedMap = new Map<string, any>();
-    
-    try {
-      const allLaunches = await this.getAllLaunches();
-      
-      for (const launch of allLaunches) {
-        // Only include completed launches (those with a DAO set)
-        if (launch.dao) {
-          let totalLocked = launch.performancePackageTokenAmount;
-          
-          const entry: any = {
-            performancePackage: launch.performancePackageTokenAmount,
-            version: launch.version,
-          };
-          
-          // Add additional tokens info (v0.7+ only)
-          if (launch.version === 'v0.7' && 
-              launch.additionalTokensAmount && 
-              launch.additionalTokensRecipient) {
-            entry.additionalTokens = {
-              amount: launch.additionalTokensAmount,
-              recipient: launch.additionalTokensRecipient,
-              claimed: launch.additionalTokensClaimed || false,
-            };
-            
-            // Only add to locked total if not claimed
-            if (!launch.additionalTokensClaimed) {
-              totalLocked = totalLocked.add(launch.additionalTokensAmount);
-            }
-          }
-          
-          entry.totalLocked = totalLocked;
-          detailedMap.set(launch.baseMint.toString(), entry);
-        }
-      }
-
-      this.setCache(cacheKey, detailedMap);
-      return detailedMap;
-    } catch (error) {
-      logger.error('Error building detailed locked amounts map', error);
-      return detailedMap;
-    }
+  this.setCache(cacheKey, breakdown);
+  return breakdown;
   }
 }
 

@@ -17,7 +17,7 @@ describe('Root Routes', () => {
       expect(response.body).toHaveProperty('name');
       expect(response.body).toHaveProperty('version');
       expect(response.body.name).toBe('Futarchy AMM - CoinGecko API');
-      expect(response.body.version).toBe('1.0.0');
+      expect(response.body.version).toBe('2.0.0');
     });
 
     it('should list available endpoints', async () => {
@@ -46,12 +46,13 @@ describe('Root Routes', () => {
       expect(response.body.supplyBreakdown).toHaveProperty('circulatingSupply');
     });
 
-    it('should include caching information', async () => {
+    it('describes itself as a read-only, Dune-free API', async () => {
       const response = await request(app).get('/');
-      
-      expect(response.body).toHaveProperty('caching');
-      expect(response.body.caching).toHaveProperty('description');
-      expect(response.body.caching).toHaveProperty('refreshInterval');
+
+      // The stale cache block was removed; root now carries a `note` and no caching fields.
+      expect(response.body).toHaveProperty('note');
+      expect(response.body.note).toContain('no Dune');
+      expect(response.body).not.toHaveProperty('caching');
     });
   });
 });

@@ -160,46 +160,6 @@ export class SolanaService {
   }
 
   /**
-   * Get the circulating supply of a token
-   * Circulating supply = Total supply - Locked amounts (performance packages, etc.)
-   * 
-   * @param mintAddress - The mint address of the token
-   * @param lockedAmount - Optional BN of locked tokens to subtract (e.g., performance package)
-   * @returns Promise<string> - The circulating supply with proper decimals
-   */
-  async getCirculatingSupply(mintAddress: string, lockedAmount?: BN): Promise<string> {
-    const lockedKey = lockedAmount ? lockedAmount.toString() : 'none';
-    const cacheKey = `circulating_supply_${mintAddress}_${lockedKey}`;
-    const cached = this.getCached<string>(cacheKey, config.cache.tickersTTL);
-    if (cached !== null) return cached;
-
-    try {
-      const mintPubkey = new PublicKey(mintAddress);
-      const mintInfo = await this.withRetry(() => getMint(this.connection, mintPubkey));
-      let supply = new BN(mintInfo.supply.toString());
-      const decimals = mintInfo.decimals;
-
-      // Subtract locked amounts (performance package tokens, etc.)
-      if (lockedAmount && lockedAmount.gt(new BN(0))) {
-        supply = supply.sub(lockedAmount);
-        // Ensure we don't go negative
-        if (supply.isNeg()) {
-          supply = new BN(0);
-        }
-      }
-
-      const circulatingSupply = Number(supply.toString()) / Math.pow(10, decimals);
-      const result = circulatingSupply.toString();
-
-      this.setCache(cacheKey, result);
-      return result;
-    } catch (error) {
-      logger.error(`Error fetching circulating supply for ${mintAddress}:`, error);
-      throw new Error(`Failed to fetch circulating supply for token: ${mintAddress}`);
-    }
-  }
-
-  /**
    * Get complete supply information for a token with detailed allocation breakdown
    * @param mintAddress - The mint address of the token
    * @param allocation - Optional token allocation breakdown (team, futarchyAMM, meteora)

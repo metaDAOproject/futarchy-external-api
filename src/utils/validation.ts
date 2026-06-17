@@ -383,7 +383,7 @@ export function getUTCDateString(date: Date = new Date()): string {
 
 /**
  * Validate that a timestamp string is valid and normalize to UTC.
- * Used for parsing timestamps from external sources like Dune.
+ * Used for parsing timestamps from external data sources.
  */
 export function parseTimestampAsUTC(
   value: string | undefined,
@@ -395,7 +395,7 @@ export function parseTimestampAsUTC(
 
   const trimmed = value.trim();
   
-  // Handle Dune-style timestamps which may have inconsistent formats
+  // Handle external timestamps which may have inconsistent formats
   // e.g., "2024-01-15T10:20:00" or "2024-01-15 10:20:00"
   const normalized = trimmed.replace(' ', 'T');
   

@@ -4,7 +4,7 @@ import { PublicKey } from '@solana/web3.js';
 import { createApp, type Services } from '../src/app.js';
 import type { FutarchyService, DaoTickerData } from '../src/services/futarchyService.js';
 import type { PriceService } from '../src/services/priceService.js';
-import type { DatabaseService } from '../src/services/databaseService.js';
+import type { ExternalDatabaseService } from '../src/services/externalDatabaseService.js';
 
 // Mock DAO data
 const mockBaseMint = new PublicKey('SoLo9oxzLDpcq1dpqAgMwgce5WqkRDtNXK7EPnbmeta');
@@ -38,7 +38,6 @@ const mockFutarchyService = {
     baseProtocolFees: new BN('100000000'),
     quoteProtocolFees: new BN('5000000'),
   }),
-  getTotalLiquidity: jest.fn().mockResolvedValue(new BN('100000000000')),
 } as unknown as FutarchyService;
 
 const mockPriceService = {
@@ -48,30 +47,29 @@ const mockPriceService = {
     ask: '0.05025',
   })),
   calculateLiquidityUSD: jest.fn(() => '100000.00'),
-  calculateVolumeFromFees: jest.fn(() => ({
-    baseVolume: '40.00000000',
-    targetVolume: '2.00000000',
-  })),
 } as unknown as PriceService;
 
-const mockDatabaseService = {
+// /api/tickers 24h metrics come from the unified user_pool ETL candles
+// (user_pool_spot_ohlcv), keyed by token (base mint). First-trade dates (startDate)
+// also come from the served (external) DB. Single source, no app-DB fallback.
+const mockExternalDatabaseService = {
   isAvailable: jest.fn().mockReturnValue(true),
+  getSpotRolling24hMetrics: jest.fn().mockResolvedValue(new Map()),
   getFirstTradeDates: jest.fn().mockResolvedValue(new Map()),
-} as unknown as DatabaseService;
+  checkServedDataContract: jest.fn().mockResolvedValue({
+    ok: true,
+    checkedAt: '2024-01-01T00:00:00.000Z',
+    missing: [],
+  }),
+} as unknown as ExternalDatabaseService;
 
 function createMockServices(): Services {
   return {
     futarchyService: mockFutarchyService,
     priceService: mockPriceService,
-    databaseService: mockDatabaseService,
-    duneService: null,
-    duneCacheService: null,
+    externalDatabaseService: mockExternalDatabaseService,
     solanaService: undefined,
     launchpadService: undefined,
-    hourlyAggregationService: null,
-    tenMinuteVolumeFetcherService: null,
-    dailyAggregationService: null,
-    meteoraVolumeFetcherService: null,
   };
 }
 
@@ -123,6 +121,58 @@ describe('CoinGecko API', () => {
         expect(response.body[0].target_volume).toBe('0');
       }
     });
+
+    it('should return 503 instead of zero volume when the served DB is unavailable', async () => {
+      (mockExternalDatabaseService as any).isAvailable.mockReturnValueOnce(false);
+
+      const response = await request(app).get('/api/tickers');
+
+      expect(response.status).toBe(503);
+      expect(response.body.error).toBe('Served database not available');
+      expect(response.body.code).toBe('SERVED_DB_UNAVAILABLE');
+    });
+
+    it('should read 24h volume from user_pool_spot_ohlcv keyed by token (base mint)', async () => {
+      (mockExternalDatabaseService as any).getSpotRolling24hMetrics.mockResolvedValueOnce(new Map([
+        [mockBaseMint.toString(), {
+          token: mockBaseMint.toString(),
+          base_volume_24h: '12.5',
+          target_volume_24h: '125',
+          high_24h: '0.06',
+          low_24h: '0.04',
+          trade_count_24h: 4,
+        }],
+      ]));
+
+      const response = await request(app).get('/api/tickers');
+
+      expect(response.status).toBe(200);
+      expect(response.body[0].base_volume).toBe('12.5');
+      expect(response.body[0].target_volume).toBe('125');
+      expect(response.body[0].high_24h).toBe('0.06');
+      expect(response.body[0].low_24h).toBe('0.04');
+    });
+
+    it('should set startDate from the served DB first-trade dates (keyed by base mint)', async () => {
+      (mockExternalDatabaseService as any).getFirstTradeDates.mockResolvedValueOnce(
+        new Map([[mockBaseMint.toString(), '2024-03-07']])
+      );
+
+      const response = await request(app).get('/api/tickers');
+
+      expect(response.status).toBe(200);
+      expect(response.body[0].startDate).toBe('2024-03-07');
+      expect((mockExternalDatabaseService as any).getFirstTradeDates).toHaveBeenCalled();
+    });
+
+    it('should omit startDate when no first-trade date exists for the base mint', async () => {
+      // Default mock returns an empty Map.
+      const response = await request(app).get('/api/tickers');
+
+      expect(response.status).toBe(200);
+      expect(response.body[0]).not.toHaveProperty('startDate');
+    });
+
   });
 
   describe('GET /health', () => {

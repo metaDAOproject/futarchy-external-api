@@ -13,5 +13,3 @@
 
 # Operational scripts
 /scripts/safe-update.ts @metanallok
-/scripts/backfill.ts @metanallok
-/scripts/backfillV06.ts @metanallok

@@ -55,13 +55,14 @@ Returns all DAO tickers with pricing, volume, and liquidity information. Automat
 | `high_24h` / `low_24h` | 24h high/low (when available) |
 | `startDate` | First trade date for the token |
 
-**Volume sources** (priority order): 10-minute DB → hourly DB → Dune cache.
+**Volume source**: `futarchy.user_pool_spot_ohlcv` in the served ETL DB. If the
+served DB is unavailable, the endpoint returns `503` instead of reporting zero volume.
 
 ---
 
 ### DexScreener Adapter Endpoints
 
-Implements the [DexScreener Adapter Spec v1.1](https://dexscreener.notion.site/DEX-Screener-Adapter-Specs-cc1223cdf6e74a7799599106b65dcd0e). All endpoints are served under `/dexscreener/`. Requires `EXTERNAL_DATABASE_URL` to be configured (v0.6 indexer DB).
+Implements the [DexScreener Adapter Spec v1.1](https://dexscreener.notion.site/DEX-Screener-Adapter-Specs-cc1223cdf6e74a7799599106b65dcd0e). All endpoints are served under `/dexscreener/`. Requires `DATABASE_PG_URL` to be configured for the served DB.
 
 #### GET `/dexscreener/latest-block`
 
@@ -153,11 +154,13 @@ Returns swap events in the given Solana slot range (both inclusive). Events are 
 
 Returns daily market data for the given date range, split by Futarchy AMM and Meteora sources.
 
-**Data source** is controlled by the `USE_DUNE_DATA` environment variable:
-- `USE_DUNE_DATA=false` — reads from `v06_fee_volume_daily_aggregate` (v0.6 indexer), providing spot + conditional volume breakdown with fee calculations and reconciliation status
-- `USE_DUNE_DATA=true` (default) — reads from `daily_volumes` (Dune pipeline)
+**Data source**: both FutarchyAMM and Meteora data come from the unified
+`futarchy.user_pool_daily` ETL table in the served DB. The served DB is a hard
+dependency: if it's unreachable the endpoint returns `503` rather than reporting
+a DB outage as zero volume.
 
-The response includes a `source` field (`"v06-indexer"` or `"dune"`) indicating which pipeline served the data.
+- **FutarchyAMM** — `source = 'futarchy_amm'`, pivoted into spot, conditional, and total daily columns. Response `futarchyAMM.source` is `"etl-user-pool-daily"`.
+- **Meteora** — `source = 'meteora'`, with the same daily accounting contract. Response `meteora.source` is `"etl-meteora-daily"`.
 
 ---
 
@@ -181,9 +184,20 @@ Returns circulating supply — total minus team performance package.
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /health` | Basic health check (status, uptime, cache status) |
-| `GET /api/health` | Comprehensive health with DB, volume services, and data freshness |
-| `GET /metrics` | Prometheus metrics |
+| `GET /health` | Liveness: process status and uptime (no dependency checks) |
+| `GET /api/health` | Readiness: served DB connectivity, ETL data contract, and data freshness |
+| `GET /metrics` | Prometheus metrics (HTTP, served-DB health gauges, heartbeat) |
+
+`/api/health` reports `status: "degraded"` (with a `message`) when the served DB
+is unreachable, the served-data contract check fails, or the freshness query fails.
+
+**Heartbeat**: a background self-check runs every `HEARTBEAT_INTERVAL_MS` (default
+1 min). It verifies served-DB connectivity, alerts when the newest swap is older
+than `HEARTBEAT_MAX_DATA_AGE_SECONDS` (default 6h — a stalled ETL with a healthy
+connection is still an outage), and re-checks the data contract every 10th tick.
+Failures push webhook alerts (with cooldowns) and update the
+`futarchy_served_db_connected` / `futarchy_served_contract_ok` /
+`futarchy_served_data_age_seconds` Prometheus gauges.
 
 ---
 
@@ -217,20 +231,19 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | **Server** | | |
 | `PORT` | Server port | `3000` |
 | `SERVER_REQUEST_TIMEOUT` | Request timeout (ms) | `300000` |
+| `TRUST_PROXY_HOPS` | Reverse-proxy hops in front of the API (needed for per-IP rate limiting behind a LB) | `0` |
 | `TRUSTED_API_KEYS` | Comma-separated allowlist of trusted partner keys | — |
 | `TRUSTED_RATE_LIMIT_MAX` | Per-bucket request count per minute for trusted keys | `600` |
-| **Database (App DB)** | | |
-| `COINGECKO_PG_URL` / `DATABASE_URL` | PostgreSQL connection string | — |
-| `DATABASE_SSL` | Enable SSL | `false` |
-| **External DB (v0.6 Indexer)** | | |
-| `EXTERNAL_DATABASE_URL` | Read-only connection to indexer DB | — |
-| `EXTERNAL_DATABASE_SSL` | Enable SSL | `false` |
-| **Dune** | | |
-| `DUNE_API_KEY` | Dune Analytics API key | — |
-| `DUNE_TEN_MINUTE_VOLUME_QUERY_ID` | 10-minute volume query ID | — |
-| `DUNE_METEORA_VOLUME_QUERY_ID` | Meteora volume query ID | — |
+| `CACHE_TICKERS_TTL` | On-chain data cache TTL (ms) | `55000` |
+| **Served indexer DB (required — the only database this API uses)** | | |
+| `DATABASE_PG_URL` | Read-only connection to the served indexer DB (Meteora, tickers, DexScreener, first-trade-dates). **Required** — `/api/market-data` returns 503 without it. | — |
+| `DATABASE_PG_SSL` | Enable SSL (server cert verified against system CAs) | `false` |
+| `DATABASE_PG_CA_CERT` | PEM CA cert content for private-CA verification | — |
+| `DATABASE_PG_SSL_NO_VERIFY` | Explicit opt-out of TLS verification (stopgap only) | `false` |
+| **Heartbeat** | | |
+| `HEARTBEAT_INTERVAL_MS` | Background self-check cadence (0 disables) | `60000` |
+| `HEARTBEAT_MAX_DATA_AGE_SECONDS` | Stale-data alert threshold (0 disables) | `21600` |
 | **Protocol** | | |
-| `USE_DUNE_DATA` | Use Dune pipeline for volume data (`true`/`false`) | `true` |
 | `PROTOCOL_FEE_RATE` | Protocol fee rate | `0.005` (0.5%) |
 | `EXCLUDED_DAOS` | Comma-separated DAO addresses to exclude | — |
 | **Alerts** | | |
@@ -242,29 +255,24 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 ```
 src/
 ├── app.ts                        # Express app setup & middleware
-├── main.ts                       # Entry point, service wiring, scheduled tasks
+├── main.ts                       # API entry point (serves routes, no indexing workers)
+├── runtime/
+│   ├── services.ts               # API service composition
+│   └── heartbeat.ts              # Background self-check (served DB, freshness, contract)
 ├── config.ts                     # Environment variables & configuration
 ├── routes/
 │   ├── index.ts                  # Route registration
 │   ├── coingecko.ts              # GET /api/tickers
 │   ├── dexscreener.ts            # DexScreener adapter (4 endpoints)
-│   ├── market.ts                 # GET /api/market-data (v0.6 or Dune via USE_DUNE_DATA)
+│   ├── market.ts                 # GET /api/market-data (user_pool ETL)
 │   ├── supply.ts                 # GET /api/supply/*
-│   ├── health.ts                 # Health checks
+│   ├── health.ts                 # Liveness + readiness checks
 │   ├── metrics.ts                # Prometheus metrics
 │   └── root.ts                   # GET / (API info)
 ├── services/
 │   ├── futarchyService.ts        # On-chain DAO/pool/token data
 │   ├── priceService.ts           # Price, spread, liquidity calculations
-│   ├── databaseService.ts        # App DB (volumes, OHLCV, fees, metrics)
-│   ├── externalDatabaseService.ts # Read-only indexer DB connection
-│   ├── v06ReconciliationService.ts # Hourly v0.6 data reconciliation
-│   ├── tenMinuteVolumeFetcherService.ts # 10-min volume from Dune
-│   ├── hourlyAggregationService.ts     # Hourly rollups
-│   ├── dailyAggregationService.ts      # Daily rollups
-│   ├── meteoraVolumeFetcherService.ts  # Meteora pool volumes
-│   ├── duneCacheService.ts       # Dune API cache layer
-│   ├── duneService.ts            # Dune API client
+│   ├── externalDatabaseService.ts # Read-only served ETL DB connection (the only DB)
 │   ├── solanaService.ts          # SPL token supply queries
 │   ├── launchpadService.ts       # Token allocation breakdown
 │   └── metricsService.ts         # Prometheus counters/histograms
@@ -274,41 +282,29 @@ src/
 ├── middleware/
 │   ├── errorHandler.ts           # Error handling & asyncHandler
 │   └── requestId.ts              # Request ID injection
-├── utils/                        # Logger, alerts, validation, scheduling
-└── schema/                       # Dune SQL queries, v0.6 DDL reference
+└── utils/                        # Logger, alerts, validation, scheduling
 ```
 
 ## Data Pipeline
 
-### Volume Sources (priority order)
-1. **10-minute volumes** — from Dune, stored in `ten_minute_volumes`, rolled up to hourly/daily
-2. **v0.6 Reconciliation** — hourly job reads `v0_6_spot_swaps` + `v0_6_conditional_swaps` from the external indexer DB, writes OHLCV and fee breakdowns to app DB
-3. **Dune cache** — fallback for 24h metrics when DB sources unavailable
+### Sources (Dune fully removed)
+The API process serves market data from the read-only served ETL DB:
+
+- `/api/tickers` reads rolling 24h metrics from `futarchy.user_pool_spot_ohlcv`.
+- `/api/market-data` reads FutarchyAMM and Meteora daily rows from `futarchy.user_pool_daily`.
+- DexScreener routes read raw indexed v0.6 swap/DAO tables from the same served DB.
+
+The served ETL DB is the **only** database this API connects to (the legacy app DB
+is fully removed). The API does not start indexing, fetchers, rollups, or any
+schema setup — it is serve-only.
 
 ### DexScreener Pipeline
 The DexScreener adapter reads **directly from the external indexer DB** (`v0_6_spot_swaps` + `v0_6_daos`) and serves real-time swap events indexed by Solana slot. No intermediate aggregation — raw swap data mapped to the DexScreener schema.
 
-## Backfill Scripts
-
-```bash
-# Full v0.6 backfill (since 2025-01-01)
-bun run backfill:v06
-
-# With custom range
-bun run backfill:v06 -- --since 2025-06-01
-
-# Chunked for large ranges
-bun run backfill:v06 -- --since 2025-01-01 --chunk-days 30
-
-# Legacy Dune-based backfills
-bun run backfill:daily
-bun run backfill:hourly
-bun run backfill:ten-minute
-```
-
 ## Rate Limiting
 
 - **Anonymous (default):** 60 requests per minute per IP. Returns `429 Too Many Requests` when exceeded.
+  - **Behind a proxy/load balancer, set `TRUST_PROXY_HOPS`** to the real hop count — otherwise every anonymous client resolves to the proxy's IP and shares a single bucket.
 - **Trusted partners:** 600 requests per minute per key (configurable via `TRUSTED_RATE_LIMIT_MAX`). Send the issued key in the `X-API-Key` header. Each key has its own bucket — partners do not share quota.
 - Requests sent with an `X-API-Key` header that does not match the server-side allowlist receive `401 Unauthorized` with `code: "INVALID_API_KEY"`.
 - Keys are issued out-of-band by the team. Contact us if you need elevated access.

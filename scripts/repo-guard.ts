@@ -72,8 +72,6 @@ const sensitiveFiles = [
   "src/services/databaseService.ts",
   "src/services/externalDatabaseService.ts",
   "scripts/safe-update.ts",
-  "scripts/backfill.ts",
-  "scripts/backfillV06.ts",
 ];
 
 // Files whose purpose is to define the guard rules themselves, or to document

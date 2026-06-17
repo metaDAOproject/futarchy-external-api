@@ -2,30 +2,26 @@ import { Router, type Request, type Response } from 'express';
 import { config } from '../config.js';
 import type { ServiceGetters } from './types.js';
 
-export function createRootRouter(services: ServiceGetters): Router {
+export function createRootRouter(_services: ServiceGetters): Router {
   const router = Router();
-  const { getDuneCacheService } = services;
 
   // Root endpoint with API documentation
   router.get('/', (req: Request, res: Response) => {
-    const duneCacheService = getDuneCacheService();
-    const cacheStatus = duneCacheService?.getCacheStatus();
-    
     res.json({
       name: 'Futarchy AMM - CoinGecko API',
-      version: '1.0.0',
+      version: '2.0.0',
       documentation: 'https://docs.coingecko.com/reference/exchanges-list',
       endpoints: {
         tickers: '/api/tickers - Returns all DAO tickers with pricing and volume',
-        market_data: '/api/market-data - Daily market data (futarchy AMM + Meteora); uses v0.6 indexer when USE_DUNE_DATA=false',
+        market_data: '/api/market-data - Daily market data from the served user_pool ETL',
         supply: '/api/supply/:mintAddress - Returns complete supply breakdown with allocation details',
         supply_total: '/api/supply/:mintAddress/total - Returns total supply only',
         supply_circulating: '/api/supply/:mintAddress/circulating - Returns circulating supply (excludes team performance package)',
         health: '/health',
-        health_detailed: '/api/health - Comprehensive health with DB and data freshness',
+        health_detailed: '/api/health - Comprehensive health with app DB and served ETL contract checks',
       },
       dexscreener: {
-        description: 'DexScreener Adapter (v1.1) — requires EXTERNAL_DATABASE_URL',
+        description: 'DexScreener Adapter (v1.1) — requires DATABASE_PG_URL',
         latest_block: '/dexscreener/latest-block - Latest indexed Solana slot',
         asset: '/dexscreener/asset?id=:mintAddress - Token metadata',
         pair: '/dexscreener/pair?id=:daoAddress - Pair info',
@@ -43,17 +39,7 @@ export function createRootRouter(services: ServiceGetters): Router {
         futarchyAmmLiquidity: 'Tokens in the internal FutarchyAMM for spot trading - IS circulating',
         meteoraLpLiquidity: 'Tokens in the external Meteora DAMM pool (POL) - IS circulating',
       },
-      caching: {
-        description: 'Dune data is cached and refreshed hourly to improve response times',
-        refreshInterval: `${parseInt(process.env.DUNE_CACHE_REFRESH_INTERVAL || '3600')} seconds`,
-        fetchTimeout: `${parseInt(process.env.DUNE_FETCH_TIMEOUT || '240')} seconds`,
-        status: cacheStatus ? {
-          isInitialized: cacheStatus.isInitialized,
-          poolMetricsCount: cacheStatus.poolMetricsCount,
-          lastUpdated: cacheStatus.lastUpdated.toISOString(),
-        } : 'Not available (DUNE_API_KEY not set)',
-      },
-      note: 'This API automatically discovers and aggregates all DAOs from the Futarchy protocol.',
+      note: 'Read-only API. Market data and ticker volume are served from the user_pool ETL in the served DB; no Dune, no in-process indexing.',
     });
   });
 
