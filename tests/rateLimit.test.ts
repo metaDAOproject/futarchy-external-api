@@ -80,6 +80,41 @@ describe('Rate limiting', () => {
       expect(third.headers['x-ratelimit-limit']).toBe('2');
       expect(trusted.status).toBe(200);
     });
+
+    it('does not consume per-IP quota when a request is rejected by the global ceiling', async () => {
+      // Given: a single IP whose per-IP budget (3) is larger than the global
+      // ceiling (2), so the global ceiling — not the per-IP limit — rejects.
+      config.server.trustProxyHops = 1;
+      config.server.rateLimit.maxRequests = 3;
+      config.server.globalRateLimit = { maxRequests: 2, windowMs: 60_000 };
+      const app = createApp({ services: createTestServices() });
+      const fromIp = () => request(app).get('/health').set('X-Forwarded-For', '198.51.100.7');
+
+      // When: two served requests exhaust the global ceiling, the third is
+      // rejected by it (per-IP still has a slot free: 2 of 3 used).
+      const r1 = await fromIp();
+      const r2 = await fromIp();
+      const r3 = await fromIp();
+
+      // Lift the global ceiling and replay from the same IP.
+      config.server.globalRateLimit.maxRequests = 10;
+      const r4 = await fromIp();
+      const r5 = await fromIp();
+
+      // Then: r3 was rejected by the GLOBAL ceiling (limit 2), not per-IP.
+      expect(r1.status).toBe(200);
+      expect(r2.status).toBe(200);
+      expect(r3.status).toBe(429);
+      expect(r3.headers['x-ratelimit-limit']).toBe('2');
+      // r4 must succeed: the rejected r3 must NOT have charged the per-IP bucket.
+      // (Under the old charge-then-check order it would have, making r4 the 4th
+      // per-IP hit against a limit of 3 → 429.)
+      expect(r4.status).toBe(200);
+      // The per-IP bucket has now seen exactly 3 served requests (r1, r2, r4),
+      // so the next one is rejected by the per-IP limit (limit 3).
+      expect(r5.status).toBe(429);
+      expect(r5.headers['x-ratelimit-limit']).toBe('3');
+    });
   });
 
   describe('trusted X-API-Key', () => {

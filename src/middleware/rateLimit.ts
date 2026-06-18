@@ -39,32 +39,24 @@ function secondsUntil(resetTime: number, now: number): number {
   return Math.max(1, Math.ceil((resetTime - now) / 1000));
 }
 
-function chargeBucket(
-  buckets: Map<string, Bucket>,
-  key: string,
+// Build the response metadata for a bucket WITHOUT mutating its count. The
+// caller checks every applicable limit first and only increments the buckets
+// once all of them pass, so a request rejected by one ceiling never consumes
+// quota from another (e.g. a global-ceiling rejection must not also burn the
+// per-IP allowance).
+function describeBucket(
+  bucket: Bucket,
   limit: RateLimitConfig,
   now: number,
+  allowed: boolean,
 ): ChargeResult {
-  const bucket = getBucket(buckets, key, now, limit.windowMs);
-  const retryAfterSeconds = secondsUntil(bucket.resetTime, now);
-
-  if (bucket.count >= limit.maxRequests) {
-    return {
-      allowed: false,
-      limit: limit.maxRequests,
-      remaining: 0,
-      resetTime: bucket.resetTime,
-      retryAfterSeconds,
-    };
-  }
-
-  bucket.count++;
   return {
-    allowed: true,
+    allowed,
     limit: limit.maxRequests,
-    remaining: Math.max(0, limit.maxRequests - bucket.count),
+    // remaining is computed against the post-increment count when allowed.
+    remaining: allowed ? Math.max(0, limit.maxRequests - (bucket.count + 1)) : 0,
     resetTime: bucket.resetTime,
-    retryAfterSeconds,
+    retryAfterSeconds: secondsUntil(bucket.resetTime, now),
   };
 }
 
@@ -102,22 +94,30 @@ export function createRateLimitMiddleware() {
     const apiKey = req.apiKey ?? 'unknown';
     const primaryLimit = tier === 'trusted' ? config.server.trustedRateLimit : config.server.rateLimit;
     const primaryKey = tier === 'trusted' ? `key:${apiKey}` : `ip:${req.ip ?? 'unknown'}`;
-    const primaryResult = chargeBucket(buckets, primaryKey, primaryLimit, now);
 
-    if (!primaryResult.allowed) {
-      sendRateLimited(res, primaryResult);
+    const globalLimit = config.server.globalRateLimit;
+    const useGlobal = tier === 'anon' && globalLimit.maxRequests > 0;
+
+    const primaryBucket = getBucket(buckets, primaryKey, now, primaryLimit.windowMs);
+    const globalBucket = useGlobal
+      ? getBucket(buckets, 'global:anon', now, globalLimit.windowMs)
+      : null;
+
+    // Check every applicable limit before charging either bucket.
+    if (primaryBucket.count >= primaryLimit.maxRequests) {
+      sendRateLimited(res, describeBucket(primaryBucket, primaryLimit, now, false));
+      return;
+    }
+    if (globalBucket && globalBucket.count >= globalLimit.maxRequests) {
+      sendRateLimited(res, describeBucket(globalBucket, globalLimit, now, false));
       return;
     }
 
-    if (tier === 'anon' && config.server.globalRateLimit.maxRequests > 0) {
-      const globalResult = chargeBucket(buckets, 'global:anon', config.server.globalRateLimit, now);
-      if (!globalResult.allowed) {
-        sendRateLimited(res, globalResult);
-        return;
-      }
-    }
+    // All limits have room — commit the request against each.
+    setRateLimitHeaders(res, describeBucket(primaryBucket, primaryLimit, now, true));
+    primaryBucket.count++;
+    if (globalBucket) globalBucket.count++;
 
-    setRateLimitHeaders(res, primaryResult);
     next();
   };
 }

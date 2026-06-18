@@ -2,7 +2,7 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import type { Application } from 'express';
 import { requestIdMiddleware } from './middleware/requestId.js';
 import { errorHandler, asyncHandler, AppError } from './middleware/errorHandler.js';
-import { clientContextMiddleware } from './middleware/clientContext.js';
+import { createClientContextMiddleware } from './middleware/clientContext.js';
 import { corsMiddleware } from './middleware/cors.js';
 import { createRateLimitMiddleware } from './middleware/rateLimit.js';
 import { restrictionMiddleware } from './middleware/restriction.js';
@@ -64,7 +64,7 @@ export function createApp(options: AppOptions): Application {
 
   // Metrics BEFORE the rate limiter so 429/401 responses are recorded too.
   app.use(createMetricsMiddleware());
-  app.use(clientContextMiddleware);
+  app.use(createClientContextMiddleware());
   app.use(restrictionMiddleware);
   app.use(createRateLimitMiddleware());
 
