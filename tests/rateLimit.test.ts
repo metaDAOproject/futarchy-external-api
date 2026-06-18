@@ -5,14 +5,20 @@ import { config } from '../src/config.js';
 import { createTestServices } from './helpers/testApp.js';
 
 const originalAnonMax = config.server.rateLimit.maxRequests;
+const originalAnonWindowMs = config.server.rateLimit.windowMs;
 const originalTrustedMax = config.server.trustedRateLimit.maxRequests;
+const originalGlobalRateLimit = { ...config.server.globalRateLimit };
 const originalKeys = new Set(config.server.trustedApiKeys);
+const originalTrustProxyHops = config.server.trustProxyHops;
 
 afterEach(() => {
   config.server.rateLimit.maxRequests = originalAnonMax;
+  config.server.rateLimit.windowMs = originalAnonWindowMs;
   config.server.trustedRateLimit.maxRequests = originalTrustedMax;
+  config.server.globalRateLimit = { ...originalGlobalRateLimit };
   config.server.trustedApiKeys.clear();
   originalKeys.forEach(k => config.server.trustedApiKeys.add(k));
+  config.server.trustProxyHops = originalTrustProxyHops;
 });
 
 describe('Rate limiting', () => {
@@ -29,6 +35,50 @@ describe('Rate limiting', () => {
       const overflow = await request(app).get('/health');
       expect(overflow.status).toBe(429);
       expect(overflow.body).toEqual({ error: 'Too many requests' });
+      expect(overflow.headers['x-ratelimit-limit']).toBe('3');
+      expect(overflow.headers['x-ratelimit-remaining']).toBe('0');
+      expect(overflow.headers['x-ratelimit-reset']).toBeTruthy();
+      expect(overflow.headers['retry-after']).toBeTruthy();
+    });
+
+    it('returns rate-limit headers on allowed responses', async () => {
+      // Given
+      config.server.rateLimit.maxRequests = 3;
+      const app = createApp({ services: createTestServices() });
+
+      // When
+      const response = await request(app).get('/health');
+
+      // Then
+      expect(response.status).toBe(200);
+      expect(response.headers['x-ratelimit-limit']).toBe('3');
+      expect(response.headers['x-ratelimit-remaining']).toBe('2');
+      expect(response.headers['x-ratelimit-reset']).toBeTruthy();
+    });
+
+    it('enforces a global anonymous ceiling across distinct client IPs', async () => {
+      // Given
+      config.server.trustProxyHops = 1;
+      config.server.rateLimit.maxRequests = 60;
+      config.server.globalRateLimit = { maxRequests: 2, windowMs: 60_000 };
+      config.server.trustedApiKeys.add('consumer-key');
+      const app = createApp({ services: createTestServices() });
+
+      // When
+      const first = await request(app).get('/health').set('X-Forwarded-For', '198.51.100.1');
+      const second = await request(app).get('/health').set('X-Forwarded-For', '198.51.100.2');
+      const third = await request(app).get('/health').set('X-Forwarded-For', '198.51.100.3');
+      const trusted = await request(app)
+        .get('/health')
+        .set('X-Forwarded-For', '198.51.100.4')
+        .set('X-API-Key', 'consumer-key');
+
+      // Then
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(third.status).toBe(429);
+      expect(third.headers['x-ratelimit-limit']).toBe('2');
+      expect(trusted.status).toBe(200);
     });
   });
 

@@ -2,6 +2,10 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import type { Application } from 'express';
 import { requestIdMiddleware } from './middleware/requestId.js';
 import { errorHandler, asyncHandler, AppError } from './middleware/errorHandler.js';
+import { clientContextMiddleware } from './middleware/clientContext.js';
+import { corsMiddleware } from './middleware/cors.js';
+import { createRateLimitMiddleware } from './middleware/rateLimit.js';
+import { restrictionMiddleware } from './middleware/restriction.js';
 import { metricsService } from './services/metricsService.js';
 import { config } from './config.js';
 import { createRoutes } from './routes/index.js';
@@ -9,68 +13,8 @@ import { createServiceGetters, type Services } from './routes/types.js';
 
 export type { Services } from './routes/types.js';
 
-declare global {
-  namespace Express {
-    interface Request {
-      clientTier?: 'anon' | 'trusted';
-    }
-  }
-}
-
 export interface AppOptions {
   services: Services;
-}
-
-function createRateLimitMiddleware() {
-  const buckets = new Map<string, { count: number; resetTime: number }>();
-
-  // Evict expired buckets so the map doesn't grow without bound across
-  // distinct client IPs/keys. unref() keeps the sweep from holding the
-  // process (or test runner) open.
-  const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
-  const sweep = setInterval(() => {
-    const now = Date.now();
-    for (const [key, bucket] of buckets) {
-      if (now > bucket.resetTime) buckets.delete(key);
-    }
-  }, SWEEP_INTERVAL_MS);
-  sweep.unref?.();
-
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const apiKey = req.header('x-api-key');
-    let tier: { windowMs: number; maxRequests: number };
-    let bucketKey: string;
-
-    if (apiKey) {
-      if (!config.server.trustedApiKeys.has(apiKey)) {
-        throw AppError.unauthorized('Invalid API key', 'INVALID_API_KEY');
-      }
-      tier = config.server.trustedRateLimit;
-      bucketKey = `key:${apiKey}`;
-      req.clientTier = 'trusted';
-    } else {
-      tier = config.server.rateLimit;
-      bucketKey = `ip:${req.ip ?? 'unknown'}`;
-      req.clientTier = 'anon';
-    }
-
-    const now = Date.now();
-    const limit = buckets.get(bucketKey);
-
-    if (!limit || now > limit.resetTime) {
-      buckets.set(bucketKey, { count: 1, resetTime: now + tier.windowMs });
-      next();
-      return;
-    }
-
-    if (limit.count >= tier.maxRequests) {
-      res.status(429).json({ error: 'Too many requests' });
-      return;
-    }
-
-    limit.count++;
-    next();
-  };
 }
 
 function createMetricsMiddleware() {
@@ -103,6 +47,7 @@ export function createApp(options: AppOptions): Application {
   const app = express();
   const { services } = options;
   const serviceGetters = createServiceGetters(services);
+  metricsService.setRestrictionMode(config.server.restriction.mode);
 
   // Resolve the real client IP from X-Forwarded-For when behind a reverse
   // proxy. Without this, every anonymous client shares the proxy's IP — and
@@ -115,15 +60,12 @@ export function createApp(options: AppOptions): Application {
   app.use(express.json());
 
   app.use(requestIdMiddleware);
-
-  app.use((req: Request, res: Response, next: NextFunction) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-    next();
-  });
+  app.use(corsMiddleware);
 
   // Metrics BEFORE the rate limiter so 429/401 responses are recorded too.
   app.use(createMetricsMiddleware());
+  app.use(clientContextMiddleware);
+  app.use(restrictionMiddleware);
   app.use(createRateLimitMiddleware());
 
   // Mount all routes

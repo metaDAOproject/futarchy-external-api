@@ -6,6 +6,7 @@
  */
 
 import client from 'prom-client';
+import type { RestrictionMode } from '../config.js';
 
 // Create a Registry to hold all metrics
 const register = new client.Registry();
@@ -63,6 +64,19 @@ export const httpRequestDuration = new client.Histogram({
 export const httpRequestsInFlight = new client.Gauge({
   name: 'futarchy_http_requests_in_flight',
   help: 'Number of HTTP requests currently being processed',
+  registers: [register],
+});
+
+export const restrictionRejectionsTotal = new client.Counter({
+  name: 'futarchy_restriction_rejections_total',
+  help: 'Total number of requests rejected by emergency restriction controls',
+  labelNames: ['reason'],
+  registers: [register],
+});
+
+export const restrictionMode = new client.Gauge({
+  name: 'futarchy_restriction_mode',
+  help: 'Emergency restriction mode (0 = normal, 1 = restricted, 2 = lockdown)',
   registers: [register],
 });
 
@@ -143,6 +157,24 @@ export class MetricsService {
 
   decrementHttpRequestsInFlight(): void {
     httpRequestsInFlight.dec();
+  }
+
+  recordRestrictionRejection(reason: string): void {
+    restrictionRejectionsTotal.labels(reason).inc();
+  }
+
+  setRestrictionMode(mode: RestrictionMode): void {
+    switch (mode) {
+      case 'normal':
+        restrictionMode.set(0);
+        return;
+      case 'restricted':
+        restrictionMode.set(1);
+        return;
+      case 'lockdown':
+        restrictionMode.set(2);
+        return;
+    }
   }
 
   /**
