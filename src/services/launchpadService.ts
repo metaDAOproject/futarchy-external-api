@@ -486,7 +486,8 @@ export class LaunchpadService {
       try {
         tokenAccountAddress = await getAssociatedTokenAddress(
           baseMint,
-          launch.additionalTokensRecipient
+          launch.additionalTokensRecipient,
+          true
         );
       } catch (error) {
         logger.warn(`[Launchpad] Could not derive additional tokens account for ${launch.additionalTokensRecipient.toString()}`);
@@ -559,4 +560,3 @@ export class LaunchpadService {
 }
 
 export default LaunchpadService;
-

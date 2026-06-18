@@ -10,9 +10,13 @@
 
 import { describe, it, expect } from 'bun:test';
 import { PublicKey } from '@solana/web3.js';
+import { getAssociatedTokenAddress } from '@solana/spl-token';
+import BN from 'bn.js';
 import { LaunchpadService } from '../../src/services/launchpadService.js';
 
 const MINT = new PublicKey('SoLo9oxzLDpcq1dpqAgMwgce5WqkRDtNXK7EPnbmeta');
+const LAUNCH = new PublicKey('5FPGRzY9ArJFwY2Hp2y2eqMzVewyWCBox7esmpuZfCvE');
+const DAO = new PublicKey('11111111111111111111111111111111');
 
 describe('LaunchpadService.getTokenAllocationBreakdown', () => {
   it('propagates infrastructure failures instead of returning an empty breakdown', async () => {
@@ -38,9 +42,8 @@ describe('LaunchpadService.getTokenAllocationBreakdown', () => {
 
   it('returns an empty breakdown (with launch metadata) for an incomplete launch', async () => {
     const svc = new LaunchpadService();
-    const launchAddress = new PublicKey('5FPGRzY9ArJFwY2Hp2y2eqMzVewyWCBox7esmpuZfCvE');
     (svc as any).getLaunchByBaseMint = async () => ({
-      launchAddress,
+      launchAddress: LAUNCH,
       baseMint: MINT,
       version: 'v0.7',
       dao: undefined,
@@ -49,7 +52,44 @@ describe('LaunchpadService.getTokenAllocationBreakdown', () => {
     const breakdown = await svc.getTokenAllocationBreakdown(MINT);
 
     expect(breakdown.version).toBe('v0.7');
-    expect(breakdown.launchAddress?.equals(launchAddress)).toBe(true);
+    expect(breakdown.launchAddress?.equals(LAUNCH)).toBe(true);
     expect(breakdown.totalNonCirculating.isZero()).toBe(true);
+  });
+
+  it('derives the additional-token account when the recipient is off-curve', async () => {
+    const svc = new LaunchpadService();
+    const [recipient] = PublicKey.findProgramAddressSync(
+      [Buffer.from('additional-recipient'), MINT.toBuffer()],
+      LAUNCH,
+    );
+    const expectedTokenAccount = await getAssociatedTokenAddress(MINT, recipient, true);
+
+    Object.defineProperty(svc, 'connection', {
+      value: { getAccountInfo: async () => null },
+    });
+    Object.defineProperty(svc, 'futarchyClient', {
+      value: { fetchDao: async () => ({ quoteMint: undefined }) },
+    });
+    svc.getLaunchByBaseMint = async () => ({
+      launchAddress: LAUNCH,
+      baseMint: MINT,
+      performancePackageGrantee: DAO,
+      performancePackageTokenAmount: new BN(0),
+      state: { completed: {} },
+      dao: DAO,
+      version: 'v0.7',
+      additionalTokensAmount: new BN(100),
+      additionalTokensRecipient: recipient,
+      additionalTokensClaimed: false,
+    });
+    svc.getPerformancePackageAddress = () => DAO;
+    svc.getFutarchyAmmLiquidity = async () => ({ amount: new BN(0) });
+
+    const breakdown = await svc.getTokenAllocationBreakdown(MINT);
+
+    expect(breakdown.additionalTokenAllocation?.recipient.equals(recipient)).toBe(true);
+    expect(
+      breakdown.additionalTokenAllocation?.tokenAccountAddress?.equals(expectedTokenAccount),
+    ).toBe(true);
   });
 });
