@@ -237,10 +237,8 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | `GLOBAL_RATE_LIMIT_MAX` | Aggregate anonymous requests per window across all IPs (`0` disables) | `0` |
 | `TRUSTED_API_KEYS` | Comma-separated allowlist of trusted partner keys | — |
 | `TRUSTED_RATE_LIMIT_MAX` | Per-bucket request count per minute for trusted keys | `600` |
-| `RESTRICTION_MODE` | Emergency mode: `normal`, `restricted`, or `lockdown` | `normal` |
+| `RESTRICTION_MODE` | Emergency mode: `normal` or `restricted` | `normal` |
 | `RESTRICTION_DISABLED_PATHS` | Comma-separated path prefixes to hard-disable for all tiers | — |
-| `RESTRICTION_EXEMPT_CIDRS` | Comma-separated IP/CIDR restriction bypass allowlist | — |
-| `ALLOWED_ORIGINS` | Comma-separated browser origins; empty keeps wildcard CORS | — |
 | `CACHE_TICKERS_TTL` | On-chain data cache TTL (ms) | `55000` |
 | **Served indexer DB (required — the only database this API uses)** | | |
 | `DATABASE_PG_URL` | Read-only connection to the served indexer DB (Meteora, tickers, DexScreener, first-trade-dates). **Required** — `/api/market-data` returns 503 without it. | — |
@@ -323,14 +321,12 @@ The DexScreener adapter reads **directly from the external indexer DB** (`v0_6_s
 All emergency controls are env-driven and require a process restart. There is no runtime admin endpoint.
 
 - `RESTRICTION_MODE=normal`: default behavior.
-- `RESTRICTION_MODE=restricted`: health, metrics, trusted access, and configured bypasses remain allowed; anonymous API traffic gets `503 SERVICE_RESTRICTED`.
-- `RESTRICTION_MODE=lockdown`: same enforcement as restricted, intended for severe downstream risk.
+- `RESTRICTION_MODE=restricted`: health, metrics, and trusted access remain allowed; anonymous API traffic gets `503 SERVICE_RESTRICTED`.
 - `RESTRICTION_DISABLED_PATHS`: hard-disables matching path prefixes for all tiers except health and metrics.
-- `RESTRICTION_EXEMPT_CIDRS`: optional IP/CIDR bypass for known safe sources. Bypassed sources skip emergency restrictions and rate limits. IPv4 CIDRs are supported; IPv6 and single IP entries are exact matches.
 
 Operational checklist:
 
-1. Confirm expected high-volume callers have valid trusted access or an approved bypass.
+1. Confirm expected high-volume callers have valid trusted access.
 2. Set the smallest effective env change for the risk level.
 3. Restart the service.
 4. Verify health and metrics remain reachable.
@@ -338,7 +334,7 @@ Operational checklist:
 
 ## Frontend And Development Access
 
-Browser traffic should stay anonymous because API secrets must not be shipped to clients. Use the anonymous tier for direct browser calls and rely on `ALLOWED_ORIGINS` only as a browser CORS signal, not authentication.
+Browser traffic should stay anonymous because API secrets must not be shipped to clients. Use the anonymous tier for direct browser calls.
 
 Server-side callers and local development proxies can use a server-held trusted key from `.env` and send it as `X-API-Key`.
 

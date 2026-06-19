@@ -76,7 +76,7 @@ export const restrictionRejectionsTotal = new client.Counter({
 
 export const restrictionMode = new client.Gauge({
   name: 'futarchy_restriction_mode',
-  help: 'Emergency restriction mode (0 = normal, 1 = restricted, 2 = lockdown)',
+  help: 'Emergency restriction mode (0 = normal, 1 = restricted)',
   registers: [register],
 });
 
@@ -170,9 +170,6 @@ export class MetricsService {
         return;
       case 'restricted':
         restrictionMode.set(1);
-        return;
-      case 'lockdown':
-        restrictionMode.set(2);
         return;
     }
   }

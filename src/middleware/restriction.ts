@@ -29,11 +29,6 @@ export function restrictionMiddleware(req: Request, res: Response, next: NextFun
     return;
   }
 
-  if (req.isExempt) {
-    next();
-    return;
-  }
-
   switch (config.server.restriction.mode) {
     case 'normal':
       next();
@@ -44,13 +39,6 @@ export function restrictionMiddleware(req: Request, res: Response, next: NextFun
         return;
       }
       sendRestricted(req, res, 'restricted_anon');
-      return;
-    case 'lockdown':
-      if (req.clientTier === 'trusted') {
-        next();
-        return;
-      }
-      sendRestricted(req, res, 'lockdown_anon');
       return;
     default:
       next();

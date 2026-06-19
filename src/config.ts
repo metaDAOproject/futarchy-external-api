@@ -1,8 +1,8 @@
 import { PublicKey } from '@solana/web3.js';
 
-export type RestrictionMode = 'normal' | 'restricted' | 'lockdown';
+export type RestrictionMode = 'normal' | 'restricted';
 
-const VALID_RESTRICTION_MODES = ['normal', 'restricted', 'lockdown'] as const;
+const VALID_RESTRICTION_MODES = ['normal', 'restricted'] as const;
 
 function parseInteger(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
@@ -21,8 +21,6 @@ function parseRestrictionMode(value: string | undefined): RestrictionMode {
   switch (value) {
     case 'restricted':
       return 'restricted';
-    case 'lockdown':
-      return 'lockdown';
     case 'normal':
     case undefined:
     case '':
@@ -71,10 +69,8 @@ export const config = {
     restriction: {
       mode: parseRestrictionMode(process.env.RESTRICTION_MODE),
       disabledPaths: parseCsv(process.env.RESTRICTION_DISABLED_PATHS),
-      exemptCidrs: parseCsv(process.env.RESTRICTION_EXEMPT_CIDRS),
       alwaysAllowedPaths: ['/health', '/api/health', '/metrics'],
     },
-    allowedOrigins: parseCsv(process.env.ALLOWED_ORIGINS),
   },
   cache: {
     tickersTTL: parseInteger(process.env.CACHE_TICKERS_TTL, 55000),

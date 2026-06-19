@@ -84,11 +84,6 @@ export function createRateLimitMiddleware() {
   sweep.unref?.();
 
   return (req: Request, res: Response, next: NextFunction): void => {
-    if (req.isExempt) {
-      next();
-      return;
-    }
-
     const now = Date.now();
     const tier = req.clientTier ?? 'anon';
     const apiKey = req.apiKey ?? 'unknown';

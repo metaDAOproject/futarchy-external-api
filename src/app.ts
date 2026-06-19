@@ -3,7 +3,6 @@ import type { Application } from 'express';
 import { requestIdMiddleware } from './middleware/requestId.js';
 import { errorHandler, asyncHandler, AppError } from './middleware/errorHandler.js';
 import { createClientContextMiddleware } from './middleware/clientContext.js';
-import { corsMiddleware } from './middleware/cors.js';
 import { createRateLimitMiddleware } from './middleware/rateLimit.js';
 import { restrictionMiddleware } from './middleware/restriction.js';
 import { metricsService } from './services/metricsService.js';
@@ -60,7 +59,11 @@ export function createApp(options: AppOptions): Application {
   app.use(express.json());
 
   app.use(requestIdMiddleware);
-  app.use(corsMiddleware);
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, X-API-Key');
+    next();
+  });
 
   // Metrics BEFORE the rate limiter so 429/401 responses are recorded too.
   app.use(createMetricsMiddleware());

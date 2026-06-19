@@ -1,7 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import { config } from '../config.js';
 import { AppError } from './errorHandler.js';
-import { parseCidrs, ipInAllowlist } from '../utils/ipMatch.js';
 import { timingSafeStringEqual } from '../utils/timingSafe.js';
 
 declare global {
@@ -9,7 +8,6 @@ declare global {
     interface Request {
       clientTier?: 'anon' | 'trusted';
       apiKey?: string;
-      isExempt?: boolean;
     }
   }
 }
@@ -29,10 +27,6 @@ function findTrustedApiKey(apiKey: string): string | undefined {
 }
 
 export function createClientContextMiddleware() {
-  // exemptCidrs is env-driven and static for the process lifetime, so parse it
-  // once at app-creation rather than re-parsing on every request.
-  const exemptRules = parseCidrs(config.server.restriction.exemptCidrs);
-
   return (req: Request, _res: Response, next: NextFunction): void => {
     const apiKey = req.header('x-api-key');
 
@@ -48,7 +42,6 @@ export function createClientContextMiddleware() {
       req.clientTier = 'anon';
     }
 
-    req.isExempt = ipInAllowlist(req.ip, exemptRules);
     next();
   };
 }
