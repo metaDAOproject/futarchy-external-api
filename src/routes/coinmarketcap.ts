@@ -18,31 +18,52 @@ import { sendAlert } from '../utils/alerts.js';
 const PROTOCOL_FEE_RATE = config.fees.protocolFeeRate;
 
 /**
+ * Parse a served-ETL numeric metric that must be finite. A non-finite value for
+ * an INCLUDED pair means contract drift produced corrupt data — surface it as a
+ * 500 (never a partial valid-looking 200). Same integrity rule for volume and
+ * high/low so no corrupt field can slip through as a silently-omitted extreme.
+ */
+function parseFinite(raw: string, field: string, mint: string): number {
+  const value = parseFloat(raw);
+  if (!Number.isFinite(value)) {
+    throw AppError.internal(
+      `Malformed 24h ${field} from the served ETL for ${mint}`,
+      'CMC_MALFORMED_METRIC'
+    );
+  }
+  return value;
+}
+
+/**
  * Apply the optional CMC allowlist (config.coinmarketcap.allowedMints). An empty
  * allowlist means "serve every discovered DAO" — same default as the CoinGecko
  * and DexScreener adapters.
  *
- * Fails CLOSED when an allowlist is configured but matches ZERO discovered DAOs:
- * that is a misconfiguration (stale/wrong mint) or an upstream discovery outage,
- * and returning an empty 200 would read as "every listed market delisted" to a
- * poller. We surface it as 503 + alert instead so it retries and we get paged,
- * rather than silently serving an empty feed.
+ * Fails CLOSED when ANY configured mint is absent from the discovered DAOs.
+ * Operators allowlist the exact tokens they expect to serve, so a missing one is
+ * never benign — it is a stale/typo'd mint, an EXCLUDED_DAOS collision, or a
+ * discovery outage. Serving the remaining pairs as a 200 would read as "that
+ * token delisted" to a poller, so we surface it as 503 + alert (naming the
+ * missing mints) instead — it retries and we get paged.
  */
 function filterAllowed(daos: DaoTickerData[]): DaoTickerData[] {
   const allowed = config.coinmarketcap.allowedMints;
   if (allowed.size === 0) return daos;
-  const filtered = daos.filter(dao => allowed.has(dao.baseMint.toString()));
-  if (filtered.length === 0) {
+
+  const discovered = new Set(daos.map(dao => dao.baseMint.toString()));
+  const missing = [...allowed].filter(mint => !discovered.has(mint));
+  if (missing.length > 0) {
     sendAlert(
-      `CMC_ALLOWED_MINTS matched none of ${daos.length} discovered DAOs — refusing to serve an empty feed`,
-      { cooldownKey: 'cmc-allowlist-no-match', cooldownMs: 10 * 60 * 1000 }
+      `CMC_ALLOWED_MINTS not found among ${daos.length} discovered DAOs: ${missing.join(', ')} — refusing to serve a partial feed`,
+      { cooldownKey: 'cmc-allowlist-missing', cooldownMs: 10 * 60 * 1000 }
     );
     throw AppError.serviceUnavailable(
-      'CMC allowlist matched no discovered markets',
+      'CMC allowlist includes markets not currently discovered',
       'CMC_ALLOWLIST_NO_MATCH'
     );
   }
-  return filtered;
+
+  return daos.filter(dao => allowed.has(dao.baseMint.toString()));
 }
 
 /**
@@ -130,24 +151,29 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
         const spread = priceService.calculateSpread(priceNum);
         if (!spread) continue;
 
-        // Volume semantics for a financial feed:
-        //  - metrics ABSENT  → the pair simply had no spot trades in 24h; 0 is the
-        //    genuine, correct volume (not an error).
-        //  - metrics PRESENT but non-finite → served-DB contract drift produced a
-        //    corrupt SUM for an INCLUDED pair. Do NOT silently drop it (that would
-        //    turn schema drift into a partial 200); throw so the whole request
-        //    fails as 5xx via asyncHandler and we get paged.
+        // Metric semantics for a financial feed:
+        //  - metrics ABSENT  → the pair simply had no spot trades in 24h; 0 volume
+        //    and no high/low is the genuine, correct answer (not an error).
+        //  - metrics PRESENT but a field is corrupt (non-finite) for an INCLUDED
+        //    pair → served-DB contract drift. Do NOT silently drop/omit it (that
+        //    turns schema drift into a valid-looking partial 200); throw so the
+        //    whole request fails 5xx via asyncHandler and we get paged.
+        //
+        // '0' is the ETL's "no data" sentinel for high/low, so a genuine '0' is
+        // treated as absent (omitted), NOT parsed — only non-'0' values are.
         const metrics = volumeByDao.get(daoAddress.toString());
         let baseVolume = 0;
         let quoteVolume = 0;
+        let high24h: number | undefined;
+        let low24h: number | undefined;
         if (metrics) {
-          baseVolume = parseFloat(metrics.base_volume_24h);
-          quoteVolume = parseFloat(metrics.target_volume_24h);
-          if (!Number.isFinite(baseVolume) || !Number.isFinite(quoteVolume)) {
-            throw AppError.internal(
-              `Malformed 24h volume from the served ETL for ${baseMint.toString()}`,
-              'CMC_MALFORMED_VOLUME'
-            );
+          baseVolume = parseFinite(metrics.base_volume_24h, 'base volume', baseMint.toString());
+          quoteVolume = parseFinite(metrics.target_volume_24h, 'quote volume', baseMint.toString());
+          if (metrics.high_24h !== '0') {
+            high24h = parseFinite(metrics.high_24h, '24h high', baseMint.toString());
+          }
+          if (metrics.low_24h !== '0') {
+            low24h = parseFinite(metrics.low_24h, '24h low', baseMint.toString());
           }
         }
 
@@ -161,17 +187,8 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
           baseVolume,
           quoteVolume,
         };
-
-        // Only attach a 24h high/low when the ETL reports a real (non-zero) one —
-        // the metrics helper returns '0' as its "no data" sentinel.
-        if (metrics && metrics.high_24h !== '0') {
-          const high = parseFloat(metrics.high_24h);
-          if (Number.isFinite(high)) pair.high24h = high;
-        }
-        if (metrics && metrics.low_24h !== '0') {
-          const low = parseFloat(metrics.low_24h);
-          if (Number.isFinite(low)) pair.low24h = low;
-        }
+        if (high24h !== undefined) pair.high24h = high24h;
+        if (low24h !== undefined) pair.low24h = low24h;
 
         pairs.push(pair);
       } catch (error) {
@@ -198,6 +215,13 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
 
   // ---------------------------------------------------------------
   // GET /cmc/summary — 24h overview of every tradeable pair (array).
+  //
+  // DELIBERATE OMISSION — price_change_percent_24h: CMC's summary schema lists it,
+  // but computing it needs a reliable 24h-ago open, which the served ETL's rolling
+  // metrics (SUM/MAX/MIN over 1m candles) do not expose. This repo's invariant is
+  // to never fabricate a financial value, so we omit the field rather than report
+  // a fake 0% — the sibling CoinGecko /api/tickers adapter omits it for the same
+  // reason. Add it here only alongside a real 24h-open source.
   // ---------------------------------------------------------------
   router.get('/cmc/summary', asyncHandler(async (req: Request, res: Response) => {
     const pairs = await buildPairs(req);
@@ -224,6 +248,13 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
 
   // ---------------------------------------------------------------
   // GET /cmc/ticker — 24h price/volume keyed by `BASE_QUOTE` pair.
+  //
+  // base_id / quote_id carry the Solana mint (contract address), NOT a CMC
+  // "unified cryptoasset id". Our tokens are not yet listed on CMC, so no unified
+  // id exists — and for a DEX the on-chain contract address IS the canonical asset
+  // identifier. Crucially it is the SAME id /cmc/assets is keyed by, so CMC can map
+  // ticker → asset consistently (ticker.base_id === assets[key].contractAddress).
+  // Emitting the "unknown" sentinel 0 instead would make every pair unmappable.
   // ---------------------------------------------------------------
   router.get('/cmc/ticker', asyncHandler(async (req: Request, res: Response) => {
     const pairs = await buildPairs(req);

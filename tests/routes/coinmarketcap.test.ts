@@ -56,14 +56,15 @@ function extDbThatThrows(): ExternalDatabaseService {
   } as unknown as ExternalDatabaseService;
 }
 
-// Served DB that returns a corrupt (non-numeric) volume for an INCLUDED pair.
-function extDbWithMalformedVolume(): ExternalDatabaseService {
+// Served DB that returns a corrupt (non-numeric) metric for an INCLUDED pair.
+// `field` selects which one is poisoned so we can assert both volume and high/low
+// fail closed identically.
+function extDbWithMalformedMetric(field: 'base_volume_24h' | 'high_24h'): ExternalDatabaseService {
+  const base: any = { token: 'BASE1', base_volume_24h: '10', target_volume_24h: '5', high_24h: '0.06', low_24h: '0.04', trade_count_24h: 1 };
+  base[field] = 'not-a-number';
   return {
     isAvailable: () => true,
-    getSpotRolling24hMetrics: async () =>
-      new Map([
-        ['BASE1', { token: 'BASE1', base_volume_24h: 'not-a-number', target_volume_24h: '5', high_24h: '0', low_24h: '0', trade_count_24h: 1 }],
-      ]),
+    getSpotRolling24hMetrics: async () => new Map([['BASE1', base]]),
   } as unknown as ExternalDatabaseService;
 }
 
@@ -199,11 +200,21 @@ describe('CoinMarketCap Routes', () => {
     it('/cmc/summary surfaces malformed ETL volume for an included pair as 5xx', async () => {
       const app = createTestApp({
         futarchyService: futarchyReturning([dao('BASE1', 'USDC', 'DAOA')]),
-        externalDatabaseService: extDbWithMalformedVolume(),
+        externalDatabaseService: extDbWithMalformedMetric('base_volume_24h'),
       });
       const res = await request(app).get('/cmc/summary');
       expect(res.status).toBe(500);
-      expect(res.body.code).toBe('CMC_MALFORMED_VOLUME');
+      expect(res.body.code).toBe('CMC_MALFORMED_METRIC');
+    });
+
+    it('/cmc/summary surfaces a malformed non-zero 24h high as 5xx (not a silent omit)', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning([dao('BASE1', 'USDC', 'DAOA')]),
+        externalDatabaseService: extDbWithMalformedMetric('high_24h'),
+      });
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBe(500);
+      expect(res.body.code).toBe('CMC_MALFORMED_METRIC');
     });
   });
 
@@ -239,6 +250,21 @@ describe('CoinMarketCap Routes', () => {
       // Same fail-closed behavior on the DB-free /cmc/assets route.
       const assets = await request(app).get('/cmc/assets');
       expect(assets.status).toBe(503);
+    });
+
+    it('fails closed (503) when ONE of several allowlisted mints is missing (partial)', async () => {
+      // BASE1 IS discovered, BASE_GONE is not — a partial match must not serve a
+      // BASE1-only 200 that reads as "BASE_GONE delisted".
+      config.coinmarketcap.allowedMints.add('BASE1');
+      config.coinmarketcap.allowedMints.add('BASE_GONE');
+      const app = createTestApp({
+        futarchyService: futarchyReturning(DAOS),
+        externalDatabaseService: extDbWithMetrics(),
+      });
+
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('CMC_ALLOWLIST_NO_MATCH');
     });
   });
 });

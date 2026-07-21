@@ -101,9 +101,14 @@ a specific set of tokens; empty (the default) serves every discovered DAO.
 ]
 ```
 
+`base_currency` / `quote_currency` are Solana mint (contract) addresses — the
+same ids `/cmc/assets` is keyed by, so CMC maps pairs → assets consistently.
+
 `highest_price_24h` / `lowest_price_24h` are omitted when the ETL window has no
-real high/low. `price_change_percent_24h` is intentionally not reported — there
-is no reliable 24h-ago open, and a fabricated `0%` would be worse than omitting.
+real high/low. `price_change_percent_24h` is intentionally not reported — the
+served ETL exposes no reliable 24h-ago open, and this API never fabricates a
+financial value (a fake `0%` would be worse than omitting). The sibling CoinGecko
+`/api/tickers` adapter omits it for the same reason.
 
 #### GET `/cmc/ticker`
 
