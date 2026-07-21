@@ -56,12 +56,17 @@ function extDbThatThrows(): ExternalDatabaseService {
   } as unknown as ExternalDatabaseService;
 }
 
-// Served DB that returns a corrupt (non-numeric) metric for an INCLUDED pair.
-// `field` selects which one is poisoned so we can assert both volume and high/low
-// fail closed identically.
-function extDbWithMalformedMetric(field: 'base_volume_24h' | 'high_24h'): ExternalDatabaseService {
+// Served DB that returns a corrupt metric for an INCLUDED pair. `field` selects
+// which one is poisoned so we can assert both volume and high/low fail closed
+// identically; `bad` selects the corruption shape (fully non-numeric by default,
+// or a numeric-prefixed string like '12abc' that a lenient parseFloat would
+// silently truncate to 12).
+function extDbWithMalformedMetric(
+  field: 'base_volume_24h' | 'high_24h',
+  bad: string = 'not-a-number',
+): ExternalDatabaseService {
   const base: any = { token: 'BASE1', base_volume_24h: '10', target_volume_24h: '5', high_24h: '0.06', low_24h: '0.04', trade_count_24h: 1 };
-  base[field] = 'not-a-number';
+  base[field] = bad;
   return {
     isAvailable: () => true,
     getSpotRolling24hMetrics: async () => new Map([['BASE1', base]]),
@@ -249,6 +254,18 @@ describe('CoinMarketCap Routes', () => {
       const app = createTestApp({
         futarchyService: futarchyReturning([dao('BASE1', 'USDC', 'DAOA')]),
         externalDatabaseService: extDbWithMalformedMetric('high_24h'),
+      });
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBe(500);
+      expect(res.body.code).toBe('CMC_MALFORMED_METRIC');
+    });
+
+    it('/cmc/summary rejects a numeric-prefixed ETL volume rather than truncating it', async () => {
+      // parseFloat('12abc') === 12 would emit truncated financial data as a 200;
+      // the full-string parse must fail closed on the trailing garbage instead.
+      const app = createTestApp({
+        futarchyService: futarchyReturning([dao('BASE1', 'USDC', 'DAOA')]),
+        externalDatabaseService: extDbWithMalformedMetric('base_volume_24h', '12abc'),
       });
       const res = await request(app).get('/cmc/summary');
       expect(res.status).toBe(500);

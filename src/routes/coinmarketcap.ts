@@ -22,9 +22,16 @@ const PROTOCOL_FEE_RATE = config.fees.protocolFeeRate;
  * an INCLUDED pair means contract drift produced corrupt data — surface it as a
  * 500 (never a partial valid-looking 200). Same integrity rule for volume and
  * high/low so no corrupt field can slip through as a silently-omitted extreme.
+ *
+ * Uses a FULL-STRING numeric parse (Number, not parseFloat): parseFloat accepts
+ * a valid numeric prefix and silently drops the rest ("12abc" → 12), which would
+ * emit truncated financial data as a valid-looking 200. Number() rejects any
+ * trailing garbage outright (→ NaN). An empty/blank string is likewise rejected
+ * (Number('') is 0, which would masquerade as a genuine zero) so a missing field
+ * fails closed instead of reading as "no volume".
  */
 function parseFinite(raw: string, field: string, mint: string): number {
-  const value = parseFloat(raw);
+  const value = raw.trim() === '' ? NaN : Number(raw);
   if (!Number.isFinite(value)) {
     throw AppError.internal(
       `Malformed 24h ${field} from the served ETL for ${mint}`,
