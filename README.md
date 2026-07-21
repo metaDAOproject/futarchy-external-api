@@ -67,6 +67,13 @@ requirements. Served under `/cmc/`. The shapes mirror the CoinGecko adapter —
 CMC's DEX spec is field-for-field close — and both feeds are built from the same
 on-chain DAO discovery and rolling-24h ETL metrics.
 
+**API versioning.** At CMC's request, every endpoint is also served under an
+explicit version prefix: `/cmc/v1/summary`, `/cmc/v1/ticker`, `/cmc/v1/assets`.
+The unversioned paths remain published as-is and are treated as the current (v1)
+contract — the two are URL aliases for the same handler, so they never diverge.
+A future breaking change would land under `/cmc/v2/…` while the existing paths
+keep serving v1.
+
 `/cmc/summary` and `/cmc/ticker` carry 24h volume, so they require
 `DATABASE_PG_URL` and return `503` (never zero volume) if the served DB is
 unavailable. `/cmc/assets` is pure on-chain metadata and does not require it.
@@ -120,6 +127,10 @@ financial value (a fake `0%` would be worse than omitting). The sibling CoinGeck
   "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta_EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": {
     "base_id": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta",
     "quote_id": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "base_name": "ZKFG",
+    "base_symbol": "ZKFG",
+    "quote_name": "USD Coin",
+    "quote_symbol": "USDC",
     "last_price": 0.081340728222,
     "base_volume": 30024.8104,
     "quote_volume": 2441.23456789,

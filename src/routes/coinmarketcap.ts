@@ -35,6 +35,16 @@ function parseFinite(raw: string, field: string, mint: string): number {
 }
 
 /**
+ * Fallback identity label for a token. Shared by /cmc/ticker (inline name/symbol)
+ * and /cmc/assets so the two feeds ALWAYS report the same name/symbol for a given
+ * mint. Falls back to a mint prefix when on-chain metadata is missing — never an
+ * empty string, since CMC's DEX spec marks base/quote name+symbol mandatory.
+ */
+function identityLabel(value: string | undefined, mint: string): string {
+  return value || mint.slice(0, 8);
+}
+
+/**
  * Apply the optional CMC allowlist (config.coinmarketcap.allowedMints). An empty
  * allowlist means "serve every discovered DAO" — same default as the CoinGecko
  * and DexScreener adapters.
@@ -75,6 +85,10 @@ interface CmcPair {
   tradingPair: string; // `${baseMint}_${quoteMint}`
   baseId: string;
   quoteId: string;
+  baseName: string;
+  baseSymbol: string;
+  quoteName: string;
+  quoteSymbol: string;
   lastPrice: number;
   bid: number;
   ask: number;
@@ -82,6 +96,20 @@ interface CmcPair {
   quoteVolume: number;
   high24h?: number;
   low24h?: number;
+}
+
+// CMC asked us to version the API URL. We keep serving the original unversioned
+// paths (`/cmc/summary`, …) that are already published and consumed AS-IS, and
+// ALSO expose the identical handlers under an explicit `/cmc/v1/…` prefix so a
+// consumer can pin a version. Both prefixes map to the same handler — this is a
+// URL alias, not a behavioural fork — so the two stay in lockstep and there is
+// nothing to keep in sync. Introduce `/cmc/v2/…` only when a breaking change
+// forces it; the unversioned path is treated as the current (v1) contract.
+const CMC_PREFIXES = ['/cmc', '/cmc/v1'] as const;
+
+/** Both the unversioned and the v1-prefixed path for a CMC endpoint. */
+function cmcPaths(name: string): string[] {
+  return CMC_PREFIXES.map(prefix => `${prefix}/${name}`);
 }
 
 export function createCoinMarketCapRouter(services: ServiceGetters): Router {
@@ -137,7 +165,10 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
     const pairs: CmcPair[] = [];
     for (const dao of allDaos) {
       try {
-        const { daoAddress, baseMint, quoteMint, baseDecimals, quoteDecimals, poolData } = dao;
+        const {
+          daoAddress, baseMint, quoteMint, baseDecimals, quoteDecimals, poolData,
+          baseSymbol, baseName, quoteSymbol, quoteName,
+        } = dao;
 
         const lastPriceStr = priceService.calculatePrice(
           poolData.baseReserves,
@@ -181,6 +212,10 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
           tradingPair: `${baseMint.toString()}_${quoteMint.toString()}`,
           baseId: baseMint.toString(),
           quoteId: quoteMint.toString(),
+          baseName: identityLabel(baseName, baseMint.toString()),
+          baseSymbol: identityLabel(baseSymbol, baseMint.toString()),
+          quoteName: identityLabel(quoteName, quoteMint.toString()),
+          quoteSymbol: identityLabel(quoteSymbol, quoteMint.toString()),
           lastPrice: priceNum,
           bid: parseFloat(spread.bid),
           ask: parseFloat(spread.ask),
@@ -223,7 +258,7 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
   // a fake 0% — the sibling CoinGecko /api/tickers adapter omits it for the same
   // reason. Add it here only alongside a real 24h-open source.
   // ---------------------------------------------------------------
-  router.get('/cmc/summary', asyncHandler(async (req: Request, res: Response) => {
+  router.get(cmcPaths('summary'), asyncHandler(async (req: Request, res: Response) => {
     const pairs = await buildPairs(req);
 
     const summary: CoinMarketCapSummaryPair[] = pairs.map(p => {
@@ -256,7 +291,7 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
   // ticker → asset consistently (ticker.base_id === assets[key].contractAddress).
   // Emitting the "unknown" sentinel 0 instead would make every pair unmappable.
   // ---------------------------------------------------------------
-  router.get('/cmc/ticker', asyncHandler(async (req: Request, res: Response) => {
+  router.get(cmcPaths('ticker'), asyncHandler(async (req: Request, res: Response) => {
     const pairs = await buildPairs(req);
 
     const ticker: CoinMarketCapTickerResponse = {};
@@ -264,6 +299,10 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
       const entry: CoinMarketCapTicker = {
         base_id: p.baseId,
         quote_id: p.quoteId,
+        base_name: p.baseName,
+        base_symbol: p.baseSymbol,
+        quote_name: p.quoteName,
+        quote_symbol: p.quoteSymbol,
         last_price: p.lastPrice,
         base_volume: p.baseVolume,
         quote_volume: p.quoteVolume,
@@ -282,7 +321,7 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
   // it does NOT require the served DB. Exposes both the base and quote token of
   // every (allowlisted) pair.
   // ---------------------------------------------------------------
-  router.get('/cmc/assets', asyncHandler(async (req: Request, res: Response) => {
+  router.get(cmcPaths('assets'), asyncHandler(async (req: Request, res: Response) => {
     const futarchyService = getFutarchyService();
     const allDaos = filterAllowed(await futarchyService.getAllDaos());
 
@@ -293,8 +332,8 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
       // shared quote (USDC) is identical across pairs, so skipping re-adds is safe.
       if (assets[mint]) return;
       const asset: CoinMarketCapAsset = {
-        name: name || mint.slice(0, 8),
-        symbol: symbol || mint.slice(0, 8),
+        name: identityLabel(name, mint),
+        symbol: identityLabel(symbol, mint),
         contractAddress: mint,
         can_withdraw: 'true',
         can_deposit: 'true',

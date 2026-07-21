@@ -14,6 +14,14 @@
 export interface CoinMarketCapTicker {
   base_id: string;
   quote_id: string;
+  // Token identity carried INLINE, per CMC's Section C "Uniswap Sample" DEX spec
+  // (a DEX has no symbol-keyed listing, so name/symbol travel with the pair). Same
+  // values as /cmc/assets keyed by base_id/quote_id — the two feeds stay consistent.
+  // Mirrors the sibling CoinGecko /api/tickers adapter, which emits these inline too.
+  base_name: string;
+  base_symbol: string;
+  quote_name: string;
+  quote_symbol: string;
   last_price: number;
   base_volume: number;
   quote_volume: number;

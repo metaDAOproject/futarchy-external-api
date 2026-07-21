@@ -134,10 +134,48 @@ describe('CoinMarketCap Routes', () => {
       const t = res.body['BASE1_USDC'];
       expect(t.base_id).toBe('BASE1');
       expect(t.quote_id).toBe('USDC');
+      // Identity carried inline per CMC's Section C DEX spec, consistent with
+      // /cmc/assets keyed by base_id/quote_id.
+      expect(t.base_symbol).toBe('BASE1SYM');
+      expect(t.base_name).toBe('BASE1 Name');
+      expect(t.quote_symbol).toBe('USDC');
+      expect(t.quote_name).toBe('USD Coin');
       expect(t.last_price).toBe(0.05);
       expect(t.base_volume).toBe(100);
       expect(t.quote_volume).toBe(5);
       expect(t.isFrozen).toBe(0);
+    });
+
+    it('falls back to a mint prefix for inline symbol/name when metadata is missing', async () => {
+      // A DAO whose base metadata never resolved on-chain: baseSymbol/baseName
+      // undefined. The ticker must still emit a non-empty string (CMC marks these
+      // mandatory) and match what /cmc/assets reports for the same mint.
+      const noMeta = {
+        daoAddress: pk('DAOC'),
+        baseMint: pk('BASENOMETA1234567890'),
+        quoteMint: pk('USDC'),
+        baseDecimals: 6,
+        quoteDecimals: 6,
+        baseSymbol: undefined,
+        baseName: undefined,
+        quoteSymbol: 'USDC',
+        quoteName: 'USD Coin',
+        poolData: { baseReserves: {}, quoteReserves: {}, baseProtocolFees: {}, quoteProtocolFees: {} },
+      } as unknown as DaoTickerData;
+
+      const app = createTestApp({
+        futarchyService: futarchyReturning([noMeta]),
+        externalDatabaseService: extDbWithMetrics(),
+      });
+
+      const tRes = await request(app).get('/cmc/ticker');
+      const t = tRes.body['BASENOMETA1234567890_USDC'];
+      expect(t.base_symbol).toBe('BASENOME');
+      expect(t.base_name).toBe('BASENOME');
+
+      const aRes = await request(app).get('/cmc/assets');
+      expect(aRes.body['BASENOMETA1234567890'].symbol).toBe(t.base_symbol);
+      expect(aRes.body['BASENOMETA1234567890'].name).toBe(t.base_name);
     });
 
     it('returns 503 when the served DB is unavailable', async () => {
@@ -215,6 +253,53 @@ describe('CoinMarketCap Routes', () => {
       const res = await request(app).get('/cmc/summary');
       expect(res.status).toBe(500);
       expect(res.body.code).toBe('CMC_MALFORMED_METRIC');
+    });
+  });
+
+  describe('API versioning (/cmc/v1 alias)', () => {
+    // CMC asked for a versioned URL. The /cmc/v1/* paths must be exact aliases of
+    // the unversioned handlers — same body, same status, same failure semantics.
+    it('serves /cmc/v1/summary identically to /cmc/summary', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning(DAOS),
+        externalDatabaseService: extDbWithMetrics(),
+      });
+
+      const unversioned = await request(app).get('/cmc/summary');
+      const versioned = await request(app).get('/cmc/v1/summary');
+      expect(versioned.status).toBe(200);
+      expect(versioned.body).toEqual(unversioned.body);
+    });
+
+    it('serves /cmc/v1/ticker identically to /cmc/ticker', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning(DAOS),
+        externalDatabaseService: extDbWithMetrics(),
+      });
+
+      const unversioned = await request(app).get('/cmc/ticker');
+      const versioned = await request(app).get('/cmc/v1/ticker');
+      expect(versioned.status).toBe(200);
+      expect(versioned.body).toEqual(unversioned.body);
+    });
+
+    it('serves /cmc/v1/assets identically to /cmc/assets', async () => {
+      const app = createTestApp({ futarchyService: futarchyReturning(DAOS) });
+
+      const unversioned = await request(app).get('/cmc/assets');
+      const versioned = await request(app).get('/cmc/v1/assets');
+      expect(versioned.status).toBe(200);
+      expect(versioned.body).toEqual(unversioned.body);
+    });
+
+    it('preserves fail-closed semantics on the versioned path (503 when served DB is down)', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning(DAOS),
+        externalDatabaseService: { isAvailable: () => false } as unknown as ExternalDatabaseService,
+      });
+      const res = await request(app).get('/cmc/v1/summary');
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('SERVED_DB_UNAVAILABLE');
     });
   });
 

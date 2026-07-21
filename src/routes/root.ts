@@ -28,7 +28,7 @@ export function createRootRouter(_services: ServiceGetters): Router {
         events: '/dexscreener/events?fromBlock=:slot&toBlock=:slot - Swap events by slot range',
       },
       coinmarketcap: {
-        description: 'CoinMarketCap DEX Adapter [Section C] — requires DATABASE_PG_URL for summary/ticker',
+        description: 'CoinMarketCap DEX Adapter [Section C] — requires DATABASE_PG_URL for summary/ticker. Also served under a versioned /cmc/v1 prefix (e.g. /cmc/v1/summary).',
         summary: '/cmc/summary - 24h overview of every tradeable pair',
         ticker: '/cmc/ticker - 24h price/volume keyed by BASE_QUOTE pair',
         assets: '/cmc/assets - Token identity keyed by mint address',
