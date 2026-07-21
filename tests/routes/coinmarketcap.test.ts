@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { createTestApp } from '../helpers/testApp.js';
 import request from 'supertest';
+import { config } from '../../src/config.js';
 import type { FutarchyService, DaoTickerData } from '../../src/services/futarchyService.js';
 import type { ExternalDatabaseService } from '../../src/services/externalDatabaseService.js';
 
@@ -44,9 +45,37 @@ function extDbWithMetrics(): ExternalDatabaseService {
   } as unknown as ExternalDatabaseService;
 }
 
+// Served DB whose 24h-metrics query throws (contract drift / query failure) — a
+// financial feed must surface this as 5xx, never as an empty/partial 200.
+function extDbThatThrows(): ExternalDatabaseService {
+  return {
+    isAvailable: () => true,
+    getSpotRolling24hMetrics: async () => {
+      throw new Error('query failed');
+    },
+  } as unknown as ExternalDatabaseService;
+}
+
+// Served DB that returns a corrupt (non-numeric) volume for an INCLUDED pair.
+function extDbWithMalformedVolume(): ExternalDatabaseService {
+  return {
+    isAvailable: () => true,
+    getSpotRolling24hMetrics: async () =>
+      new Map([
+        ['BASE1', { token: 'BASE1', base_volume_24h: 'not-a-number', target_volume_24h: '5', high_24h: '0', low_24h: '0', trade_count_24h: 1 }],
+      ]),
+  } as unknown as ExternalDatabaseService;
+}
+
 const DAOS = [dao('BASE1', 'USDC', 'DAOA'), dao('BASE2', 'USDC', 'DAOB')];
 
 describe('CoinMarketCap Routes', () => {
+  // The allowlist lives on the config singleton; a couple of tests mutate it, so
+  // always reset to the default (empty = serve all) afterward.
+  afterEach(() => {
+    config.coinmarketcap.allowedMints.clear();
+  });
+
   describe('GET /cmc/summary', () => {
     it('returns a 24h summary array with price, spread, and volume per pair', async () => {
       const app = createTestApp({
@@ -144,6 +173,72 @@ describe('CoinMarketCap Routes', () => {
       const res = await request(app).get('/cmc/assets');
       expect(res.status).toBe(200);
       expect(Object.keys(res.body)).toContain('BASE1');
+    });
+  });
+
+  describe('served-DB failure semantics (never a partial 200)', () => {
+    it('/cmc/summary surfaces a 24h-metrics query failure as 5xx with no feed body', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning(DAOS),
+        externalDatabaseService: extDbThatThrows(),
+      });
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(Array.isArray(res.body)).toBe(false);
+    });
+
+    it('/cmc/ticker surfaces a 24h-metrics query failure as 5xx', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning(DAOS),
+        externalDatabaseService: extDbThatThrows(),
+      });
+      const res = await request(app).get('/cmc/ticker');
+      expect(res.status).toBeGreaterThanOrEqual(500);
+    });
+
+    it('/cmc/summary surfaces malformed ETL volume for an included pair as 5xx', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning([dao('BASE1', 'USDC', 'DAOA')]),
+        externalDatabaseService: extDbWithMalformedVolume(),
+      });
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBe(500);
+      expect(res.body.code).toBe('CMC_MALFORMED_VOLUME');
+    });
+  });
+
+  describe('CMC_ALLOWED_MINTS filtering', () => {
+    it('serves only allowlisted base mints when the allowlist is set', async () => {
+      config.coinmarketcap.allowedMints.add('BASE1');
+      const app = createTestApp({
+        futarchyService: futarchyReturning(DAOS),
+        externalDatabaseService: extDbWithMetrics(),
+      });
+
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(1);
+      expect(res.body[0].trading_pairs).toBe('BASE1_USDC');
+
+      // /cmc/assets respects the same allowlist (only BASE1 + its quote).
+      const assets = await request(app).get('/cmc/assets');
+      expect(Object.keys(assets.body).sort()).toEqual(['BASE1', 'USDC']);
+    });
+
+    it('fails closed (503) when the allowlist matches zero discovered DAOs', async () => {
+      config.coinmarketcap.allowedMints.add('NOTADISCOVEREDMINT');
+      const app = createTestApp({
+        futarchyService: futarchyReturning(DAOS),
+        externalDatabaseService: extDbWithMetrics(),
+      });
+
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('CMC_ALLOWLIST_NO_MATCH');
+
+      // Same fail-closed behavior on the DB-free /cmc/assets route.
+      const assets = await request(app).get('/cmc/assets');
+      expect(assets.status).toBe(503);
     });
   });
 });

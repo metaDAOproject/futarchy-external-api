@@ -320,7 +320,7 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | `TRUSTED_RATE_LIMIT_MAX` | Per-bucket request count per minute for trusted keys | `600` |
 | `CACHE_TICKERS_TTL` | On-chain data cache TTL (ms) | `55000` |
 | **Served indexer DB (required — the only database this API uses)** | | |
-| `DATABASE_PG_URL` | Read-only connection to the served indexer DB (Meteora, tickers, DexScreener, first-trade-dates). **Required** — `/api/market-data` returns 503 without it. | — |
+| `DATABASE_PG_URL` | Read-only connection to the served indexer DB (Meteora, tickers, DexScreener, first-trade-dates). **Required** — `/api/market-data`, `/api/tickers`, `/cmc/summary`, `/cmc/ticker`, and the DexScreener routes return 503 without it. | — |
 | `DATABASE_PG_SSL` | Enable SSL (server cert verified against system CAs) | `false` |
 | `DATABASE_PG_CA_CERT` | PEM CA cert content for private-CA verification | — |
 | `DATABASE_PG_SSL_NO_VERIFY` | Explicit opt-out of TLS verification (stopgap only) | `false` |
@@ -330,6 +330,7 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | **Protocol** | | |
 | `PROTOCOL_FEE_RATE` | Protocol fee rate | `0.005` (0.5%) |
 | `EXCLUDED_DAOS` | Comma-separated DAO addresses to exclude | — |
+| `CMC_ALLOWED_MINTS` | Comma-separated base-mint allowlist for the `/cmc/*` routes; empty serves all. Validated at startup; if set but matching zero discovered DAOs, the CMC routes fail closed with 503. | — |
 | **Alerts** | | |
 | `ALERT_WEBHOOK_URL` | Telegram alert webhook URL | — |
 | `ALERT_WEBHOOK_SECRET` | Webhook secret | — |

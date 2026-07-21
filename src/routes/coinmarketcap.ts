@@ -21,11 +21,28 @@ const PROTOCOL_FEE_RATE = config.fees.protocolFeeRate;
  * Apply the optional CMC allowlist (config.coinmarketcap.allowedMints). An empty
  * allowlist means "serve every discovered DAO" — same default as the CoinGecko
  * and DexScreener adapters.
+ *
+ * Fails CLOSED when an allowlist is configured but matches ZERO discovered DAOs:
+ * that is a misconfiguration (stale/wrong mint) or an upstream discovery outage,
+ * and returning an empty 200 would read as "every listed market delisted" to a
+ * poller. We surface it as 503 + alert instead so it retries and we get paged,
+ * rather than silently serving an empty feed.
  */
 function filterAllowed(daos: DaoTickerData[]): DaoTickerData[] {
   const allowed = config.coinmarketcap.allowedMints;
   if (allowed.size === 0) return daos;
-  return daos.filter(dao => allowed.has(dao.baseMint.toString()));
+  const filtered = daos.filter(dao => allowed.has(dao.baseMint.toString()));
+  if (filtered.length === 0) {
+    sendAlert(
+      `CMC_ALLOWED_MINTS matched none of ${daos.length} discovered DAOs — refusing to serve an empty feed`,
+      { cooldownKey: 'cmc-allowlist-no-match', cooldownMs: 10 * 60 * 1000 }
+    );
+    throw AppError.serviceUnavailable(
+      'CMC allowlist matched no discovered markets',
+      'CMC_ALLOWLIST_NO_MATCH'
+    );
+  }
+  return filtered;
 }
 
 /**
@@ -113,10 +130,26 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
         const spread = priceService.calculateSpread(priceNum);
         if (!spread) continue;
 
+        // Volume semantics for a financial feed:
+        //  - metrics ABSENT  → the pair simply had no spot trades in 24h; 0 is the
+        //    genuine, correct volume (not an error).
+        //  - metrics PRESENT but non-finite → served-DB contract drift produced a
+        //    corrupt SUM for an INCLUDED pair. Do NOT silently drop it (that would
+        //    turn schema drift into a partial 200); throw so the whole request
+        //    fails as 5xx via asyncHandler and we get paged.
         const metrics = volumeByDao.get(daoAddress.toString());
-        const baseVolume = metrics ? parseFloat(metrics.base_volume_24h) : 0;
-        const quoteVolume = metrics ? parseFloat(metrics.target_volume_24h) : 0;
-        if (!Number.isFinite(baseVolume) || !Number.isFinite(quoteVolume)) continue;
+        let baseVolume = 0;
+        let quoteVolume = 0;
+        if (metrics) {
+          baseVolume = parseFloat(metrics.base_volume_24h);
+          quoteVolume = parseFloat(metrics.target_volume_24h);
+          if (!Number.isFinite(baseVolume) || !Number.isFinite(quoteVolume)) {
+            throw AppError.internal(
+              `Malformed 24h volume from the served ETL for ${baseMint.toString()}`,
+              'CMC_MALFORMED_VOLUME'
+            );
+          }
+        }
 
         const pair: CmcPair = {
           tradingPair: `${baseMint.toString()}_${quoteMint.toString()}`,
@@ -142,13 +175,17 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
 
         pairs.push(pair);
       } catch (error) {
-        // Per-pair skip ONLY (identical to the CoinGecko adapter's per-ticker
-        // catch): drop a single pair whose price/spread/volume can't be computed
-        // so one bad pool doesn't sink the whole feed. This does NOT mask an
-        // infrastructure/data outage as a 200 — those surface as 5xx before we
-        // reach here: getAllDaos() throws (its "refusing to serve an empty set"
-        // guard) if the RPC scan degrades, and getSpotRolling24hMetrics() throws
-        // on any served-DB/query failure. Both propagate via asyncHandler.
+        // Intentional financial-integrity failures (AppError, e.g. malformed ETL
+        // volume above) MUST propagate — rethrow so the request fails 5xx rather
+        // than being downgraded to a silently-dropped pair.
+        if (error instanceof AppError) throw error;
+        // Otherwise this is a per-pair skip ONLY (identical to the CoinGecko
+        // adapter's per-ticker catch): drop a single pair whose price/spread can't
+        // be computed so one bad pool doesn't sink the whole feed. This does NOT
+        // mask an infrastructure/data outage as a 200 — those surface as 5xx
+        // before we reach here: getAllDaos() throws (its "refusing to serve an
+        // empty set" guard) if the RPC scan degrades, and getSpotRolling24hMetrics()
+        // throws on any served-DB/query failure. Both propagate via asyncHandler.
         logger.error('Error building CMC pair', error, {
           daoAddress: dao.daoAddress.toString(),
           requestId: req.requestId,
