@@ -142,6 +142,13 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
 
         pairs.push(pair);
       } catch (error) {
+        // Per-pair skip ONLY (identical to the CoinGecko adapter's per-ticker
+        // catch): drop a single pair whose price/spread/volume can't be computed
+        // so one bad pool doesn't sink the whole feed. This does NOT mask an
+        // infrastructure/data outage as a 200 — those surface as 5xx before we
+        // reach here: getAllDaos() throws (its "refusing to serve an empty set"
+        // guard) if the RPC scan degrades, and getSpotRolling24hMetrics() throws
+        // on any served-DB/query failure. Both propagate via asyncHandler.
         logger.error('Error building CMC pair', error, {
           daoAddress: dao.daoAddress.toString(),
           requestId: req.requestId,
@@ -163,6 +170,7 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
         trading_pairs: p.tradingPair,
         base_currency: p.baseId,
         quote_currency: p.quoteId,
+        type: 'spot',
         last_price: p.lastPrice,
         lowest_ask: p.ask,
         highest_bid: p.bid,

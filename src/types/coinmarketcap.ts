@@ -29,6 +29,10 @@ export interface CoinMarketCapSummaryPair {
   trading_pairs: string;
   base_currency: string;
   quote_currency: string;
+  // Market-type discriminator. Always 'spot': getPoolData only ever selects the
+  // DAO's spot pool (conditional pass/fail pools are explicitly ignored), so
+  // every pair we surface is a spot market.
+  type: 'spot';
   last_price: number;
   lowest_ask: number;
   highest_bid: number;

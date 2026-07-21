@@ -89,6 +89,7 @@ a specific set of tokens; empty (the default) serves every discovered DAO.
     "trading_pairs": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta_EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "base_currency": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta",
     "quote_currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "type": "spot",
     "last_price": 0.081340728222,
     "lowest_ask": 0.081747431863,
     "highest_bid": 0.080934024581,

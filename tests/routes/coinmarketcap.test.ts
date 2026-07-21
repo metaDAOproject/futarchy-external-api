@@ -62,6 +62,7 @@ describe('CoinMarketCap Routes', () => {
       const a = res.body.find((p: any) => p.trading_pairs === 'BASE1_USDC');
       expect(a.base_currency).toBe('BASE1');
       expect(a.quote_currency).toBe('USDC');
+      expect(a.type).toBe('spot');
       expect(a.last_price).toBe(0.05);
       // Mock PriceService spread → bid 0.04975 / ask 0.05025.
       expect(a.lowest_ask).toBe(0.05025);
