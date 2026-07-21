@@ -51,6 +51,19 @@ export const config = {
     // Protocol fee rate (0.005 = 0.5%); used to report fee bps on DexScreener routes.
     protocolFeeRate: parseFloat(process.env.PROTOCOL_FEE_RATE || '0.005'),
   },
+  coinmarketcap: {
+    // Optional allowlist of base-mint addresses exposed on the CoinMarketCap
+    // routes. Empty (the default) means "serve every discovered DAO", matching
+    // the CoinGecko/DexScreener adapters. When set, ONLY these base mints appear
+    // — this is how we map our tokens onto CMC's expected asset ids without
+    // leaking test/never-listed DAOs into the CMC feed.
+    allowedMints: new Set<string>(
+      (process.env.CMC_ALLOWED_MINTS || '')
+        .split(',')
+        .map(m => m.trim())
+        .filter(Boolean)
+    ),
+  },
   alerts: {
     webhookUrl: process.env.ALERT_WEBHOOK_URL || 'https://telegram-webhook-relay.themetadao-org.workers.dev',
     webhookSecret: process.env.ALERT_WEBHOOK_SECRET || '',

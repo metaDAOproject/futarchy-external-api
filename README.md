@@ -60,6 +60,89 @@ served DB is unavailable, the endpoint returns `503` instead of reporting zero v
 
 ---
 
+### CoinMarketCap Endpoints
+
+Implements the DEX endpoints from [Section C] of CoinMarketCap's integration
+requirements. Served under `/cmc/`. The shapes mirror the CoinGecko adapter —
+CMC's DEX spec is field-for-field close — and both feeds are built from the same
+on-chain DAO discovery and rolling-24h ETL metrics.
+
+`/cmc/summary` and `/cmc/ticker` carry 24h volume, so they require
+`DATABASE_PG_URL` and return `503` (never zero volume) if the served DB is
+unavailable. `/cmc/assets` is pure on-chain metadata and does not require it.
+
+No dedicated auth: like every route, CMC reuses the shared rate-limit tiers —
+anonymous by IP, or the elevated per-key bucket when a trusted `X-API-Key`
+(`TRUSTED_API_KEYS`) is sent.
+
+Set `CMC_ALLOWED_MINTS` (comma-separated base mints) to restrict the CMC feed to
+a specific set of tokens; empty (the default) serves every discovered DAO.
+
+#### GET `/cmc/summary`
+
+24h overview of every tradeable pair.
+
+**Response:**
+```json
+[
+  {
+    "trading_pairs": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta_EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "base_currency": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta",
+    "quote_currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "last_price": 0.081340728222,
+    "lowest_ask": 0.081747431863,
+    "highest_bid": 0.080934024581,
+    "base_volume": 30024.8104,
+    "quote_volume": 2441.23456789,
+    "highest_price_24h": 0.085,
+    "lowest_price_24h": 0.078
+  }
+]
+```
+
+`highest_price_24h` / `lowest_price_24h` are omitted when the ETL window has no
+real high/low. `price_change_percent_24h` is intentionally not reported — there
+is no reliable 24h-ago open, and a fabricated `0%` would be worse than omitting.
+
+#### GET `/cmc/ticker`
+
+24h price and volume keyed by the `BASE_QUOTE` trading pair.
+
+**Response:**
+```json
+{
+  "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta_EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": {
+    "base_id": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta",
+    "quote_id": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "last_price": 0.081340728222,
+    "base_volume": 30024.8104,
+    "quote_volume": 2441.23456789,
+    "isFrozen": 0
+  }
+}
+```
+
+#### GET `/cmc/assets`
+
+Token identity keyed by mint address (both base and quote of every pair).
+
+**Response:**
+```json
+{
+  "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta": {
+    "name": "ZKFG",
+    "symbol": "ZKFG",
+    "contractAddress": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta",
+    "can_withdraw": "true",
+    "can_deposit": "true",
+    "maker_fee": 0.005,
+    "taker_fee": 0.005
+  }
+}
+```
+
+---
+
 ### DexScreener Adapter Endpoints
 
 Implements the [DexScreener Adapter Spec v1.1](https://dexscreener.notion.site/DEX-Screener-Adapter-Specs-cc1223cdf6e74a7799599106b65dcd0e). All endpoints are served under `/dexscreener/`. Requires `DATABASE_PG_URL` to be configured for the served DB.
@@ -263,6 +346,7 @@ src/
 ├── routes/
 │   ├── index.ts                  # Route registration
 │   ├── coingecko.ts              # GET /api/tickers
+│   ├── coinmarketcap.ts          # CoinMarketCap DEX adapter (summary/ticker/assets)
 │   ├── dexscreener.ts            # DexScreener adapter (4 endpoints)
 │   ├── market.ts                 # GET /api/market-data (user_pool ETL)
 │   ├── supply.ts                 # GET /api/supply/*
@@ -278,6 +362,7 @@ src/
 │   └── metricsService.ts         # Prometheus counters/histograms
 ├── types/
 │   ├── coingecko.ts              # CoinGecko response types
+│   ├── coinmarketcap.ts          # CoinMarketCap response types
 │   └── dexscreener.ts            # DexScreener response types
 ├── middleware/
 │   ├── errorHandler.ts           # Error handling & asyncHandler
