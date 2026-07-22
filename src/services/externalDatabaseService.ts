@@ -164,6 +164,14 @@ export class ExternalDatabaseService {
    * absent from the map: a 24h change is undefined for a market younger than 24h,
    * and the caller omits the field rather than fabricate one. Throws (never masks
    * as empty) on connection/query failure, exactly like getSpotRolling24hMetrics.
+   *
+   * DISTINCT ON picks ONE row per base_mint; the ORDER BY must therefore break
+   * every tie deterministically or the plan could pick a non-final reserve state
+   * when several swaps share the same block_time. We extend block_time DESC with
+   * the same event-order columns the DexScreener /events route uses (slot, then
+   * within-transaction inner_group/inner_ix, with signature to disambiguate
+   * distinct txns in one slot) — highest wins, so the selected row is truly the
+   * last swap at or before the cutoff.
    */
   async getSpotReserves24hAgo(tokens: string[]): Promise<Map<string, { baseReserves: string; quoteReserves: string }>> {
     if (tokens.length === 0) {
@@ -189,7 +197,7 @@ export class ExternalDatabaseService {
            AND amm_base_reserves IS NOT NULL
            AND amm_quote_reserves IS NOT NULL
            AND amm_base_reserves > 0
-         ORDER BY base_mint, block_time DESC`,
+         ORDER BY base_mint, block_time DESC, slot DESC, signature DESC, inner_group DESC, inner_ix DESC`,
         [cutoff, tokens]
       );
 
