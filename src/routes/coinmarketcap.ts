@@ -85,6 +85,60 @@ function filterAllowed(daos: DaoTickerData[]): DaoTickerData[] {
 }
 
 /**
+ * Fail CLOSED when two served DAOs share a base mint.
+ *
+ * Every CMC feed keys its per-token financial data by base mint: rolling-24h
+ * volume/high/low (user_pool_spot_ohlcv, GROUP BY token), the 24h-ago reference
+ * reserves behind price_change_percent_24h (user_pool_swaps, DISTINCT ON
+ * base_mint), and the /cmc/assets identity entry. None of those served-ETL
+ * tables carry a per-pool dimension, so if one base mint trades in more than one
+ * discovered market there is NO way to attribute volume / price / metadata to the
+ * right pair — one market's numbers would be silently served for another, and the
+ * pair that loses the base-mint→dao key collision would be emitted with a false
+ * zero volume. Rather than serve mis-attributed financial data, refuse the whole
+ * feed with a 503 + alert so a poller retries and we get paged.
+ *
+ * In the futarchy model each DAO launches its own token, so a base-mint collision
+ * is not expected in practice — it signals a launch anomaly, an EXCLUDED_DAOS
+ * gap, or a discovery bug, exactly the kind of thing that should page rather than
+ * quietly emit wrong numbers. Runs AFTER the allowlist filter, so a collision
+ * that the operator has already narrowed away (only one side allowlisted) is not
+ * treated as ambiguous.
+ */
+function assertUniqueBaseMints(daos: DaoTickerData[]): void {
+  const seen = new Set<string>();
+  const collisions = new Set<string>();
+  for (const dao of daos) {
+    const mint = dao.baseMint.toString();
+    if (seen.has(mint)) collisions.add(mint);
+    else seen.add(mint);
+  }
+  if (collisions.size > 0) {
+    const mints = [...collisions].join(', ');
+    sendAlert(
+      `CMC discovered multiple DAOs sharing a base mint (${mints}) — served ETL metrics are keyed by base mint and cannot be attributed per market; refusing to serve mis-attributed data`,
+      { cooldownKey: 'cmc-duplicate-base-mint', cooldownMs: 10 * 60 * 1000 }
+    );
+    throw AppError.serviceUnavailable(
+      'CMC discovered multiple markets sharing a base mint',
+      'CMC_DUPLICATE_BASE_MINT'
+    );
+  }
+}
+
+/**
+ * The DAO set every CMC endpoint serves: apply the operator allowlist, then
+ * assert no two survivors share a base mint. Both feeds (buildPairs and the
+ * DB-free /cmc/assets route) go through this so their notion of "which markets
+ * exist" — and the fail-closed guards around it — can never diverge.
+ */
+function servedDaos(daos: DaoTickerData[]): DaoTickerData[] {
+  const filtered = filterAllowed(daos);
+  assertUniqueBaseMints(filtered);
+  return filtered;
+}
+
+/**
  * A single tradeable pair, enriched with live price/spread (from spot reserves)
  * and rolling-24h volume/high/low (from the served ETL). Shared by /cmc/summary
  * and /cmc/ticker so both feeds are always internally consistent.
@@ -152,7 +206,7 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
       throw AppError.serviceUnavailable('Served database not available', 'SERVED_DB_UNAVAILABLE');
     }
 
-    const allDaos = filterAllowed(await futarchyService.getAllDaos());
+    const allDaos = servedDaos(await futarchyService.getAllDaos());
 
     // Rolling-24h spot metrics keyed by base mint (token) → mapped to dao (pool_id),
     // identical to the CoinGecko adapter's single source.
@@ -378,13 +432,15 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
   // ---------------------------------------------------------------
   router.get(cmcPaths('assets'), asyncHandler(async (req: Request, res: Response) => {
     const futarchyService = getFutarchyService();
-    const allDaos = filterAllowed(await futarchyService.getAllDaos());
+    const allDaos = servedDaos(await futarchyService.getAllDaos());
 
     const assets: CoinMarketCapAssetsResponse = {};
 
     const addAsset = (mint: string, symbol: string | undefined, name: string | undefined): void => {
-      // First writer wins: the base token's own metadata is authoritative, and a
-      // shared quote (USDC) is identical across pairs, so skipping re-adds is safe.
+      // First writer wins. servedDaos() guarantees base mints are unique across
+      // the served set, so the ONLY re-add here is a shared quote (e.g. USDC),
+      // identical across pairs — skipping it is safe and cannot mask a divergent
+      // base-token identity (that case fails closed upstream via assertUniqueBaseMints).
       if (assets[mint]) return;
       const asset: CoinMarketCapAsset = {
         name: identityLabel(name, mint),

@@ -375,6 +375,66 @@ describe('CoinMarketCap Routes', () => {
     });
   });
 
+  describe('duplicate base mint (fail closed — per-market attribution is impossible)', () => {
+    // Two DAOs, same base mint, different pools. The served ETL keys volume /
+    // 24h-ago reserves / identity by base mint with no per-pool dimension, so we
+    // cannot attribute them to the right pair — every CMC feed must 503, never
+    // serve one market's numbers for another (or a false zero for the loser).
+    const COLLIDING = [
+      dao('BASE1', 'USDC', 'DAOA'),
+      dao('BASE1', 'USDC', 'DAOB'),
+    ];
+
+    it('fails closed (503) on /cmc/summary when two DAOs share a base mint', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning(COLLIDING),
+        externalDatabaseService: extDbWithMetrics(),
+      });
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('CMC_DUPLICATE_BASE_MINT');
+    });
+
+    it('fails closed (503) on /cmc/ticker when two DAOs share a base mint', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning(COLLIDING),
+        externalDatabaseService: extDbWithMetrics(),
+      });
+      const res = await request(app).get('/cmc/ticker');
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('CMC_DUPLICATE_BASE_MINT');
+    });
+
+    it('fails closed (503) on the DB-free /cmc/assets when two DAOs share a base mint', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning(COLLIDING),
+        externalDatabaseService: extDbWithMetrics(),
+      });
+      const res = await request(app).get('/cmc/assets');
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('CMC_DUPLICATE_BASE_MINT');
+    });
+
+    it('serves normally (200) when the allowlist narrows a collision to a single market', async () => {
+      // A shared quote (USDC) across DISTINCT base mints is NOT a collision — the
+      // default DAOS set must still serve. And when only one side of a real base-
+      // mint collision is allowlisted, the guard (which runs AFTER the allowlist)
+      // no longer sees ambiguity, so the feed serves the surviving pair.
+      config.coinmarketcap.allowedMints.add('BASE1');
+      const app = createTestApp({
+        futarchyService: futarchyReturning([
+          dao('BASE1', 'USDC', 'DAOA'),
+          dao('BASE2', 'USDC', 'DAOB'),
+        ]),
+        externalDatabaseService: extDbWithMetrics(),
+      });
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(1);
+      expect(res.body[0].trading_pairs).toBe('BASE1_USDC');
+    });
+  });
+
   describe('price_change_percent_24h (from AMM swap history)', () => {
     // last_price comes from the (empty) live poolData reserves → the mock returns
     // its default 0.05. For the 24h-ago reserves we return raw values the route

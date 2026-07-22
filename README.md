@@ -85,6 +85,16 @@ anonymous by IP, or the elevated per-key bucket when a trusted `X-API-Key`
 Set `CMC_ALLOWED_MINTS` (comma-separated base mints) to restrict the CMC feed to
 a specific set of tokens; empty (the default) serves every discovered DAO.
 
+Every CMC feed keys its per-token data (24h volume/high/low, the 24h-ago
+reference reserves, and the `/cmc/assets` identity entry) by **base mint**, and
+the served-ETL tables carry no per-pool dimension. If two discovered markets ever
+share a base mint the numbers can't be attributed to the right pair, so all three
+endpoints **fail closed** with `503` (`CMC_DUPLICATE_BASE_MINT`) rather than serve
+one market's volume/price for another. The check runs after `CMC_ALLOWED_MINTS`,
+so narrowing the allowlist to a single side of a collision serves normally. In the
+futarchy model each DAO launches its own token, so this is an anomaly guard, not
+an expected path.
+
 #### GET `/cmc/summary`
 
 24h overview of every tradeable pair.
