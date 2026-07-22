@@ -4,6 +4,7 @@ import request from 'supertest';
 import { config } from '../../src/config.js';
 import type { FutarchyService, DaoTickerData } from '../../src/services/futarchyService.js';
 import type { ExternalDatabaseService } from '../../src/services/externalDatabaseService.js';
+import type { PriceService } from '../../src/services/priceService.js';
 
 // Minimal DAO stand-ins: buildPairs only ever calls `.toString()` on the pubkey
 // fields and reads decimals/poolData, and the mock PriceService (testApp) ignores
@@ -42,6 +43,9 @@ function extDbWithMetrics(): ExternalDatabaseService {
         ['BASE1', { token: 'BASE1', base_volume_24h: '100', target_volume_24h: '5', high_24h: '0.06', low_24h: '0.04', trade_count_24h: 3 }],
         ['BASE2', { token: 'BASE2', base_volume_24h: '0', target_volume_24h: '0', high_24h: '0', low_24h: '0', trade_count_24h: 0 }],
       ]),
+    // Default: no 24h-ago reserves → price_change_percent_24h omitted (the price-
+    // change tests below override this with a dedicated mock).
+    getSpotReserves24hAgo: async () => new Map(),
   } as unknown as ExternalDatabaseService;
 }
 
@@ -70,6 +74,7 @@ function extDbWithMalformedMetric(
   return {
     isAvailable: () => true,
     getSpotRolling24hMetrics: async () => new Map([['BASE1', base]]),
+    getSpotReserves24hAgo: async () => new Map(),
   } as unknown as ExternalDatabaseService;
 }
 
@@ -367,6 +372,91 @@ describe('CoinMarketCap Routes', () => {
       const res = await request(app).get('/cmc/summary');
       expect(res.status).toBe(503);
       expect(res.body.code).toBe('CMC_ALLOWLIST_NO_MATCH');
+    });
+  });
+
+  describe('price_change_percent_24h (from AMM swap history)', () => {
+    // last_price comes from the (empty) live poolData reserves → the mock returns
+    // its default 0.05. For the 24h-ago reserves we return raw values the route
+    // wraps in BN, and the mock prices them by their base value: base '40' → 0.04.
+    // So change = (0.05 − 0.04) / 0.04 × 100 = +25%.
+    function priceServiceWithRef(): PriceService {
+      return {
+        calculatePrice: (base: any) => (base?.toString?.() === '40' ? '0.04' : '0.05'),
+        calculateSpread: () => ({ bid: '0.04975', ask: '0.05025' }),
+        calculateLiquidityUSD: () => '1000',
+      } as unknown as PriceService;
+    }
+
+    function extDbWithReserves(
+      reserves: Map<string, { baseReserves: string; quoteReserves: string }>,
+    ): ExternalDatabaseService {
+      return {
+        isAvailable: () => true,
+        getSpotRolling24hMetrics: async () =>
+          new Map([['BASE1', { token: 'BASE1', base_volume_24h: '100', target_volume_24h: '5', high_24h: '0', low_24h: '0', trade_count_24h: 3 }]]),
+        getSpotReserves24hAgo: async () => reserves,
+      } as unknown as ExternalDatabaseService;
+    }
+
+    it('emits price_change_percent_24h from the last swap ≥24h ago', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning([dao('BASE1', 'USDC', 'DAOA')]),
+        externalDatabaseService: extDbWithReserves(new Map([['BASE1', { baseReserves: '40', quoteReserves: '1000' }]])),
+        priceService: priceServiceWithRef(),
+      });
+
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBe(200);
+      expect(res.body[0].price_change_percent_24h).toBeCloseTo(25, 6);
+    });
+
+    it('omits price_change_percent_24h for a market with no swap older than 24h', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning([dao('BASE1', 'USDC', 'DAOA')]),
+        // Empty reserves map: BASE1 first traded < 24h ago → change is undefined.
+        externalDatabaseService: extDbWithReserves(new Map()),
+        priceService: priceServiceWithRef(),
+      });
+
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBe(200);
+      expect(res.body[0]).not.toHaveProperty('price_change_percent_24h');
+    });
+
+    it('serves the summary (200) without price_change if the 24h-ago source query fails', async () => {
+      // The swaps source is non-essential: its failure degrades to "field absent",
+      // never a 5xx (unlike the volume source), and price/volume still serve.
+      const extDb = {
+        isAvailable: () => true,
+        getSpotRolling24hMetrics: async () =>
+          new Map([['BASE1', { token: 'BASE1', base_volume_24h: '100', target_volume_24h: '5', high_24h: '0', low_24h: '0', trade_count_24h: 3 }]]),
+        getSpotReserves24hAgo: async () => { throw new Error('swaps query failed'); },
+      } as unknown as ExternalDatabaseService;
+
+      const app = createTestApp({
+        futarchyService: futarchyReturning([dao('BASE1', 'USDC', 'DAOA')]),
+        externalDatabaseService: extDb,
+        priceService: priceServiceWithRef(),
+      });
+
+      const res = await request(app).get('/cmc/summary');
+      expect(res.status).toBe(200);
+      expect(res.body[0].last_price).toBe(0.05);
+      expect(res.body[0].base_volume).toBe(100);
+      expect(res.body[0]).not.toHaveProperty('price_change_percent_24h');
+    });
+
+    it('does NOT include price_change_percent_24h on /cmc/ticker (not in CMC ticker spec)', async () => {
+      const app = createTestApp({
+        futarchyService: futarchyReturning([dao('BASE1', 'USDC', 'DAOA')]),
+        externalDatabaseService: extDbWithReserves(new Map([['BASE1', { baseReserves: '40', quoteReserves: '1000' }]])),
+        priceService: priceServiceWithRef(),
+      });
+
+      const res = await request(app).get('/cmc/ticker');
+      expect(res.status).toBe(200);
+      expect(res.body['BASE1_USDC']).not.toHaveProperty('price_change_percent_24h');
     });
   });
 });

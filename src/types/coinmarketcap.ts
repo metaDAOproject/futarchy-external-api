@@ -48,10 +48,13 @@ export interface CoinMarketCapSummaryPair {
   quote_volume: number;
   // Only reported when a real 24h high/low exists in the ETL window. Omitted
   // (rather than reported as 0) otherwise — a financial feed must not fabricate
-  // an extreme. price_change_percent_24h is intentionally absent: we have no
-  // reliable 24h-ago open, and reporting a fake 0% would be worse than omitting.
+  // an extreme.
   highest_price_24h?: number;
   lowest_price_24h?: number;
+  // 24h price change, percent. Derived from the AMM's exact price 24h ago (the
+  // reserves of the last swap ≥24h ago). Omitted for markets younger than 24h,
+  // where the change is undefined — never fabricated as 0.
+  price_change_percent_24h?: number;
 }
 
 /** One entry in the `/cmc/assets` object, keyed by the token's mint address. */

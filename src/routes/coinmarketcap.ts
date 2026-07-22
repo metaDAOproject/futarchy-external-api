@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from 'express';
+import BN from 'bn.js';
 import type {
   CoinMarketCapTicker,
   CoinMarketCapTickerResponse,
@@ -103,6 +104,9 @@ interface CmcPair {
   quoteVolume: number;
   high24h?: number;
   low24h?: number;
+  // Present only when a true 24h-ago price exists (the pair had a swap ≥24h ago).
+  // Omitted for markets younger than 24h — a 24h change is undefined there.
+  priceChangePercent24h?: number;
 }
 
 // CMC asked us to version the API URL. We keep serving the original unversioned
@@ -131,7 +135,10 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
    * zero volume for a financial feed). Price/spread/liquidity come from live
    * spot-pool reserves via the same PriceService the CoinGecko adapter uses.
    */
-  async function buildPairs(req: Request): Promise<CmcPair[]> {
+  async function buildPairs(
+    req: Request,
+    opts: { withPriceChange?: boolean } = {}
+  ): Promise<CmcPair[]> {
     const futarchyService = getFutarchyService();
     const priceService = getPriceService();
     const externalDatabaseService = getExternalDatabaseService();
@@ -167,6 +174,27 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
         high_24h: metrics.high_24h,
         low_24h: metrics.low_24h,
       });
+    }
+
+    // Reserves from the last spot swap ≥24h ago, per token — the source for
+    // price_change_percent_24h (summary only). A failure here is NON-fatal: the
+    // core feed (price + volume) is unaffected, and price_change is definitionally
+    // optional (young markets omit it), so an outage of the swaps source degrades
+    // to "field absent" rather than taking the whole feed down. This differs from
+    // the volume source, whose absence WOULD be a false financial claim (0 volume).
+    let reserves24hByToken = new Map<string, { baseReserves: string; quoteReserves: string }>();
+    if (opts.withPriceChange) {
+      try {
+        reserves24hByToken = await externalDatabaseService.getSpotReserves24hAgo(baseMints);
+      } catch (error) {
+        logger.error('Failed to load 24h-ago reserves for /cmc price change; serving feed without it', error, {
+          requestId: req.requestId,
+        });
+        sendAlert(
+          'CMC price_change_percent_24h source (user_pool_swaps) query failed — serving feed without 24h change',
+          { cooldownKey: 'cmc-price-change-source', cooldownMs: 10 * 60 * 1000 }
+        );
+      }
     }
 
     const pairs: CmcPair[] = [];
@@ -232,6 +260,26 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
         if (high24h !== undefined) pair.high24h = high24h;
         if (low24h !== undefined) pair.low24h = low24h;
 
+        // price_change_percent_24h — computed from the last swap ≥24h ago, priced
+        // through the SAME calculatePrice as last_price (identical decimal handling
+        // → a true mid-vs-mid comparison). Omitted (never fabricated) when: the
+        // market is younger than 24h (no ref in the map), or the reference price
+        // can't be computed / is ≤0. A bad historical reserve is a per-pair omit,
+        // not a 500 — unlike the primary price/volume feed.
+        const ref = reserves24hByToken.get(baseMint.toString());
+        if (ref) {
+          const refPriceStr = priceService.calculatePrice(
+            new BN(ref.baseReserves),
+            new BN(ref.quoteReserves),
+            baseDecimals,
+            quoteDecimals
+          );
+          const refPrice = refPriceStr ? parseFloat(refPriceStr) : NaN;
+          if (Number.isFinite(refPrice) && refPrice > 0) {
+            pair.priceChangePercent24h = ((priceNum - refPrice) / refPrice) * 100;
+          }
+        }
+
         pairs.push(pair);
       } catch (error) {
         // Intentional financial-integrity failures (AppError, e.g. malformed ETL
@@ -258,15 +306,14 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
   // ---------------------------------------------------------------
   // GET /cmc/summary — 24h overview of every tradeable pair (array).
   //
-  // DELIBERATE OMISSION — price_change_percent_24h: CMC's summary schema lists it,
-  // but computing it needs a reliable 24h-ago open, which the served ETL's rolling
-  // metrics (SUM/MAX/MIN over 1m candles) do not expose. This repo's invariant is
-  // to never fabricate a financial value, so we omit the field rather than report
-  // a fake 0% — the sibling CoinGecko /api/tickers adapter omits it for the same
-  // reason. Add it here only alongside a real 24h-open source.
+  // price_change_percent_24h is computed from AMM swap history (see buildPairs):
+  // the FutarchyAMM price is a pure function of pool reserves and reserves only
+  // move on a swap, so the last swap ≥24h ago gives the EXACT price 24h ago. It is
+  // omitted (never fabricated) for markets younger than 24h, where the change is
+  // undefined. This is the only endpoint that carries it (CMC's ticker/A2 does not).
   // ---------------------------------------------------------------
   router.get(cmcPaths('summary'), asyncHandler(async (req: Request, res: Response) => {
-    const pairs = await buildPairs(req);
+    const pairs = await buildPairs(req, { withPriceChange: true });
 
     const summary: CoinMarketCapSummaryPair[] = pairs.map(p => {
       const entry: CoinMarketCapSummaryPair = {
@@ -282,6 +329,7 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
       };
       if (p.high24h !== undefined) entry.highest_price_24h = p.high24h;
       if (p.low24h !== undefined) entry.lowest_price_24h = p.low24h;
+      if (p.priceChangePercent24h !== undefined) entry.price_change_percent_24h = p.priceChangePercent24h;
       return entry;
     });
 

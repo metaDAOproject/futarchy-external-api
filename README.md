@@ -103,7 +103,8 @@ a specific set of tokens; empty (the default) serves every discovered DAO.
     "base_volume": 30024.8104,
     "quote_volume": 2441.23456789,
     "highest_price_24h": 0.085,
-    "lowest_price_24h": 0.078
+    "lowest_price_24h": 0.078,
+    "price_change_percent_24h": 4.28
   }
 ]
 ```
@@ -112,10 +113,17 @@ a specific set of tokens; empty (the default) serves every discovered DAO.
 same ids `/cmc/assets` is keyed by, so CMC maps pairs → assets consistently.
 
 `highest_price_24h` / `lowest_price_24h` are omitted when the ETL window has no
-real high/low. `price_change_percent_24h` is intentionally not reported — the
-served ETL exposes no reliable 24h-ago open, and this API never fabricates a
-financial value (a fake `0%` would be worse than omitting). The sibling CoinGecko
-`/api/tickers` adapter omits it for the same reason.
+real high/low.
+
+`price_change_percent_24h` is the 24h price change in percent, computed from the
+AMM's **exact** price 24h ago. The FutarchyAMM price is a pure function of pool
+reserves, and reserves only change on a swap, so the reserves of the last swap
+≥24h ago (`futarchy.user_pool_swaps`) are the pool's exact state 24h ago — priced
+through the same formula as `last_price` (a true mid-vs-mid comparison). It is
+**omitted** for a market younger than 24h (no swap before the cutoff), where the
+change is undefined — never fabricated as `0%`. If the swaps source is briefly
+unavailable, the field is omitted for that response but price/volume still serve
+(unlike the volume source, whose absence returns `503`).
 
 #### GET `/cmc/ticker`
 
