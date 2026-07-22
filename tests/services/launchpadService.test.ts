@@ -116,6 +116,17 @@ describe('LaunchpadService.getExcludedHolderBalances', () => {
     await expect((svc as any).getExcludedHolderBalances(MINT)).rejects.toThrow('RPC connection refused');
   });
 
+  it('throws on an unreadable parsed token-account shape instead of counting it as 0', async () => {
+    config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER });
+    const svc = new LaunchpadService();
+    (svc as any).connection = {
+      getParsedTokenAccountsByOwner: async () => ({
+        value: [{ account: { data: { parsed: { info: {} } } } }],
+      }),
+    };
+    await expect((svc as any).getExcludedHolderBalances(MINT)).rejects.toThrow('Unexpected parsed token-account shape');
+  });
+
   it('ignores holders configured for a different mint (no RPC for the queried mint)', async () => {
     config.circulating.excludedHolders.push({ mint: OTHER_MINT, wallet: HOLDER });
     const svc = new LaunchpadService();

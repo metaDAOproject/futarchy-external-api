@@ -434,7 +434,15 @@ export class LaunchpadService {
       let amount = new BN(0);
       for (const { account } of resp.value) {
         const raw = (account.data as any)?.parsed?.info?.tokenAmount?.amount;
-        if (raw) amount = amount.add(new BN(raw));
+        // Fail loud on an unexpected parsed shape: silently treating an
+        // unreadable account as 0 would overstate circulating supply, which is
+        // exactly the mispricing this path must never produce.
+        if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
+          throw new Error(
+            `[Launchpad] Unexpected parsed token-account shape for excluded holder ${holder.wallet.toString()} (mint ${mint}) — refusing to treat an unreadable balance as 0`,
+          );
+        }
+        amount = amount.add(new BN(raw));
       }
       logger.info(`[Launchpad] Excluded holder ${holder.wallet.toString()} (${holder.label ?? 'unlabeled'}) holds ${amount.toString()} tokens of ${mint} across ${resp.value.length} account(s)`);
       balances.push({ wallet: holder.wallet, label: holder.label, amount });

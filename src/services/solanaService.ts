@@ -180,12 +180,19 @@ export class SolanaService {
   async getSupplyInfo(mintAddress: string, allocation?: TokenAllocationInput): Promise<TokenSupplyInfo> {
     const additionalAmount = allocation?.additionalTokenAllocation?.amount || new BN(0);
     const daoTreasuryAmount = allocation?.daoTreasuryTokens?.amount || new BN(0);
-    const excludedHoldersTotal = (allocation?.excludedHolders || []).reduce(
+    const excludedHolders = allocation?.excludedHolders || [];
+    const excludedHoldersTotal = excludedHolders.reduce(
       (sum, h) => sum.add(h.amount),
       new BN(0),
     );
+    // Key on per-holder address/amount/label (not just the aggregate) so two
+    // different holder sets that happen to share a total can't return each
+    // other's cached allocation.excludedHolders detail.
+    const excludedHoldersKey = excludedHolders
+      .map(h => `${h.address}:${h.amount}:${h.label ?? ''}`)
+      .join('|');
     const cacheKey = allocation
-      ? `supply_info_${mintAddress}_${allocation.teamPerformancePackage.amount}_${allocation.futarchyAmmLiquidity.amount}_${allocation.meteoraLpLiquidity.amount}_${additionalAmount}_${daoTreasuryAmount}_${excludedHoldersTotal}`
+      ? `supply_info_${mintAddress}_${allocation.teamPerformancePackage.amount}_${allocation.futarchyAmmLiquidity.amount}_${allocation.meteoraLpLiquidity.amount}_${additionalAmount}_${daoTreasuryAmount}_${excludedHoldersKey}`
       : `supply_info_${mintAddress}_none`;
     const cached = this.getCached<TokenSupplyInfo>(cacheKey, config.cache.tickersTTL);
     if (cached !== null) return cached;
