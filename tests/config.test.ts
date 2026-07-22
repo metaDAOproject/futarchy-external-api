@@ -61,6 +61,17 @@ describe('parseExcludedHolders', () => {
     expect(() => parseExcludedHolders(`${MINT}:${WALLET}:good, garbage`)).toThrow();
   });
 
+  it('dedupes exact mint:wallet duplicates so a balance is never subtracted twice', () => {
+    const holders = parseExcludedHolders(`${MINT}:${WALLET}:first, ${MINT}:${WALLET}:second`);
+    expect(holders).toHaveLength(1);
+    expect(holders[0]!.label).toBe('first'); // first occurrence wins
+  });
+
+  it('keeps the same wallet across different mints (dedupe is per mint:wallet)', () => {
+    const holders = parseExcludedHolders(`${MINT}:${WALLET}, ${WALLET2}:${WALLET}`);
+    expect(holders).toHaveLength(2);
+  });
+
   it('treats an empty label after the second colon as undefined', () => {
     const holders = parseExcludedHolders(`${MINT}:${WALLET}:`);
     expect(holders).toHaveLength(1);

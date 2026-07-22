@@ -30,6 +30,10 @@ export interface ExcludedHolder {
  */
 export function parseExcludedHolders(raw: string): ExcludedHolder[] {
   const holders: ExcludedHolder[] = [];
+  // Dedupe by mint:wallet — a duplicated env entry (copy/paste) would otherwise be
+  // resolved and subtracted twice, double-counting the same live balance and
+  // understating circulating supply.
+  const seen = new Set<string>();
   for (const entry of raw.split(',')) {
     const trimmed = entry.trim();
     if (!trimmed) continue; // blank entry / trailing comma — not an error
@@ -53,7 +57,11 @@ export function parseExcludedHolders(raw: string): ExcludedHolder[] {
       // Validate both are real pubkeys; keep `mint` as string (matches how the
       // supply path compares mints) and `wallet` as a PublicKey for lookups.
       new PublicKey(mint);
-      holders.push({ mint, wallet: new PublicKey(wallet), label });
+      const walletKey = new PublicKey(wallet); // throws if invalid
+      const dedupeKey = `${mint}:${wallet}`;
+      if (seen.has(dedupeKey)) continue; // drop exact duplicate (keep first occurrence)
+      seen.add(dedupeKey);
+      holders.push({ mint, wallet: walletKey, label });
     } catch {
       throw new Error(
         `Invalid EXCLUDED_CIRCULATING_WALLETS entry "${trimmed}" — mint and wallet must be valid base58 pubkeys`,
