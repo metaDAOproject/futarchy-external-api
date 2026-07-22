@@ -75,17 +75,21 @@ describe('Supply Routes', () => {
           totalNonCirculating: new BN(100),
         }),
       } as unknown as LaunchpadService;
+      let capturedAllocation: any;
       const solanaService = {
-        getSupplyInfo: async () => ({
-          mint: validMintAddress,
-          totalSupply: '1000000',
-          circulatingSupply: '999900',
-          decimals: 6,
-          rawTotalSupply: '1000000000000',
-          allocation: {
-            excludedHolders: [{ amount: '0.0001', address: holderAddress, label: 'Laso external' }],
-          },
-        }),
+        getSupplyInfo: async (_mint: string, allocation: any) => {
+          capturedAllocation = allocation;
+          return {
+            mint: validMintAddress,
+            totalSupply: '1000000',
+            circulatingSupply: '999900',
+            decimals: 6,
+            rawTotalSupply: '1000000000000',
+            allocation: {
+              excludedHolders: [{ amount: '0.0001', address: holderAddress, label: 'Laso external' }],
+            },
+          };
+        },
       } as unknown as SolanaService;
       const testApp = createTestApp({ launchpadService, solanaService });
 
@@ -96,6 +100,12 @@ describe('Supply Routes', () => {
       expect(response.body.allocation.excludedHolders).toEqual([
         { amount: '0.0001', address: holderAddress, label: 'Laso external' },
       ]);
+      // The breakdown's excludedHolders must be mapped (wallet -> address) and
+      // forwarded to getSupplyInfo — guards supplyWithLaunchpadAllocation wiring.
+      expect(capturedAllocation.excludedHolders).toHaveLength(1);
+      expect(capturedAllocation.excludedHolders[0].address).toBe(holderAddress);
+      expect(capturedAllocation.excludedHolders[0].label).toBe('Laso external');
+      expect(capturedAllocation.excludedHolders[0].amount.toString()).toBe('100');
     });
   });
 

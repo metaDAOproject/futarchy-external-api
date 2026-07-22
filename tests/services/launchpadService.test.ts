@@ -8,12 +8,19 @@
  * bug this suite pins down).
  */
 
-import { describe, it, expect, afterEach } from 'bun:test';
+import { describe, it, expect, afterEach, beforeEach } from 'bun:test';
 import { PublicKey } from '@solana/web3.js';
 import { LaunchpadService } from '../../src/services/launchpadService.js';
 import { config } from '../../src/config.js';
 
 const MINT = new PublicKey('SoLo9oxzLDpcq1dpqAgMwgce5WqkRDtNXK7EPnbmeta');
+
+// Guarantee a clean excluded-holders config for EVERY test in this file, so the
+// no-launch/incomplete-launch cases below never depend on ambient
+// EXCLUDED_CIRCULATING_WALLETS (which would add unexpected RPC / balances).
+beforeEach(() => {
+  config.circulating.excludedHolders.length = 0;
+});
 
 describe('LaunchpadService.getTokenAllocationBreakdown', () => {
   it('propagates infrastructure failures instead of returning an empty breakdown', async () => {
