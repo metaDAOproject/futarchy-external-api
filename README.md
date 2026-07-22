@@ -177,10 +177,10 @@ Returns total supply only (plain text number).
 #### GET `/api/supply/:mintAddress/circulating`
 
 Returns circulating supply — total minus non-circulating allocations: the team
-performance package, unclaimed additional-token allocation, DAO treasury holdings,
-and any operator-configured **excluded holders** (external/vesting/encumbered wallets
-listed in `EXCLUDED_CIRCULATING_WALLETS`). Each excluded holder's *live* on-chain
-balance is subtracted and echoed back under `allocation.excludedHolders`.
+performance package, the additional-token allocation, DAO treasury holdings, and any
+operator-configured **excluded holders** (external/vesting/encumbered wallets listed
+in `EXCLUDED_CIRCULATING_WALLETS`). Each excluded holder's *live* on-chain balance is
+subtracted and echoed back under `allocation.excludedHolders`.
 
 ---
 
