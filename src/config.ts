@@ -19,34 +19,45 @@ export interface ExcludedHolder {
  * Parse the `EXCLUDED_CIRCULATING_WALLETS` env value into structured holders.
  *
  * Format: comma-separated entries, each `<mint>:<wallet>` or
- * `<mint>:<wallet>:<label>`. Whitespace is trimmed. Malformed entries (missing
- * mint/wallet, invalid base58 pubkey) are skipped rather than fatal, so one bad
- * entry can never take down startup / every supply read. The label may contain
- * anything except a comma (which delimits entries).
+ * `<mint>:<wallet>:<label>`. Whitespace is trimmed and blank entries (e.g. a
+ * trailing comma) are ignored. The label may contain anything except a comma
+ * (which delimits entries).
+ *
+ * A malformed NON-blank entry (missing mint/wallet, invalid base58 pubkey)
+ * THROWS. This is a financial serving path: silently dropping a typo'd exclusion
+ * would overstate circulating supply, so we fail fast at startup instead — the
+ * same fail-loud-not-quietly-wrong contract the rest of the supply path follows.
  */
 export function parseExcludedHolders(raw: string): ExcludedHolder[] {
   const holders: ExcludedHolder[] = [];
   for (const entry of raw.split(',')) {
     const trimmed = entry.trim();
-    if (!trimmed) continue;
+    if (!trimmed) continue; // blank entry / trailing comma — not an error
     // Split into at most 3 parts so a label may itself contain ':'.
     const firstColon = trimmed.indexOf(':');
-    if (firstColon === -1) continue;
-    const secondColon = trimmed.indexOf(':', firstColon + 1);
-    const mint = trimmed.slice(0, firstColon).trim();
+    const secondColon = firstColon === -1 ? -1 : trimmed.indexOf(':', firstColon + 1);
+    const mint = firstColon === -1 ? '' : trimmed.slice(0, firstColon).trim();
     const wallet =
-      secondColon === -1
-        ? trimmed.slice(firstColon + 1).trim()
-        : trimmed.slice(firstColon + 1, secondColon).trim();
+      firstColon === -1
+        ? ''
+        : secondColon === -1
+          ? trimmed.slice(firstColon + 1).trim()
+          : trimmed.slice(firstColon + 1, secondColon).trim();
     const label = secondColon === -1 ? undefined : trimmed.slice(secondColon + 1).trim() || undefined;
-    if (!mint || !wallet) continue;
+    if (!mint || !wallet) {
+      throw new Error(
+        `Invalid EXCLUDED_CIRCULATING_WALLETS entry "${trimmed}" — expected "<mint>:<wallet>" or "<mint>:<wallet>:<label>"`,
+      );
+    }
     try {
       // Validate both are real pubkeys; keep `mint` as string (matches how the
-      // supply path compares mints) and `wallet` as a PublicKey for ATA derivation.
+      // supply path compares mints) and `wallet` as a PublicKey for lookups.
       new PublicKey(mint);
       holders.push({ mint, wallet: new PublicKey(wallet), label });
     } catch {
-      // Invalid base58 — skip this entry, never abort the whole list.
+      throw new Error(
+        `Invalid EXCLUDED_CIRCULATING_WALLETS entry "${trimmed}" — mint and wallet must be valid base58 pubkeys`,
+      );
     }
   }
   return holders;

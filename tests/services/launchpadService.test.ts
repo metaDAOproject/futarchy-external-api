@@ -8,9 +8,10 @@
  * bug this suite pins down).
  */
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { PublicKey } from '@solana/web3.js';
 import { LaunchpadService } from '../../src/services/launchpadService.js';
+import { config } from '../../src/config.js';
 
 const MINT = new PublicKey('SoLo9oxzLDpcq1dpqAgMwgce5WqkRDtNXK7EPnbmeta');
 
@@ -54,11 +55,79 @@ describe('LaunchpadService.getTokenAllocationBreakdown', () => {
     expect(breakdown.excludedHolders).toEqual([]);
   });
 
+});
+
+describe('LaunchpadService.getExcludedHolderBalances', () => {
+  const HOLDER = new PublicKey('DMB74TZgN7Rqfwtqqm3VQBgKBb2WYPdBqVtHbvB4LLeV');
+  const OTHER_MINT = 'So11111111111111111111111111111111111111112';
+
+  afterEach(() => {
+    // The config singleton is mutated in-place by these tests; reset it so the
+    // default (no configured holders) is restored for every other suite.
+    config.circulating.excludedHolders.length = 0;
+  });
+
+  function tokenAccount(amount: string) {
+    return { account: { data: { parsed: { info: { tokenAmount: { amount } } } } } };
+  }
+
   it('resolves no excluded holders (and hits no RPC) when none are configured for the mint', async () => {
-    // Default test env sets no EXCLUDED_CIRCULATING_WALLETS, so the mint has no
-    // configured holders and getExcludedHolderBalances must short-circuit to [].
     const svc = new LaunchpadService();
+    let called = false;
+    (svc as any).connection = {
+      getParsedTokenAccountsByOwner: async () => {
+        called = true;
+        return { value: [] };
+      },
+    };
     const balances = await (svc as any).getExcludedHolderBalances(MINT);
     expect(balances).toEqual([]);
+    expect(called).toBe(false);
+  });
+
+  it('sums ALL of the holder’s token accounts for the mint, not just the ATA', async () => {
+    config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER, label: 'ext' });
+    const svc = new LaunchpadService();
+    (svc as any).connection = {
+      getParsedTokenAccountsByOwner: async () => ({ value: [tokenAccount('100'), tokenAccount('25')] }),
+    };
+    const balances = await (svc as any).getExcludedHolderBalances(MINT);
+    expect(balances).toHaveLength(1);
+    expect(balances[0].amount.toString()).toBe('125');
+    expect(balances[0].label).toBe('ext');
+  });
+
+  it('yields a 0 balance when the holder owns no token accounts of the mint', async () => {
+    config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER });
+    const svc = new LaunchpadService();
+    (svc as any).connection = { getParsedTokenAccountsByOwner: async () => ({ value: [] }) };
+    const balances = await (svc as any).getExcludedHolderBalances(MINT);
+    expect(balances[0].amount.isZero()).toBe(true);
+  });
+
+  it('propagates an RPC failure instead of returning a silent 0', async () => {
+    config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER });
+    const svc = new LaunchpadService();
+    (svc as any).connection = {
+      getParsedTokenAccountsByOwner: async () => {
+        throw new Error('RPC connection refused');
+      },
+    };
+    await expect((svc as any).getExcludedHolderBalances(MINT)).rejects.toThrow('RPC connection refused');
+  });
+
+  it('ignores holders configured for a different mint (no RPC for the queried mint)', async () => {
+    config.circulating.excludedHolders.push({ mint: OTHER_MINT, wallet: HOLDER });
+    const svc = new LaunchpadService();
+    let called = false;
+    (svc as any).connection = {
+      getParsedTokenAccountsByOwner: async () => {
+        called = true;
+        return { value: [] };
+      },
+    };
+    const balances = await (svc as any).getExcludedHolderBalances(MINT);
+    expect(balances).toEqual([]);
+    expect(called).toBe(false);
   });
 });

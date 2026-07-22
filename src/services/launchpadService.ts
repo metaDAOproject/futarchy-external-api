@@ -412,9 +412,12 @@ export class LaunchpadService {
    * wallets (e.g. Laso's external wallet) whose tokens should be excluded from
    * circulating supply. Returns [] when none are configured for this mint (no RPC).
    *
-   * Error contract matches the rest of the breakdown: a genuinely-absent token
-   * account is 0 (the wallet simply holds none of this mint); any RPC/infra
-   * failure PROPAGATES — a silent 0 would overstate circulating supply.
+   * Sums ALL of the wallet's token accounts for the mint (via
+   * getParsedTokenAccountsByOwner), not just the associated account — a wallet can
+   * hold the mint across multiple non-associated accounts, and under-counting here
+   * would overstate circulating supply. An owner with no matching account yields 0
+   * (an empty result, not an error). Any RPC/infra failure PROPAGATES — a silent 0
+   * would overstate circulating supply.
    */
   private async getExcludedHolderBalances(baseMint: PublicKey): Promise<ExcludedHolderBalance[]> {
     const mint = baseMint.toString();
@@ -423,19 +426,17 @@ export class LaunchpadService {
 
     const balances: ExcludedHolderBalance[] = [];
     for (const holder of configured) {
+      // No try/catch: an RPC failure must reject (never a silent 0). An owner that
+      // holds none of the mint simply comes back with an empty `value` array.
+      const resp = await this.connection.getParsedTokenAccountsByOwner(holder.wallet, {
+        mint: baseMint,
+      });
       let amount = new BN(0);
-      try {
-        // allowOwnerOffCurve=true so PDA/program-owned holders (e.g. vesting
-        // contracts) resolve their ATA correctly, not just system wallets.
-        const ata = await getAssociatedTokenAddress(baseMint, holder.wallet, true);
-        const tokenAccount = await getAccount(this.connection, ata);
-        amount = new BN(tokenAccount.amount.toString());
-        logger.info(`[Launchpad] Excluded holder ${holder.wallet.toString()} (${holder.label ?? 'unlabeled'}) holds ${amount.toString()} tokens of ${mint}`);
-      } catch (error: any) {
-        // Genuinely-absent ATA → 0 held (correct). RPC failure must propagate.
-        if (!isTokenAccountAbsent(error)) throw error;
-        logger.info(`[Launchpad] Excluded holder ${holder.wallet.toString()} holds no ${mint} (no token account)`);
+      for (const { account } of resp.value) {
+        const raw = (account.data as any)?.parsed?.info?.tokenAmount?.amount;
+        if (raw) amount = amount.add(new BN(raw));
       }
+      logger.info(`[Launchpad] Excluded holder ${holder.wallet.toString()} (${holder.label ?? 'unlabeled'}) holds ${amount.toString()} tokens of ${mint} across ${resp.value.length} account(s)`);
       balances.push({ wallet: holder.wallet, label: holder.label, amount });
     }
     return balances;

@@ -42,19 +42,23 @@ describe('parseExcludedHolders', () => {
     expect(holders[0]!.label).toBe('spaced label');
   });
 
-  it('skips malformed and invalid-pubkey entries without throwing', () => {
-    const holders = parseExcludedHolders(
-      [
-        'no-colon-here',           // no delimiter
-        `${MINT}:`,                // missing wallet
-        `:${WALLET}`,              // missing mint
-        `not-a-pubkey:${WALLET}`,  // invalid mint
-        `${MINT}:not-a-pubkey`,    // invalid wallet
-        `${MINT}:${WALLET}:good`,  // the only valid one
-      ].join(','),
-    );
+  it('ignores blank entries from a trailing/leading comma', () => {
+    const holders = parseExcludedHolders(`,${MINT}:${WALLET}, ,`);
     expect(holders).toHaveLength(1);
-    expect(holders[0]!.label).toBe('good');
+    expect(holders[0]!.wallet.toString()).toBe(WALLET);
+  });
+
+  it('throws on malformed entries so a typo cannot silently overstate circulating supply', () => {
+    expect(() => parseExcludedHolders('no-colon-here')).toThrow('Invalid EXCLUDED_CIRCULATING_WALLETS');
+    expect(() => parseExcludedHolders(`${MINT}:`)).toThrow('Invalid EXCLUDED_CIRCULATING_WALLETS');
+    expect(() => parseExcludedHolders(`:${WALLET}`)).toThrow('Invalid EXCLUDED_CIRCULATING_WALLETS');
+    expect(() => parseExcludedHolders(`not-a-pubkey:${WALLET}`)).toThrow('valid base58 pubkeys');
+    expect(() => parseExcludedHolders(`${MINT}:not-a-pubkey`)).toThrow('valid base58 pubkeys');
+  });
+
+  it('aborts the whole list if any entry is malformed', () => {
+    // The one valid entry must NOT be returned — fail fast, don't partially apply.
+    expect(() => parseExcludedHolders(`${MINT}:${WALLET}:good, garbage`)).toThrow();
   });
 
   it('treats an empty label after the second colon as undefined', () => {
