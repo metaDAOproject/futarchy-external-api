@@ -165,13 +165,14 @@ export class ExternalDatabaseService {
    * and the caller omits the field rather than fabricate one. Throws (never masks
    * as empty) on connection/query failure, exactly like getSpotRolling24hMetrics.
    *
-   * DISTINCT ON picks ONE row per base_mint; the ORDER BY must therefore break
-   * every tie deterministically or the plan could pick a non-final reserve state
+   * The per-token LATERAL LIMIT 1 picks ONE row per base_mint; its ORDER BY must
+   * break every tie deterministically or it could pick a non-final reserve state
    * when several swaps share the same block_time. We extend block_time DESC with
    * the same event-order columns the DexScreener /events route uses (slot, then
    * within-transaction inner_group/inner_ix, with signature to disambiguate
    * distinct txns in one slot) — highest wins, so the selected row is truly the
-   * last swap at or before the cutoff.
+   * last swap at or before the cutoff. See the query for why LATERAL beats a
+   * single DISTINCT ON here (index-backed per-token seek vs full-table seq scan).
    */
   async getSpotReserves24hAgo(tokens: string[]): Promise<Map<string, { baseReserves: string; quoteReserves: string }>> {
     if (tokens.length === 0) {
@@ -184,20 +185,32 @@ export class ExternalDatabaseService {
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
     try {
+      // Per-token LATERAL LIMIT 1 rather than a single DISTINCT ON over the whole
+      // table. `block_time <= cutoff` spans nearly all history (everything but the
+      // last 24h), so a DISTINCT ON makes the planner seq-scan + sort the entire
+      // user_pool_swaps table (measured: ~1.4M rows, ~8s, and growing unbounded).
+      // Driving from the small token array instead lets each token do a backward
+      // Index Scan on idx_user_pool_swaps_base_mint (base_mint, block_time) and
+      // stop at the first matching row — 38 index seeks, ~30ms, flat as history
+      // grows. Same result set and the SAME deterministic tie-break ordering.
       const result = await this.pool.query(
-        `SELECT DISTINCT ON (base_mint)
-           base_mint                    AS token,
-           amm_base_reserves::text      AS base_reserves,
-           amm_quote_reserves::text     AS quote_reserves
-         FROM futarchy.user_pool_swaps
-         WHERE source = 'futarchy_amm'
-           AND market_kind = 'spot'
-           AND block_time <= $1
-           AND base_mint = ANY($2::text[])
-           AND amm_base_reserves IS NOT NULL
-           AND amm_quote_reserves IS NOT NULL
-           AND amm_base_reserves > 0
-         ORDER BY base_mint, block_time DESC, slot DESC, signature DESC, inner_group DESC, inner_ix DESC`,
+        `SELECT s.token, s.base_reserves, s.quote_reserves
+         FROM unnest($2::text[]) AS t(base_mint)
+         CROSS JOIN LATERAL (
+           SELECT u.base_mint                 AS token,
+                  u.amm_base_reserves::text   AS base_reserves,
+                  u.amm_quote_reserves::text  AS quote_reserves
+           FROM futarchy.user_pool_swaps u
+           WHERE u.base_mint = t.base_mint
+             AND u.source = 'futarchy_amm'
+             AND u.market_kind = 'spot'
+             AND u.block_time <= $1
+             AND u.amm_base_reserves IS NOT NULL
+             AND u.amm_quote_reserves IS NOT NULL
+             AND u.amm_base_reserves > 0
+           ORDER BY u.block_time DESC, u.slot DESC, u.signature DESC, u.inner_group DESC, u.inner_ix DESC
+           LIMIT 1
+         ) s`,
         [cutoff, tokens]
       );
 
