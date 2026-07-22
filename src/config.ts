@@ -1,4 +1,57 @@
 import { PublicKey } from '@solana/web3.js';
+
+/**
+ * A wallet whose live on-chain balance of a specific mint is treated as
+ * non-circulating (external/vesting/encumbered/protocol-owned holdings that are
+ * NOT "in the hands of others"). Scoped per-mint so we only ever exclude a
+ * balance an operator has explicitly vetted as encumbered.
+ */
+export interface ExcludedHolder {
+  /** Base mint whose balance held by `wallet` is excluded from circulating supply. */
+  mint: string;
+  /** Wallet (owner) address that holds the encumbered tokens. */
+  wallet: PublicKey;
+  /** Optional human-readable tag surfaced in the supply allocation response. */
+  label?: string;
+}
+
+/**
+ * Parse the `EXCLUDED_CIRCULATING_WALLETS` env value into structured holders.
+ *
+ * Format: comma-separated entries, each `<mint>:<wallet>` or
+ * `<mint>:<wallet>:<label>`. Whitespace is trimmed. Malformed entries (missing
+ * mint/wallet, invalid base58 pubkey) are skipped rather than fatal, so one bad
+ * entry can never take down startup / every supply read. The label may contain
+ * anything except a comma (which delimits entries).
+ */
+export function parseExcludedHolders(raw: string): ExcludedHolder[] {
+  const holders: ExcludedHolder[] = [];
+  for (const entry of raw.split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    // Split into at most 3 parts so a label may itself contain ':'.
+    const firstColon = trimmed.indexOf(':');
+    if (firstColon === -1) continue;
+    const secondColon = trimmed.indexOf(':', firstColon + 1);
+    const mint = trimmed.slice(0, firstColon).trim();
+    const wallet =
+      secondColon === -1
+        ? trimmed.slice(firstColon + 1).trim()
+        : trimmed.slice(firstColon + 1, secondColon).trim();
+    const label = secondColon === -1 ? undefined : trimmed.slice(secondColon + 1).trim() || undefined;
+    if (!mint || !wallet) continue;
+    try {
+      // Validate both are real pubkeys; keep `mint` as string (matches how the
+      // supply path compares mints) and `wallet` as a PublicKey for ATA derivation.
+      new PublicKey(mint);
+      holders.push({ mint, wallet: new PublicKey(wallet), label });
+    } catch {
+      // Invalid base58 — skip this entry, never abort the whole list.
+    }
+  }
+  return holders;
+}
+
 export const config = {
   solana: {
     rpcUrl: process.env.RPCPOOL_RPC_URL || process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
@@ -50,6 +103,12 @@ export const config = {
   fees: {
     // Protocol fee rate (0.005 = 0.5%); used to report fee bps on DexScreener routes.
     protocolFeeRate: parseFloat(process.env.PROTOCOL_FEE_RATE || '0.005'),
+  },
+  circulating: {
+    // Operator-vetted wallets whose live balance of a given mint is NON-circulating
+    // (external/vesting/encumbered/protocol-owned holdings). Subtracted from the
+    // circulating supply of the matching mint. See parseExcludedHolders for format.
+    excludedHolders: parseExcludedHolders(process.env.EXCLUDED_CIRCULATING_WALLETS || ''),
   },
   alerts: {
     webhookUrl: process.env.ALERT_WEBHOOK_URL || 'https://telegram-webhook-relay.themetadao-org.workers.dev',

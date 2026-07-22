@@ -44,6 +44,11 @@ export async function getSupplyInfoWithLaunchpadAllocation(
       amount: allocation.daoTreasuryTokens.amount,
       vaultAddress: allocation.daoTreasuryTokens.vaultAddress?.toString(),
     },
+    excludedHolders: (allocation.excludedHolders ?? []).map((h) => ({
+      amount: h.amount,
+      address: h.wallet.toString(),
+      label: h.label,
+    })),
     daoAddress: allocation.daoAddress?.toString(),
     launchAddress: allocation.launchAddress?.toString(),
     version: allocation.version,

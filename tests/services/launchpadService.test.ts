@@ -51,5 +51,14 @@ describe('LaunchpadService.getTokenAllocationBreakdown', () => {
     expect(breakdown.version).toBe('v0.7');
     expect(breakdown.launchAddress?.equals(launchAddress)).toBe(true);
     expect(breakdown.totalNonCirculating.isZero()).toBe(true);
+    expect(breakdown.excludedHolders).toEqual([]);
+  });
+
+  it('resolves no excluded holders (and hits no RPC) when none are configured for the mint', async () => {
+    // Default test env sets no EXCLUDED_CIRCULATING_WALLETS, so the mint has no
+    // configured holders and getExcludedHolderBalances must short-circuit to [].
+    const svc = new LaunchpadService();
+    const balances = await (svc as any).getExcludedHolderBalances(MINT);
+    expect(balances).toEqual([]);
   });
 });

@@ -35,6 +35,17 @@ export interface AdditionalTokenAllocation {
 }
 
 /**
+ * A configured non-circulating holder resolved to its live on-chain balance.
+ * These are operator-vetted external/vesting/encumbered/protocol-owned wallets
+ * (e.g. Laso's external wallet) whose tokens are NOT "in the hands of others".
+ */
+export interface ExcludedHolderBalance {
+  wallet: PublicKey;
+  label?: string;
+  amount: BN;
+}
+
+/**
  * Complete token allocation breakdown for launchpad tokens
  */
 export interface TokenAllocationBreakdown {
@@ -63,11 +74,15 @@ export interface TokenAllocationBreakdown {
     amount: BN;
     vaultAddress?: PublicKey;
   };
+  // Operator-configured non-circulating holders (external/vesting/encumbered) for
+  // this mint, resolved to their live on-chain balances. Empty when none configured.
+  excludedHolders: ExcludedHolderBalance[];
   // DAO address (if launch completed)
   daoAddress?: PublicKey;
   // Launch address
   launchAddress?: PublicKey;
-  // Total non-circulating supply (performance package + additional tokens if unclaimed + DAO treasury)
+  // Total non-circulating supply (performance package + additional tokens if unclaimed
+  // + DAO treasury + configured excluded holders)
   totalNonCirculating: BN;
 }
 
@@ -392,6 +407,41 @@ export class LaunchpadService {
   }
 
   /**
+   * Resolve the operator-configured non-circulating holders for a mint to their
+   * live on-chain balances. These are external/vesting/encumbered/protocol-owned
+   * wallets (e.g. Laso's external wallet) whose tokens should be excluded from
+   * circulating supply. Returns [] when none are configured for this mint (no RPC).
+   *
+   * Error contract matches the rest of the breakdown: a genuinely-absent token
+   * account is 0 (the wallet simply holds none of this mint); any RPC/infra
+   * failure PROPAGATES — a silent 0 would overstate circulating supply.
+   */
+  private async getExcludedHolderBalances(baseMint: PublicKey): Promise<ExcludedHolderBalance[]> {
+    const mint = baseMint.toString();
+    const configured = config.circulating.excludedHolders.filter(h => h.mint === mint);
+    if (configured.length === 0) return [];
+
+    const balances: ExcludedHolderBalance[] = [];
+    for (const holder of configured) {
+      let amount = new BN(0);
+      try {
+        // allowOwnerOffCurve=true so PDA/program-owned holders (e.g. vesting
+        // contracts) resolve their ATA correctly, not just system wallets.
+        const ata = await getAssociatedTokenAddress(baseMint, holder.wallet, true);
+        const tokenAccount = await getAccount(this.connection, ata);
+        amount = new BN(tokenAccount.amount.toString());
+        logger.info(`[Launchpad] Excluded holder ${holder.wallet.toString()} (${holder.label ?? 'unlabeled'}) holds ${amount.toString()} tokens of ${mint}`);
+      } catch (error: any) {
+        // Genuinely-absent ATA → 0 held (correct). RPC failure must propagate.
+        if (!isTokenAccountAbsent(error)) throw error;
+        logger.info(`[Launchpad] Excluded holder ${holder.wallet.toString()} holds no ${mint} (no token account)`);
+      }
+      balances.push({ wallet: holder.wallet, label: holder.label, amount });
+    }
+    return balances;
+  }
+
+  /**
    * Get the complete token allocation breakdown for a launchpad token.
    * This provides a complete picture of where all tokens are allocated:
    * - Team Performance Package (locked)
@@ -406,13 +456,23 @@ export class LaunchpadService {
     const cached = this.getCached<TokenAllocationBreakdown>(cacheKey, config.cache.tickersTTL * 5);
     if (cached) return cached;
 
+    // Configured excluded holders are launch-independent — resolve them once and
+    // apply to every return path so an external/vesting wallet is excluded even
+    // for a token whose launch never completed (or was never launchpad-launched).
+    const excludedHolders = await this.getExcludedHolderBalances(baseMint);
+    const excludedHoldersTotal = excludedHolders.reduce(
+      (sum, h) => sum.add(h.amount),
+      new BN(0),
+    );
+
     const emptyBreakdown: TokenAllocationBreakdown = {
       version: 'v0.6',
       teamPerformancePackage: { amount: new BN(0) },
       futarchyAmmLiquidity: { amount: new BN(0) },
       meteoraLpLiquidity: { amount: new BN(0) },
       daoTreasuryTokens: { amount: new BN(0) },
-      totalNonCirculating: new BN(0),
+      excludedHolders,
+      totalNonCirculating: excludedHoldersTotal,
     };
 
     // No catch-all below: an empty breakdown is returned ONLY for the two
@@ -531,6 +591,9 @@ export class LaunchpadService {
     // Add DAO treasury tokens (protocol-controlled, not circulating)
     totalNonCirculating = totalNonCirculating.add(daoTreasuryTokens.amount);
 
+    // Add configured excluded holders (external/vesting/encumbered, not circulating)
+    totalNonCirculating = totalNonCirculating.add(excludedHoldersTotal);
+
     const breakdown: TokenAllocationBreakdown = {
       version: launch.version,
       teamPerformancePackage: {
@@ -548,6 +611,7 @@ export class LaunchpadService {
       },
       additionalTokenAllocation,
       daoTreasuryTokens,
+      excludedHolders,
       daoAddress: launch.dao,
       launchAddress: launch.launchAddress,
       totalNonCirculating,

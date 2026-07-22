@@ -176,7 +176,11 @@ Returns total supply only (plain text number).
 
 #### GET `/api/supply/:mintAddress/circulating`
 
-Returns circulating supply — total minus team performance package.
+Returns circulating supply — total minus non-circulating allocations: the team
+performance package, unclaimed additional-token allocation, DAO treasury holdings,
+and any operator-configured **excluded holders** (external/vesting/encumbered wallets
+listed in `EXCLUDED_CIRCULATING_WALLETS`). Each excluded holder's *live* on-chain
+balance is subtracted and echoed back under `allocation.excludedHolders`.
 
 ---
 
@@ -246,6 +250,7 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | **Protocol** | | |
 | `PROTOCOL_FEE_RATE` | Protocol fee rate | `0.005` (0.5%) |
 | `EXCLUDED_DAOS` | Comma-separated DAO addresses to exclude | — |
+| `EXCLUDED_CIRCULATING_WALLETS` | Non-circulating holders, comma-separated `mint:wallet` or `mint:wallet:label` (external/vesting/encumbered); each wallet's live balance of that mint is subtracted from circulating supply | — |
 | **Alerts** | | |
 | `ALERT_WEBHOOK_URL` | Telegram alert webhook URL | — |
 | `ALERT_WEBHOOK_SECRET` | Webhook secret | — |

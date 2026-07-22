@@ -84,6 +84,11 @@ export function createSupplyRouter(services: ServiceGetters): Router {
           amount: string;
           vaultAddress?: string;
         };
+        excludedHolders?: Array<{
+          amount: string;
+          address: string;
+          label?: string;
+        }>;
         daoAddress?: string;
         launchAddress?: string;
         version?: string;
@@ -92,11 +97,12 @@ export function createSupplyRouter(services: ServiceGetters): Router {
       result: supplyInfo.circulatingSupply,
     };
     
-    if (allocation.teamPerformancePackage.address || 
-        allocation.futarchyAmmLiquidity.vaultAddress || 
+    if (allocation.teamPerformancePackage.address ||
+        allocation.futarchyAmmLiquidity.vaultAddress ||
         allocation.meteoraLpLiquidity.poolAddress ||
         allocation.additionalTokenAllocation ||
-        !allocation.daoTreasuryTokens.amount.isZero()) {
+        !allocation.daoTreasuryTokens.amount.isZero() ||
+        (allocation.excludedHolders?.some(h => !h.amount.isZero()) ?? false)) {
       response.allocation = {
         teamPerformancePackageAddress: allocation.teamPerformancePackage.address?.toString(),
         futarchyAmmVaultAddress: allocation.futarchyAmmLiquidity.vaultAddress?.toString(),
@@ -105,6 +111,7 @@ export function createSupplyRouter(services: ServiceGetters): Router {
         additionalTokenAllocation: supplyInfo.allocation?.additionalTokenAllocation,
         initialTokenAllocation: supplyInfo.allocation?.initialTokenAllocation,
         daoTreasuryTokens: supplyInfo.allocation?.daoTreasuryTokens,
+        excludedHolders: supplyInfo.allocation?.excludedHolders,
         daoAddress: allocation.daoAddress?.toString(),
         launchAddress: allocation.launchAddress?.toString(),
         version: allocation.version,

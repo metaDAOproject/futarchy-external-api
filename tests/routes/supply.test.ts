@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'bun:test';
+import BN from 'bn.js';
 import request from 'supertest';
 import { createTestApp } from '../helpers/testApp.js';
+import type { LaunchpadService } from '../../src/services/launchpadService.js';
+import type { SolanaService } from '../../src/services/solanaService.js';
 
 const app = createTestApp();
 
@@ -54,9 +57,45 @@ describe('Supply Routes', () => {
   describe('GET /api/supply/:mintAddress/circulating', () => {
     it('should reject invalid mint address', async () => {
       const response = await request(app).get(`/api/supply/${invalidAddress}/circulating`);
-      
+
       expect(response.status).toBe(400);
       expect(response.body.error).toContain('not a valid Solana public key');
+    });
+
+    it('surfaces excluded holders in the allocation breakdown', async () => {
+      const holderAddress = 'SoLo9oxzLDpcq1dpqAgMwgce5WqkRDtNXK7EPnbmeta';
+      const launchpadService = {
+        getTokenAllocationBreakdown: async () => ({
+          version: 'v0.7',
+          teamPerformancePackage: { amount: new BN(0) },
+          futarchyAmmLiquidity: { amount: new BN(0) },
+          meteoraLpLiquidity: { amount: new BN(0) },
+          daoTreasuryTokens: { amount: new BN(0) },
+          excludedHolders: [{ wallet: { toString: () => holderAddress }, label: 'Laso external', amount: new BN(100) }],
+          totalNonCirculating: new BN(100),
+        }),
+      } as unknown as LaunchpadService;
+      const solanaService = {
+        getSupplyInfo: async () => ({
+          mint: validMintAddress,
+          totalSupply: '1000000',
+          circulatingSupply: '999900',
+          decimals: 6,
+          rawTotalSupply: '1000000000000',
+          allocation: {
+            excludedHolders: [{ amount: '0.0001', address: holderAddress, label: 'Laso external' }],
+          },
+        }),
+      } as unknown as SolanaService;
+      const testApp = createTestApp({ launchpadService, solanaService });
+
+      const response = await request(testApp).get(`/api/supply/${validMintAddress}/circulating`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.result).toBe('999900');
+      expect(response.body.allocation.excludedHolders).toEqual([
+        { amount: '0.0001', address: holderAddress, label: 'Laso external' },
+      ]);
     });
   });
 

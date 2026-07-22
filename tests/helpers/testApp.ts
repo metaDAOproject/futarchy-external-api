@@ -58,6 +58,7 @@ export function createMockLaunchpadService(): LaunchpadService {
       futarchyAmmLiquidity: { amount: new BN(0) },
       meteoraLpLiquidity: { amount: new BN(0) },
       daoTreasuryTokens: { amount: new BN(0) },
+      excludedHolders: [],
       totalNonCirculating: new BN(0),
     }),
   } as unknown as LaunchpadService;
