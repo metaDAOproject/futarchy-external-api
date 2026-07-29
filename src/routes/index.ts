@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { createHealthRouter } from './health.js';
 import { createMetricsRouter } from './metrics.js';
 import { createCoinGeckoRouter } from './coingecko.js';
+import { createCoinMarketCapRouter } from './coinmarketcap.js';
 
 import { createSupplyRouter } from './supply.js';
 import { createMarketRouter } from './market.js';
@@ -18,6 +19,7 @@ export function createRoutes(services: ServiceGetters): Router {
   router.use(createHealthRouter(services));
   router.use(createMetricsRouter(services));
   router.use(createCoinGeckoRouter(services));
+  router.use(createCoinMarketCapRouter(services));
   router.use(createSupplyRouter(services));
   router.use(createMarketRouter(services));
   router.use(createDexScreenerRouter(services));

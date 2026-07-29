@@ -60,6 +60,124 @@ served DB is unavailable, the endpoint returns `503` instead of reporting zero v
 
 ---
 
+### CoinMarketCap Endpoints
+
+Implements the DEX endpoints from [Section C] of CoinMarketCap's integration
+requirements. Served under `/cmc/`. The shapes mirror the CoinGecko adapter —
+CMC's DEX spec is field-for-field close — and both feeds are built from the same
+on-chain DAO discovery and rolling-24h ETL metrics.
+
+**API versioning.** At CMC's request, every endpoint is also served under an
+explicit version prefix: `/cmc/v1/summary`, `/cmc/v1/ticker`, `/cmc/v1/assets`.
+The unversioned paths remain published as-is and are treated as the current (v1)
+contract — the two are URL aliases for the same handler, so they never diverge.
+A future breaking change would land under `/cmc/v2/…` while the existing paths
+keep serving v1.
+
+`/cmc/summary` and `/cmc/ticker` carry 24h volume, so they require
+`DATABASE_PG_URL` and return `503` (never zero volume) if the served DB is
+unavailable. `/cmc/assets` is pure on-chain metadata and does not require it.
+
+No dedicated auth: like every route, CMC reuses the shared rate-limit tiers —
+anonymous by IP, or the elevated per-key bucket when a trusted `X-API-Key`
+(`TRUSTED_API_KEYS`) is sent.
+
+Set `CMC_ALLOWED_MINTS` (comma-separated base mints) to restrict the CMC feed to
+a specific set of tokens; empty (the default) serves every discovered DAO.
+
+Every CMC feed keys its per-token data (24h volume/high/low, the 24h-ago
+reference reserves, and the `/cmc/assets` identity entry) by **base mint**, and
+the served-ETL tables carry no per-pool dimension. If two discovered markets ever
+share a base mint the numbers can't be attributed to the right pair, so all three
+endpoints **fail closed** with `503` (`CMC_DUPLICATE_BASE_MINT`) rather than serve
+one market's volume/price for another. The check runs after `CMC_ALLOWED_MINTS`,
+so narrowing the allowlist to a single side of a collision serves normally. In the
+futarchy model each DAO launches its own token, so this is an anomaly guard, not
+an expected path.
+
+#### GET `/cmc/summary`
+
+24h overview of every tradeable pair.
+
+**Response:**
+```json
+[
+  {
+    "trading_pairs": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta_EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "base_currency": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta",
+    "quote_currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "type": "spot",
+    "last_price": 0.081340728222,
+    "lowest_ask": 0.081747431863,
+    "highest_bid": 0.080934024581,
+    "base_volume": 30024.8104,
+    "quote_volume": 2441.23456789,
+    "highest_price_24h": 0.085,
+    "lowest_price_24h": 0.078,
+    "price_change_percent_24h": 4.28
+  }
+]
+```
+
+`base_currency` / `quote_currency` are Solana mint (contract) addresses — the
+same ids `/cmc/assets` is keyed by, so CMC maps pairs → assets consistently.
+
+`highest_price_24h` / `lowest_price_24h` are omitted when the ETL window has no
+real high/low.
+
+`price_change_percent_24h` is the 24h price change in percent, computed from the
+AMM's **exact** price 24h ago. The FutarchyAMM price is a pure function of pool
+reserves, and reserves only change on a swap, so the reserves of the last swap
+≥24h ago (`futarchy.user_pool_swaps`) are the pool's exact state 24h ago — priced
+through the same formula as `last_price` (a true mid-vs-mid comparison). It is
+**omitted** for a market younger than 24h (no swap before the cutoff), where the
+change is undefined — never fabricated as `0%`. If the swaps source is briefly
+unavailable, the field is omitted for that response but price/volume still serve
+(unlike the volume source, whose absence returns `503`).
+
+#### GET `/cmc/ticker`
+
+24h price and volume keyed by the `BASE_QUOTE` trading pair.
+
+**Response:**
+```json
+{
+  "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta_EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": {
+    "base_id": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta",
+    "quote_id": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "base_name": "ZKFG",
+    "base_symbol": "ZKFG",
+    "quote_name": "USD Coin",
+    "quote_symbol": "USDC",
+    "last_price": 0.081340728222,
+    "base_volume": 30024.8104,
+    "quote_volume": 2441.23456789,
+    "isFrozen": 0
+  }
+}
+```
+
+#### GET `/cmc/assets`
+
+Token identity keyed by mint address (both base and quote of every pair).
+
+**Response:**
+```json
+{
+  "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta": {
+    "name": "ZKFG",
+    "symbol": "ZKFG",
+    "contractAddress": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta",
+    "can_withdraw": "true",
+    "can_deposit": "true",
+    "maker_fee": 0.005,
+    "taker_fee": 0.005
+  }
+}
+```
+
+---
+
 ### DexScreener Adapter Endpoints
 
 Implements the [DexScreener Adapter Spec v1.1](https://dexscreener.notion.site/DEX-Screener-Adapter-Specs-cc1223cdf6e74a7799599106b65dcd0e). All endpoints are served under `/dexscreener/`. Requires `DATABASE_PG_URL` to be configured for the served DB.
@@ -236,7 +354,7 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | `TRUSTED_RATE_LIMIT_MAX` | Per-bucket request count per minute for trusted keys | `600` |
 | `CACHE_TICKERS_TTL` | On-chain data cache TTL (ms) | `55000` |
 | **Served indexer DB (required — the only database this API uses)** | | |
-| `DATABASE_PG_URL` | Read-only connection to the served indexer DB (Meteora, tickers, DexScreener, first-trade-dates). **Required** — `/api/market-data` returns 503 without it. | — |
+| `DATABASE_PG_URL` | Read-only connection to the served indexer DB (Meteora, tickers, DexScreener, first-trade-dates). **Required** — `/api/market-data`, `/api/tickers`, `/cmc/summary`, `/cmc/ticker`, and the DexScreener routes return 503 without it. | — |
 | `DATABASE_PG_SSL` | Enable SSL (server cert verified against system CAs) | `false` |
 | `DATABASE_PG_CA_CERT` | PEM CA cert content for private-CA verification | — |
 | `DATABASE_PG_SSL_NO_VERIFY` | Explicit opt-out of TLS verification (stopgap only) | `false` |
@@ -246,6 +364,7 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | **Protocol** | | |
 | `PROTOCOL_FEE_RATE` | Protocol fee rate | `0.005` (0.5%) |
 | `EXCLUDED_DAOS` | Comma-separated DAO addresses to exclude | — |
+| `CMC_ALLOWED_MINTS` | Comma-separated base-mint allowlist for the `/cmc/*` routes; empty serves all. Validated at startup; if set but matching zero discovered DAOs, the CMC routes fail closed with 503. | — |
 | **Alerts** | | |
 | `ALERT_WEBHOOK_URL` | Telegram alert webhook URL | — |
 | `ALERT_WEBHOOK_SECRET` | Webhook secret | — |
@@ -263,6 +382,7 @@ src/
 ├── routes/
 │   ├── index.ts                  # Route registration
 │   ├── coingecko.ts              # GET /api/tickers
+│   ├── coinmarketcap.ts          # CoinMarketCap DEX adapter (summary/ticker/assets)
 │   ├── dexscreener.ts            # DexScreener adapter (4 endpoints)
 │   ├── market.ts                 # GET /api/market-data (user_pool ETL)
 │   ├── supply.ts                 # GET /api/supply/*
@@ -278,6 +398,7 @@ src/
 │   └── metricsService.ts         # Prometheus counters/histograms
 ├── types/
 │   ├── coingecko.ts              # CoinGecko response types
+│   ├── coinmarketcap.ts          # CoinMarketCap response types
 │   └── dexscreener.ts            # DexScreener response types
 ├── middleware/
 │   ├── errorHandler.ts           # Error handling & asyncHandler
