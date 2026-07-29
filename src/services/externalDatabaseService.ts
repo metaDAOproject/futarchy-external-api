@@ -144,6 +144,92 @@ export class ExternalDatabaseService {
   }
 
   /**
+   * Post-swap AMM reserves from the LAST spot swap at or before `now - 24h`, per
+   * token (base mint). The caller turns these into the reference price 24h ago and
+   * computes CMC's `price_change_percent_24h`.
+   *
+   * Why this is EXACT, not an estimate: FutarchyAMM spot price is a pure function
+   * of pool reserves (`quote/base`, decimal-adjusted), and AMM reserves only change
+   * when a swap executes. So the reserves of the last swap before the cutoff ARE
+   * the pool's exact state — hence exact price — at the cutoff instant. Carry-
+   * forward on an AMM is exact (unlike an orderbook, which needs a real snapshot).
+   *
+   * `amm_base_reserves`/`amm_quote_reserves` are our decoded post-swap reserves,
+   * non-NULL for every spot swap (same columns the DexScreener /events route reads).
+   * Returns RAW reserves (as strings) so the caller prices them through the SAME
+   * PriceService.calculatePrice used for `last_price` — identical decimal handling,
+   * so the percent change is a true mid-vs-mid comparison.
+   *
+   * A token with NO swap before the cutoff (first traded < 24h ago) is simply
+   * absent from the map: a 24h change is undefined for a market younger than 24h,
+   * and the caller omits the field rather than fabricate one. Throws (never masks
+   * as empty) on connection/query failure, exactly like getSpotRolling24hMetrics.
+   *
+   * The per-token LATERAL LIMIT 1 picks ONE row per base_mint; its ORDER BY must
+   * break every tie deterministically or it could pick a non-final reserve state
+   * when several swaps share the same block_time. We extend block_time DESC with
+   * the same event-order columns the DexScreener /events route uses (slot, then
+   * within-transaction inner_group/inner_ix, with signature to disambiguate
+   * distinct txns in one slot) — highest wins, so the selected row is truly the
+   * last swap at or before the cutoff. See the query for why LATERAL beats a
+   * single DISTINCT ON here (index-backed per-token seek vs full-table seq scan).
+   */
+  async getSpotReserves24hAgo(tokens: string[]): Promise<Map<string, { baseReserves: string; quoteReserves: string }>> {
+    if (tokens.length === 0) {
+      return new Map();
+    }
+    if (!this.pool || !this.isConnected) {
+      throw new Error('External database not connected');
+    }
+
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    try {
+      // Per-token LATERAL LIMIT 1 rather than a single DISTINCT ON over the whole
+      // table. `block_time <= cutoff` spans nearly all history (everything but the
+      // last 24h), so a DISTINCT ON makes the planner seq-scan + sort the entire
+      // user_pool_swaps table (measured: ~1.4M rows, ~8s, and growing unbounded).
+      // Driving from the small token array instead lets each token do a backward
+      // Index Scan on idx_user_pool_swaps_base_mint (base_mint, block_time) and
+      // stop at the first matching row — 38 index seeks, ~30ms, flat as history
+      // grows. Same result set and the SAME deterministic tie-break ordering.
+      const result = await this.pool.query(
+        `SELECT s.token, s.base_reserves, s.quote_reserves
+         FROM unnest($2::text[]) AS t(base_mint)
+         CROSS JOIN LATERAL (
+           SELECT u.base_mint                 AS token,
+                  u.amm_base_reserves::text   AS base_reserves,
+                  u.amm_quote_reserves::text  AS quote_reserves
+           FROM futarchy.user_pool_swaps u
+           WHERE u.base_mint = t.base_mint
+             AND u.source = 'futarchy_amm'
+             AND u.market_kind = 'spot'
+             AND u.block_time <= $1
+             AND u.amm_base_reserves IS NOT NULL
+             AND u.amm_quote_reserves IS NOT NULL
+             AND u.amm_base_reserves > 0
+           ORDER BY u.block_time DESC, u.slot DESC, u.signature DESC, u.inner_group DESC, u.inner_ix DESC
+           LIMIT 1
+         ) s`,
+        [cutoff, tokens]
+      );
+
+      const reservesMap = new Map<string, { baseReserves: string; quoteReserves: string }>();
+      for (const row of result.rows) {
+        if (row.base_reserves == null || row.quote_reserves == null) continue;
+        reservesMap.set(row.token, {
+          baseReserves: row.base_reserves,
+          quoteReserves: row.quote_reserves,
+        });
+      }
+      return reservesMap;
+    } catch (error: any) {
+      logger.error('[ExternalDB] Error getting 24h-ago spot reserves from user_pool_swaps:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Daily Meteora volumes from the unified `futarchy.user_pool_daily` (source=
    * 'meteora') in the served DB — the user_pool ETL output (a faithful, v0_6_daos-
    * filtered map of the meteora accounting ETL's meteora_daily view). Reading the

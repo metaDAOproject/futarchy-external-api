@@ -1,0 +1,467 @@
+import { Router, type Request, type Response } from 'express';
+import BN from 'bn.js';
+import type {
+  CoinMarketCapTicker,
+  CoinMarketCapTickerResponse,
+  CoinMarketCapSummaryPair,
+  CoinMarketCapAsset,
+  CoinMarketCapAssetsResponse,
+} from '../types/coinmarketcap.js';
+import type { DaoTickerData } from '../services/futarchyService.js';
+import type { ServiceGetters } from './types.js';
+import { AppError, asyncHandler } from '../middleware/errorHandler.js';
+import { config } from '../config.js';
+import { logger } from '../utils/logger.js';
+import { sendAlert } from '../utils/alerts.js';
+
+// Fees reported on /cmc/assets. Both maker and taker pay the same flat protocol
+// fee on the FutarchyAMM — there is no maker/taker distinction on an AMM.
+const PROTOCOL_FEE_RATE = config.fees.protocolFeeRate;
+
+/**
+ * Parse a served-ETL numeric metric that must be finite. A non-finite value for
+ * an INCLUDED pair means contract drift produced corrupt data — surface it as a
+ * 500 (never a partial valid-looking 200). Same integrity rule for volume and
+ * high/low so no corrupt field can slip through as a silently-omitted extreme.
+ *
+ * Uses a FULL-STRING numeric parse (Number, not parseFloat): parseFloat accepts
+ * a valid numeric prefix and silently drops the rest ("12abc" → 12), which would
+ * emit truncated financial data as a valid-looking 200. Number() rejects any
+ * trailing garbage outright (→ NaN). An empty/blank string is likewise rejected
+ * (Number('') is 0, which would masquerade as a genuine zero) so a missing field
+ * fails closed instead of reading as "no volume".
+ */
+function parseFinite(raw: string, field: string, mint: string): number {
+  const value = raw.trim() === '' ? NaN : Number(raw);
+  if (!Number.isFinite(value)) {
+    throw AppError.internal(
+      `Malformed 24h ${field} from the served ETL for ${mint}`,
+      'CMC_MALFORMED_METRIC'
+    );
+  }
+  return value;
+}
+
+/**
+ * Fallback identity label for a token. Shared by /cmc/ticker (inline name/symbol)
+ * and /cmc/assets so the two feeds ALWAYS report the same name/symbol for a given
+ * mint. Falls back to a mint prefix when on-chain metadata is missing — never an
+ * empty string, since CMC's DEX spec marks base/quote name+symbol mandatory.
+ */
+function identityLabel(value: string | undefined, mint: string): string {
+  return value || mint.slice(0, 8);
+}
+
+/**
+ * Apply the optional CMC allowlist (config.coinmarketcap.allowedMints). An empty
+ * allowlist means "serve every discovered DAO" — same default as the CoinGecko
+ * and DexScreener adapters.
+ *
+ * Fails CLOSED when ANY configured mint is absent from the discovered DAOs.
+ * Operators allowlist the exact tokens they expect to serve, so a missing one is
+ * never benign — it is a stale/typo'd mint, an EXCLUDED_DAOS collision, or a
+ * discovery outage. Serving the remaining pairs as a 200 would read as "that
+ * token delisted" to a poller, so we surface it as 503 + alert (naming the
+ * missing mints) instead — it retries and we get paged.
+ */
+function filterAllowed(daos: DaoTickerData[]): DaoTickerData[] {
+  const allowed = config.coinmarketcap.allowedMints;
+  if (allowed.size === 0) return daos;
+
+  const discovered = new Set(daos.map(dao => dao.baseMint.toString()));
+  const missing = [...allowed].filter(mint => !discovered.has(mint));
+  if (missing.length > 0) {
+    sendAlert(
+      `CMC_ALLOWED_MINTS not found among ${daos.length} discovered DAOs: ${missing.join(', ')} — refusing to serve a partial feed`,
+      { cooldownKey: 'cmc-allowlist-missing', cooldownMs: 10 * 60 * 1000 }
+    );
+    throw AppError.serviceUnavailable(
+      'CMC allowlist includes markets not currently discovered',
+      'CMC_ALLOWLIST_NO_MATCH'
+    );
+  }
+
+  return daos.filter(dao => allowed.has(dao.baseMint.toString()));
+}
+
+/**
+ * Fail CLOSED when two served DAOs share a base mint.
+ *
+ * Every CMC feed keys its per-token financial data by base mint: rolling-24h
+ * volume/high/low (user_pool_spot_ohlcv, GROUP BY token), the 24h-ago reference
+ * reserves behind price_change_percent_24h (user_pool_swaps, DISTINCT ON
+ * base_mint), and the /cmc/assets identity entry. None of those served-ETL
+ * tables carry a per-pool dimension, so if one base mint trades in more than one
+ * discovered market there is NO way to attribute volume / price / metadata to the
+ * right pair — one market's numbers would be silently served for another, and the
+ * pair that loses the base-mint→dao key collision would be emitted with a false
+ * zero volume. Rather than serve mis-attributed financial data, refuse the whole
+ * feed with a 503 + alert so a poller retries and we get paged.
+ *
+ * In the futarchy model each DAO launches its own token, so a base-mint collision
+ * is not expected in practice — it signals a launch anomaly, an EXCLUDED_DAOS
+ * gap, or a discovery bug, exactly the kind of thing that should page rather than
+ * quietly emit wrong numbers. Runs AFTER the allowlist filter, so a collision
+ * that the operator has already narrowed away (only one side allowlisted) is not
+ * treated as ambiguous.
+ */
+function assertUniqueBaseMints(daos: DaoTickerData[]): void {
+  const seen = new Set<string>();
+  const collisions = new Set<string>();
+  for (const dao of daos) {
+    const mint = dao.baseMint.toString();
+    if (seen.has(mint)) collisions.add(mint);
+    else seen.add(mint);
+  }
+  if (collisions.size > 0) {
+    const mints = [...collisions].join(', ');
+    sendAlert(
+      `CMC discovered multiple DAOs sharing a base mint (${mints}) — served ETL metrics are keyed by base mint and cannot be attributed per market; refusing to serve mis-attributed data`,
+      { cooldownKey: 'cmc-duplicate-base-mint', cooldownMs: 10 * 60 * 1000 }
+    );
+    throw AppError.serviceUnavailable(
+      'CMC discovered multiple markets sharing a base mint',
+      'CMC_DUPLICATE_BASE_MINT'
+    );
+  }
+}
+
+/**
+ * The DAO set every CMC endpoint serves: apply the operator allowlist, then
+ * assert no two survivors share a base mint. Both feeds (buildPairs and the
+ * DB-free /cmc/assets route) go through this so their notion of "which markets
+ * exist" — and the fail-closed guards around it — can never diverge.
+ */
+function servedDaos(daos: DaoTickerData[]): DaoTickerData[] {
+  const filtered = filterAllowed(daos);
+  assertUniqueBaseMints(filtered);
+  return filtered;
+}
+
+/**
+ * A single tradeable pair, enriched with live price/spread (from spot reserves)
+ * and rolling-24h volume/high/low (from the served ETL). Shared by /cmc/summary
+ * and /cmc/ticker so both feeds are always internally consistent.
+ */
+interface CmcPair {
+  tradingPair: string; // `${baseMint}_${quoteMint}`
+  baseId: string;
+  quoteId: string;
+  baseName: string;
+  baseSymbol: string;
+  quoteName: string;
+  quoteSymbol: string;
+  lastPrice: number;
+  bid: number;
+  ask: number;
+  baseVolume: number;
+  quoteVolume: number;
+  high24h?: number;
+  low24h?: number;
+  // Present only when a true 24h-ago price exists (the pair had a swap ≥24h ago).
+  // Omitted for markets younger than 24h — a 24h change is undefined there.
+  priceChangePercent24h?: number;
+}
+
+// CMC asked us to version the API URL. We keep serving the original unversioned
+// paths (`/cmc/summary`, …) that are already published and consumed AS-IS, and
+// ALSO expose the identical handlers under an explicit `/cmc/v1/…` prefix so a
+// consumer can pin a version. Both prefixes map to the same handler — this is a
+// URL alias, not a behavioural fork — so the two stay in lockstep and there is
+// nothing to keep in sync. Introduce `/cmc/v2/…` only when a breaking change
+// forces it; the unversioned path is treated as the current (v1) contract.
+const CMC_PREFIXES = ['/cmc', '/cmc/v1'] as const;
+
+/** Both the unversioned and the v1-prefixed path for a CMC endpoint. */
+function cmcPaths(name: string): string[] {
+  return CMC_PREFIXES.map(prefix => `${prefix}/${name}`);
+}
+
+export function createCoinMarketCapRouter(services: ServiceGetters): Router {
+  const router = Router();
+  const { getFutarchyService, getPriceService, getExternalDatabaseService } = services;
+
+  /**
+   * Build the enriched pair list shared by /cmc/summary and /cmc/ticker.
+   *
+   * Mirrors the CoinGecko /api/tickers path: the served ETL DB is the source of
+   * truth for 24h volume, so its absence is surfaced as 503 (never masked as
+   * zero volume for a financial feed). Price/spread/liquidity come from live
+   * spot-pool reserves via the same PriceService the CoinGecko adapter uses.
+   */
+  async function buildPairs(
+    req: Request,
+    opts: { withPriceChange?: boolean } = {}
+  ): Promise<CmcPair[]> {
+    const futarchyService = getFutarchyService();
+    const priceService = getPriceService();
+    const externalDatabaseService = getExternalDatabaseService();
+
+    if (!externalDatabaseService?.isAvailable()) {
+      logger.warn('Served database unavailable for /cmc endpoint', { requestId: req.requestId });
+      sendAlert(
+        'Served database unavailable for /cmc — refusing to report zero volume',
+        { cooldownKey: 'cmc-served-db-unavailable', cooldownMs: 10 * 60 * 1000 }
+      );
+      throw AppError.serviceUnavailable('Served database not available', 'SERVED_DB_UNAVAILABLE');
+    }
+
+    const allDaos = servedDaos(await futarchyService.getAllDaos());
+
+    // Rolling-24h spot metrics keyed by base mint (token) → mapped to dao (pool_id),
+    // identical to the CoinGecko adapter's single source.
+    const tokenToDaoMap = new Map<string, string>();
+    for (const dao of allDaos) {
+      tokenToDaoMap.set(dao.baseMint.toString(), dao.daoAddress.toString());
+    }
+
+    const baseMints = allDaos.map(dao => dao.baseMint.toString());
+    const spotMetrics = await externalDatabaseService.getSpotRolling24hMetrics(baseMints);
+
+    const volumeByDao = new Map<string, { base_volume_24h: string; target_volume_24h: string; high_24h: string; low_24h: string }>();
+    for (const [token, metrics] of spotMetrics.entries()) {
+      const daoAddress = tokenToDaoMap.get(token);
+      if (!daoAddress) continue;
+      volumeByDao.set(daoAddress, {
+        base_volume_24h: metrics.base_volume_24h,
+        target_volume_24h: metrics.target_volume_24h,
+        high_24h: metrics.high_24h,
+        low_24h: metrics.low_24h,
+      });
+    }
+
+    // Reserves from the last spot swap ≥24h ago, per token — the source for
+    // price_change_percent_24h (summary only). A failure here is NON-fatal: the
+    // core feed (price + volume) is unaffected, and price_change is definitionally
+    // optional (young markets omit it), so an outage of the swaps source degrades
+    // to "field absent" rather than taking the whole feed down. This differs from
+    // the volume source, whose absence WOULD be a false financial claim (0 volume).
+    let reserves24hByToken = new Map<string, { baseReserves: string; quoteReserves: string }>();
+    if (opts.withPriceChange) {
+      try {
+        reserves24hByToken = await externalDatabaseService.getSpotReserves24hAgo(baseMints);
+      } catch (error) {
+        logger.error('Failed to load 24h-ago reserves for /cmc price change; serving feed without it', error, {
+          requestId: req.requestId,
+        });
+        sendAlert(
+          'CMC price_change_percent_24h source (user_pool_swaps) query failed — serving feed without 24h change',
+          { cooldownKey: 'cmc-price-change-source', cooldownMs: 10 * 60 * 1000 }
+        );
+      }
+    }
+
+    const pairs: CmcPair[] = [];
+    for (const dao of allDaos) {
+      try {
+        const {
+          daoAddress, baseMint, quoteMint, baseDecimals, quoteDecimals, poolData,
+          baseSymbol, baseName, quoteSymbol, quoteName,
+        } = dao;
+
+        const lastPriceStr = priceService.calculatePrice(
+          poolData.baseReserves,
+          poolData.quoteReserves,
+          baseDecimals,
+          quoteDecimals
+        );
+        if (!lastPriceStr) continue;
+
+        const priceNum = parseFloat(lastPriceStr);
+        const spread = priceService.calculateSpread(priceNum);
+        if (!spread) continue;
+
+        // Metric semantics for a financial feed:
+        //  - metrics ABSENT  → the pair simply had no spot trades in 24h; 0 volume
+        //    and no high/low is the genuine, correct answer (not an error).
+        //  - metrics PRESENT but a field is corrupt (non-finite) for an INCLUDED
+        //    pair → served-DB contract drift. Do NOT silently drop/omit it (that
+        //    turns schema drift into a valid-looking partial 200); throw so the
+        //    whole request fails 5xx via asyncHandler and we get paged.
+        //
+        // '0' is the ETL's "no data" sentinel for high/low, so a genuine '0' is
+        // treated as absent (omitted), NOT parsed — only non-'0' values are.
+        const metrics = volumeByDao.get(daoAddress.toString());
+        let baseVolume = 0;
+        let quoteVolume = 0;
+        let high24h: number | undefined;
+        let low24h: number | undefined;
+        if (metrics) {
+          baseVolume = parseFinite(metrics.base_volume_24h, 'base volume', baseMint.toString());
+          quoteVolume = parseFinite(metrics.target_volume_24h, 'quote volume', baseMint.toString());
+          if (metrics.high_24h !== '0') {
+            high24h = parseFinite(metrics.high_24h, '24h high', baseMint.toString());
+          }
+          if (metrics.low_24h !== '0') {
+            low24h = parseFinite(metrics.low_24h, '24h low', baseMint.toString());
+          }
+        }
+
+        const pair: CmcPair = {
+          tradingPair: `${baseMint.toString()}_${quoteMint.toString()}`,
+          baseId: baseMint.toString(),
+          quoteId: quoteMint.toString(),
+          baseName: identityLabel(baseName, baseMint.toString()),
+          baseSymbol: identityLabel(baseSymbol, baseMint.toString()),
+          quoteName: identityLabel(quoteName, quoteMint.toString()),
+          quoteSymbol: identityLabel(quoteSymbol, quoteMint.toString()),
+          lastPrice: priceNum,
+          bid: parseFloat(spread.bid),
+          ask: parseFloat(spread.ask),
+          baseVolume,
+          quoteVolume,
+        };
+        if (high24h !== undefined) pair.high24h = high24h;
+        if (low24h !== undefined) pair.low24h = low24h;
+
+        // price_change_percent_24h — computed from the last swap ≥24h ago, priced
+        // through the SAME calculatePrice as last_price (identical decimal handling
+        // → a true mid-vs-mid comparison). Omitted (never fabricated) when: the
+        // market is younger than 24h (no ref in the map), or the reference price
+        // can't be computed / is ≤0. A bad historical reserve is a per-pair omit,
+        // not a 500 — unlike the primary price/volume feed.
+        const ref = reserves24hByToken.get(baseMint.toString());
+        if (ref) {
+          const refPriceStr = priceService.calculatePrice(
+            new BN(ref.baseReserves),
+            new BN(ref.quoteReserves),
+            baseDecimals,
+            quoteDecimals
+          );
+          const refPrice = refPriceStr ? parseFloat(refPriceStr) : NaN;
+          if (Number.isFinite(refPrice) && refPrice > 0) {
+            pair.priceChangePercent24h = ((priceNum - refPrice) / refPrice) * 100;
+          }
+        }
+
+        pairs.push(pair);
+      } catch (error) {
+        // Intentional financial-integrity failures (AppError, e.g. malformed ETL
+        // volume above) MUST propagate — rethrow so the request fails 5xx rather
+        // than being downgraded to a silently-dropped pair.
+        if (error instanceof AppError) throw error;
+        // Otherwise this is a per-pair skip ONLY (identical to the CoinGecko
+        // adapter's per-ticker catch): drop a single pair whose price/spread can't
+        // be computed so one bad pool doesn't sink the whole feed. This does NOT
+        // mask an infrastructure/data outage as a 200 — those surface as 5xx
+        // before we reach here: getAllDaos() throws (its "refusing to serve an
+        // empty set" guard) if the RPC scan degrades, and getSpotRolling24hMetrics()
+        // throws on any served-DB/query failure. Both propagate via asyncHandler.
+        logger.error('Error building CMC pair', error, {
+          daoAddress: dao.daoAddress.toString(),
+          requestId: req.requestId,
+        });
+      }
+    }
+
+    return pairs;
+  }
+
+  // ---------------------------------------------------------------
+  // GET /cmc/summary — 24h overview of every tradeable pair (array).
+  //
+  // price_change_percent_24h is computed from AMM swap history (see buildPairs):
+  // the FutarchyAMM price is a pure function of pool reserves and reserves only
+  // move on a swap, so the last swap ≥24h ago gives the EXACT price 24h ago. It is
+  // omitted (never fabricated) for markets younger than 24h, where the change is
+  // undefined. This is the only endpoint that carries it (CMC's ticker/A2 does not).
+  // ---------------------------------------------------------------
+  router.get(cmcPaths('summary'), asyncHandler(async (req: Request, res: Response) => {
+    const pairs = await buildPairs(req, { withPriceChange: true });
+
+    const summary: CoinMarketCapSummaryPair[] = pairs.map(p => {
+      const entry: CoinMarketCapSummaryPair = {
+        trading_pairs: p.tradingPair,
+        base_currency: p.baseId,
+        quote_currency: p.quoteId,
+        type: 'spot',
+        last_price: p.lastPrice,
+        lowest_ask: p.ask,
+        highest_bid: p.bid,
+        base_volume: p.baseVolume,
+        quote_volume: p.quoteVolume,
+      };
+      if (p.high24h !== undefined) entry.highest_price_24h = p.high24h;
+      if (p.low24h !== undefined) entry.lowest_price_24h = p.low24h;
+      if (p.priceChangePercent24h !== undefined) entry.price_change_percent_24h = p.priceChangePercent24h;
+      return entry;
+    });
+
+    res.json(summary);
+  }));
+
+  // ---------------------------------------------------------------
+  // GET /cmc/ticker — 24h price/volume keyed by `BASE_QUOTE` pair.
+  //
+  // base_id / quote_id carry the Solana mint (contract address), NOT a CMC
+  // "unified cryptoasset id". Our tokens are not yet listed on CMC, so no unified
+  // id exists — and for a DEX the on-chain contract address IS the canonical asset
+  // identifier. Crucially it is the SAME id /cmc/assets is keyed by, so CMC can map
+  // ticker → asset consistently (ticker.base_id === assets[key].contractAddress).
+  // Emitting the "unknown" sentinel 0 instead would make every pair unmappable.
+  // ---------------------------------------------------------------
+  router.get(cmcPaths('ticker'), asyncHandler(async (req: Request, res: Response) => {
+    const pairs = await buildPairs(req);
+
+    const ticker: CoinMarketCapTickerResponse = {};
+    for (const p of pairs) {
+      const entry: CoinMarketCapTicker = {
+        base_id: p.baseId,
+        quote_id: p.quoteId,
+        base_name: p.baseName,
+        base_symbol: p.baseSymbol,
+        quote_name: p.quoteName,
+        quote_symbol: p.quoteSymbol,
+        last_price: p.lastPrice,
+        base_volume: p.baseVolume,
+        quote_volume: p.quoteVolume,
+        isFrozen: 0,
+      };
+      ticker[p.tradingPair] = entry;
+    }
+
+    res.json(ticker);
+  }));
+
+  // ---------------------------------------------------------------
+  // GET /cmc/assets — token identity keyed by mint address.
+  //
+  // Pure on-chain metadata (symbol/name/decimals via getAllDaos) — no volume, so
+  // it does NOT require the served DB. Exposes both the base and quote token of
+  // every (allowlisted) pair.
+  // ---------------------------------------------------------------
+  router.get(cmcPaths('assets'), asyncHandler(async (req: Request, res: Response) => {
+    const futarchyService = getFutarchyService();
+    const allDaos = servedDaos(await futarchyService.getAllDaos());
+
+    const assets: CoinMarketCapAssetsResponse = {};
+
+    const addAsset = (mint: string, symbol: string | undefined, name: string | undefined): void => {
+      // First writer wins. servedDaos() guarantees base mints are unique across
+      // the served set, so the ONLY re-add here is a shared quote (e.g. USDC),
+      // identical across pairs — skipping it is safe and cannot mask a divergent
+      // base-token identity (that case fails closed upstream via assertUniqueBaseMints).
+      if (assets[mint]) return;
+      const asset: CoinMarketCapAsset = {
+        name: identityLabel(name, mint),
+        symbol: identityLabel(symbol, mint),
+        contractAddress: mint,
+        can_withdraw: 'true',
+        can_deposit: 'true',
+        maker_fee: PROTOCOL_FEE_RATE,
+        taker_fee: PROTOCOL_FEE_RATE,
+      };
+      assets[mint] = asset;
+    };
+
+    for (const dao of allDaos) {
+      addAsset(dao.baseMint.toString(), dao.baseSymbol, dao.baseName);
+      addAsset(dao.quoteMint.toString(), dao.quoteSymbol, dao.quoteName);
+    }
+
+    logger.debug('Built CMC assets', { count: Object.keys(assets).length, requestId: req.requestId });
+    res.json(assets);
+  }));
+
+  return router;
+}
