@@ -1,4 +1,76 @@
 import { PublicKey } from '@solana/web3.js';
+
+/**
+ * A wallet whose live on-chain balance of a specific mint is treated as
+ * non-circulating (external/vesting/encumbered/protocol-owned holdings that are
+ * NOT "in the hands of others"). Scoped per-mint so we only ever exclude a
+ * balance an operator has explicitly vetted as encumbered.
+ */
+export interface ExcludedHolder {
+  /** Base mint whose balance held by `wallet` is excluded from circulating supply. */
+  mint: string;
+  /** Wallet (owner) address that holds the encumbered tokens. */
+  wallet: PublicKey;
+  /** Optional human-readable tag surfaced in the supply allocation response. */
+  label?: string;
+}
+
+/**
+ * Parse the `EXCLUDED_CIRCULATING_WALLETS` env value into structured holders.
+ *
+ * Format: comma-separated entries, each `<mint>:<wallet>` or
+ * `<mint>:<wallet>:<label>`. Whitespace is trimmed and blank entries (e.g. a
+ * trailing comma) are ignored. The label may contain anything except a comma
+ * (which delimits entries).
+ *
+ * A malformed NON-blank entry (missing mint/wallet, invalid base58 pubkey)
+ * THROWS. This is a financial serving path: silently dropping a typo'd exclusion
+ * would overstate circulating supply, so we fail fast at startup instead — the
+ * same fail-loud-not-quietly-wrong contract the rest of the supply path follows.
+ */
+export function parseExcludedHolders(raw: string): ExcludedHolder[] {
+  const holders: ExcludedHolder[] = [];
+  // Dedupe by mint:wallet — a duplicated env entry (copy/paste) would otherwise be
+  // resolved and subtracted twice, double-counting the same live balance and
+  // understating circulating supply.
+  const seen = new Set<string>();
+  for (const entry of raw.split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue; // blank entry / trailing comma — not an error
+    // Split into at most 3 parts so a label may itself contain ':'.
+    const firstColon = trimmed.indexOf(':');
+    const secondColon = firstColon === -1 ? -1 : trimmed.indexOf(':', firstColon + 1);
+    const mint = firstColon === -1 ? '' : trimmed.slice(0, firstColon).trim();
+    const wallet =
+      firstColon === -1
+        ? ''
+        : secondColon === -1
+          ? trimmed.slice(firstColon + 1).trim()
+          : trimmed.slice(firstColon + 1, secondColon).trim();
+    const label = secondColon === -1 ? undefined : trimmed.slice(secondColon + 1).trim() || undefined;
+    if (!mint || !wallet) {
+      throw new Error(
+        `Invalid EXCLUDED_CIRCULATING_WALLETS entry "${trimmed}" — expected "<mint>:<wallet>" or "<mint>:<wallet>:<label>"`,
+      );
+    }
+    try {
+      // Validate both are real pubkeys; keep `mint` as string (matches how the
+      // supply path compares mints) and `wallet` as a PublicKey for lookups.
+      new PublicKey(mint);
+      const walletKey = new PublicKey(wallet); // throws if invalid
+      const dedupeKey = `${mint}:${wallet}`;
+      if (seen.has(dedupeKey)) continue; // drop exact duplicate (keep first occurrence)
+      seen.add(dedupeKey);
+      holders.push({ mint, wallet: walletKey, label });
+    } catch {
+      throw new Error(
+        `Invalid EXCLUDED_CIRCULATING_WALLETS entry "${trimmed}" — mint and wallet must be valid base58 pubkeys`,
+      );
+    }
+  }
+  return holders;
+}
+
 export const config = {
   solana: {
     rpcUrl: process.env.RPCPOOL_RPC_URL || process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
@@ -50,6 +122,12 @@ export const config = {
   fees: {
     // Protocol fee rate (0.005 = 0.5%); used to report fee bps on DexScreener routes.
     protocolFeeRate: parseFloat(process.env.PROTOCOL_FEE_RATE || '0.005'),
+  },
+  circulating: {
+    // Operator-vetted wallets whose live balance of a given mint is NON-circulating
+    // (external/vesting/encumbered/protocol-owned holdings). Subtracted from the
+    // circulating supply of the matching mint. See parseExcludedHolders for format.
+    excludedHolders: parseExcludedHolders(process.env.EXCLUDED_CIRCULATING_WALLETS || ''),
   },
   coinmarketcap: {
     // Optional allowlist of base-mint addresses exposed on the CoinMarketCap

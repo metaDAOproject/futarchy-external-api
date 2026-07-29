@@ -198,7 +198,9 @@ Returns the latest Solana slot for which swap data is available.
 
 #### GET `/dexscreener/asset?id=:mintAddress`
 
-Returns token metadata for a given Solana mint address. Fetched from on-chain Metaplex Token Metadata.
+Returns token metadata and supply for a given Solana mint address. Supply is
+calculated from one confirmed mint/allocation snapshot. If supply cannot be
+verified, the endpoint returns `503` with code `SUPPLY_UNAVAILABLE`.
 
 **Response:**
 ```json
@@ -207,6 +209,8 @@ Returns token metadata for a given Solana mint address. Fetched from on-chain Me
     "id": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta",
     "name": "ZKFG",
     "symbol": "ZKFG",
+    "totalSupply": 1000000,
+    "circulatingSupply": 875000,
     "metadata": {
       "decimals": "6"
     }
@@ -294,7 +298,15 @@ Returns total supply only (plain text number).
 
 #### GET `/api/supply/:mintAddress/circulating`
 
-Returns circulating supply — total minus team performance package.
+Returns circulating supply — total minus non-circulating allocations: the team
+performance package, the additional-token allocation, DAO treasury holdings, and any
+operator-configured **excluded holders** (external/vesting/encumbered wallets listed
+in `EXCLUDED_CIRCULATING_WALLETS`). Each excluded holder's on-chain balance is read
+with the other live non-circulating balances at one confirmed slot, cached for
+`CACHE_TICKERS_TTL` (55 seconds by default), subtracted, and echoed back under
+`allocation.excludedHolders`. The shared slot is returned as
+`allocation.balanceSnapshotSlot`. This excludes direct SPL token balances only; it
+does not decode fractional ownership of DAMM pool positions.
 
 ---
 
@@ -364,6 +376,7 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | **Protocol** | | |
 | `PROTOCOL_FEE_RATE` | Protocol fee rate | `0.005` (0.5%) |
 | `EXCLUDED_DAOS` | Comma-separated DAO addresses to exclude | — |
+| `EXCLUDED_CIRCULATING_WALLETS` | Non-circulating direct SPL token holders, comma-separated `mint:wallet` or `mint:wallet:label` (external/vesting/encumbered); each wallet's live balance of that mint is subtracted from circulating supply. DAMM pool-position ownership is not decoded. | — |
 | `CMC_ALLOWED_MINTS` | Comma-separated base-mint allowlist for the `/cmc/*` routes; empty serves all. Validated at startup; if set but matching zero discovered DAOs, the CMC routes fail closed with 503. | — |
 | **Alerts** | | |
 | `ALERT_WEBHOOK_URL` | Telegram alert webhook URL | — |

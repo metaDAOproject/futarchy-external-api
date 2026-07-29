@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { PublicKey } from '@solana/web3.js';
-import { asyncHandler } from '../middleware/errorHandler.js';
+import { AppError, asyncHandler } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 import type { ServiceGetters } from './types.js';
@@ -28,7 +28,8 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
   // valid pubkeys would grow these maps (and burn RPC per miss) without limit.
   const assetCache = new Map<string, { data: DexScreenerAssetResponse; expiresAt: number }>();
   const pairCache = new Map<string, { data: DexScreenerPairResponse; expiresAt: number }>();
-  const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  const ASSET_CACHE_TTL_MS = config.cache.tickersTTL;
+  const PAIR_CACHE_TTL_MS = 5 * 60 * 1000;
   const CACHE_MAX_ENTRIES = 1000;
 
   function cachePut<T>(cache: Map<string, T>, key: string, value: T): void {
@@ -97,47 +98,54 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       return res.status(400).json({ error: 'Invalid asset id (not a valid Solana address)' });
     }
 
-    const [metadata, decimals] = await Promise.all([
-      futarchyService.getTokenMetadata(mintPubkey),
-      futarchyService.getTokenDecimals(mintPubkey),
-    ]);
-
-    let totalSupply: number | undefined;
-    let circulatingSupply: number | undefined;
+    let totalSupply: number;
+    let circulatingSupply: number;
     try {
       const { supplyInfo } = await getSupplyInfoWithLaunchpadAllocation(
         id,
         solanaService,
         launchpadService,
       );
-      const total = parseFloat(supplyInfo.totalSupply);
-      const circ = parseFloat(supplyInfo.circulatingSupply);
-      if (Number.isFinite(total) && Number.isFinite(circ)) {
-        totalSupply = total;
-        circulatingSupply = circ;
+      const total = Number(supplyInfo.totalSupply);
+      const circ = Number(supplyInfo.circulatingSupply);
+      if (!Number.isFinite(total) || !Number.isFinite(circ)) {
+        throw new Error('Supply response was not a finite number');
       }
+      totalSupply = total;
+      circulatingSupply = circ;
     } catch (err) {
       logger.warn('[DexScreener] /asset could not load supply', {
         mint: id,
         error: err instanceof Error ? err.message : String(err),
       });
+      throw AppError.serviceUnavailable(
+        'Supply data temporarily unavailable',
+        'SUPPLY_UNAVAILABLE',
+      );
     }
+
+    const [metadata, decimals] = await Promise.all([
+      futarchyService.getTokenMetadata(mintPubkey),
+      futarchyService.getTokenDecimals(mintPubkey),
+    ]);
 
     const response: DexScreenerAssetResponse = {
       asset: {
         id,
         name: metadata?.name || id.slice(0, 8),
         symbol: metadata?.symbol || id.slice(0, 8),
-        ...(totalSupply !== undefined && circulatingSupply !== undefined
-          ? { totalSupply, circulatingSupply }
-          : {}),
+        totalSupply,
+        circulatingSupply,
         metadata: {
           decimals: String(decimals),
         },
       },
     };
 
-    cachePut(assetCache, id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
+    cachePut(assetCache, id, {
+      data: response,
+      expiresAt: Date.now() + ASSET_CACHE_TTL_MS,
+    });
     res.json(response);
   }));
 
@@ -196,7 +204,10 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       },
     };
 
-    cachePut(pairCache, id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
+    cachePut(pairCache, id, {
+      data: response,
+      expiresAt: Date.now() + PAIR_CACHE_TTL_MS,
+    });
     res.json(response);
   }));
 
