@@ -52,6 +52,8 @@ export interface TokenSupplyInfo {
       address: string;
       label?: string;
     }>;
+    // Confirmed slot shared by live non-circulating balance reads.
+    balanceSnapshotSlot?: number;
     // DAO address
     daoAddress?: string;
     // Launch address
@@ -93,6 +95,7 @@ export interface TokenAllocationInput {
     address: string;
     label?: string;
   }>;
+  balanceSnapshotSlot?: number;
   daoAddress?: string;
   launchAddress?: string;
   version?: string;
@@ -117,6 +120,56 @@ export class SolanaService {
 
   private setCache(key: string, data: any): void {
     this.cache.set(key, { data, timestamp: Date.now() });
+  }
+
+  private assertNonOverlappingAllocations(allocation: TokenAllocationInput): void {
+    const occupiedOwners = new Map<string, string>();
+    const addOccupiedOwner = (address: string | undefined, category: string, amount: BN): void => {
+      if (address && amount.gt(new BN(0))) {
+        const existingCategory = occupiedOwners.get(address);
+        if (existingCategory) {
+          throw new Error(
+            `Allocation owner ${address} overlaps the ${existingCategory} and ${category} allocations`,
+          );
+        }
+        occupiedOwners.set(address, category);
+      }
+    };
+
+    addOccupiedOwner(
+      allocation.teamPerformancePackage.address,
+      'team performance package',
+      allocation.teamPerformancePackage.amount,
+    );
+    addOccupiedOwner(
+      allocation.daoTreasuryTokens?.vaultAddress,
+      'DAO treasury',
+      allocation.daoTreasuryTokens?.amount ?? new BN(0),
+    );
+    if (allocation.additionalTokenAllocation && !allocation.additionalTokenAllocation.claimed) {
+      addOccupiedOwner(
+        allocation.additionalTokenAllocation.recipient,
+        'unclaimed additional-token allocation',
+        allocation.additionalTokenAllocation.amount,
+      );
+    }
+
+    const seenExcludedOwners = new Set<string>();
+    for (const holder of allocation.excludedHolders ?? []) {
+      if (seenExcludedOwners.has(holder.address)) {
+        throw new Error(
+          `Excluded holder ${holder.address} is configured more than once`,
+        );
+      }
+      seenExcludedOwners.add(holder.address);
+
+      const overlappingCategory = occupiedOwners.get(holder.address);
+      if (overlappingCategory && holder.amount.gt(new BN(0))) {
+        throw new Error(
+          `Excluded holder ${holder.address} overlaps the ${overlappingCategory} allocation`,
+        );
+      }
+    }
   }
 
   /**
@@ -178,21 +231,60 @@ export class SolanaService {
    * @returns Promise<TokenSupplyInfo> - Complete supply information with allocation details
    */
   async getSupplyInfo(mintAddress: string, allocation?: TokenAllocationInput): Promise<TokenSupplyInfo> {
-    const additionalAmount = allocation?.additionalTokenAllocation?.amount || new BN(0);
-    const daoTreasuryAmount = allocation?.daoTreasuryTokens?.amount || new BN(0);
+    if (allocation) {
+      this.assertNonOverlappingAllocations(allocation);
+    }
+
     const excludedHolders = allocation?.excludedHolders || [];
     const excludedHoldersTotal = excludedHolders.reduce(
       (sum, h) => sum.add(h.amount),
       new BN(0),
     );
-    // Key on per-holder address/amount/label (not just the aggregate) so two
-    // different holder sets that happen to share a total can't return each
-    // other's cached allocation.excludedHolders detail.
-    const excludedHoldersKey = excludedHolders
-      .map(h => `${h.address}:${h.amount}:${h.label ?? ''}`)
-      .join('|');
+    // Key on every response-bearing allocation field, including the live-balance
+    // slot. Equal numeric totals from different owners must not reuse each
+    // other's allocation metadata.
+    const allocationCacheKey = allocation
+      ? JSON.stringify({
+          teamPerformancePackage: {
+            amount: allocation.teamPerformancePackage.amount.toString(),
+            address: allocation.teamPerformancePackage.address,
+          },
+          futarchyAmmLiquidity: {
+            amount: allocation.futarchyAmmLiquidity.amount.toString(),
+            vaultAddress: allocation.futarchyAmmLiquidity.vaultAddress,
+          },
+          meteoraLpLiquidity: {
+            amount: allocation.meteoraLpLiquidity.amount.toString(),
+            poolAddress: allocation.meteoraLpLiquidity.poolAddress,
+            vaultAddress: allocation.meteoraLpLiquidity.vaultAddress,
+          },
+          additionalTokenAllocation: allocation.additionalTokenAllocation
+            ? {
+                amount: allocation.additionalTokenAllocation.amount.toString(),
+                recipient: allocation.additionalTokenAllocation.recipient,
+                claimed: allocation.additionalTokenAllocation.claimed,
+                tokenAccountAddress: allocation.additionalTokenAllocation.tokenAccountAddress,
+              }
+            : undefined,
+          daoTreasuryTokens: allocation.daoTreasuryTokens
+            ? {
+                amount: allocation.daoTreasuryTokens.amount.toString(),
+                vaultAddress: allocation.daoTreasuryTokens.vaultAddress,
+              }
+            : undefined,
+          excludedHolders: excludedHolders.map(holder => ({
+            address: holder.address,
+            amount: holder.amount.toString(),
+            label: holder.label,
+          })),
+          balanceSnapshotSlot: allocation.balanceSnapshotSlot,
+          daoAddress: allocation.daoAddress,
+          launchAddress: allocation.launchAddress,
+          version: allocation.version,
+        })
+      : 'none';
     const cacheKey = allocation
-      ? `supply_info_${mintAddress}_${allocation.teamPerformancePackage.amount}_${allocation.futarchyAmmLiquidity.amount}_${allocation.meteoraLpLiquidity.amount}_${additionalAmount}_${daoTreasuryAmount}_${excludedHoldersKey}`
+      ? `supply_info_${mintAddress}_${allocationCacheKey}`
       : `supply_info_${mintAddress}_none`;
     const cached = this.getCached<TokenSupplyInfo>(cacheKey, config.cache.tickersTTL);
     if (cached !== null) return cached;
@@ -221,9 +313,11 @@ export class SolanaService {
           circulatingSupplyBN = circulatingSupplyBN.sub(teamAmount);
         }
 
-        // Subtract additional token allocation from circulating supply (v0.7+ only)
-        // These tokens go to a specific recipient, not into general circulation
+        // Subtract additional token allocation only while it is unclaimed (v0.7+ only).
+        // Once claimed, those tokens are in the recipient's control and circulating
+        // unless the recipient is explicitly listed as an excluded holder.
         if (allocation.additionalTokenAllocation && 
+            !allocation.additionalTokenAllocation.claimed &&
             allocation.additionalTokenAllocation.amount.gt(new BN(0))) {
           circulatingSupplyBN = circulatingSupplyBN.sub(allocation.additionalTokenAllocation.amount);
         }
@@ -246,7 +340,15 @@ export class SolanaService {
         const RNGR_INITIAL_ALLOCATION = new BN(192187500000); // 192,187.5 tokens with 6 decimals
         let initialTokenAllocationDetails: { amount: string; claimed: boolean } | undefined;
         
-        if (mintAddress === RNGR_MINT) {
+        // Add the known claimed tranche back only while the full additional
+        // allocation is still being subtracted. Once the launch reports the
+        // allocation fully claimed, none of it is subtracted and adding this
+        // tranche again would make circulating supply exceed total supply.
+        if (
+          mintAddress === RNGR_MINT &&
+          allocation.additionalTokenAllocation &&
+          !allocation.additionalTokenAllocation.claimed
+        ) {
           circulatingSupplyBN = circulatingSupplyBN.add(RNGR_INITIAL_ALLOCATION);
           initialTokenAllocationDetails = {
             amount: (Number(RNGR_INITIAL_ALLOCATION.toString()) / divisor).toString(),
@@ -254,9 +356,12 @@ export class SolanaService {
           };
         }
 
-        // Ensure we don't go negative
+        // A negative result means categories overlap or configuration is invalid.
+        // Returning a clamped 0 would hide a financial-accounting error.
         if (circulatingSupplyBN.isNeg()) {
-          circulatingSupplyBN = new BN(0);
+          throw new Error(
+            `Non-circulating allocations exceed total supply for ${mintAddress}`,
+          );
         }
 
         // Build allocation details for response (include all for transparency)
@@ -288,16 +393,17 @@ export class SolanaService {
             amount: (Number(allocation.daoTreasuryTokens.amount.toString()) / divisor).toString(),
             vaultAddress: allocation.daoTreasuryTokens.vaultAddress,
           } : undefined,
-          // Include configured excluded holders that actually hold a balance
-          excludedHolders: allocation.excludedHolders && allocation.excludedHolders.some(h => h.amount.gt(new BN(0)))
+          // Include every configured holder, including zero balances, so operators
+          // can distinguish an empty wallet from a missing configuration entry.
+          excludedHolders: allocation.excludedHolders && allocation.excludedHolders.length > 0
             ? allocation.excludedHolders
-                .filter(h => h.amount.gt(new BN(0)))
                 .map(h => ({
                   amount: (Number(h.amount.toString()) / divisor).toString(),
                   address: h.address,
                   label: h.label,
                 }))
             : undefined,
+          balanceSnapshotSlot: allocation.balanceSnapshotSlot,
           daoAddress: allocation.daoAddress,
           launchAddress: allocation.launchAddress,
           version: allocation.version,
@@ -319,7 +425,9 @@ export class SolanaService {
       return result;
     } catch (error) {
       logger.error(`Error fetching supply info for ${mintAddress}:`, error);
-      throw new Error(`Failed to fetch supply info for token: ${mintAddress}`);
+      throw error instanceof Error
+        ? error
+        : new Error(`Failed to fetch supply info for token: ${mintAddress}`);
     }
   }
 }

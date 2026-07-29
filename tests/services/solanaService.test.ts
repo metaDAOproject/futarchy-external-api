@@ -10,6 +10,7 @@ import { SolanaService } from '../../src/services/solanaService.js';
 import type { TokenAllocationInput } from '../../src/services/solanaService.js';
 
 const MINT = 'So11111111111111111111111111111111111111112';
+const RNGR_MINT = 'RNGRtJMbCveqCp7AC6U95KmrdKecFckaJZiWbPGmeta';
 const HOLDER_A = 'SoLo9oxzLDpcq1dpqAgMwgce5WqkRDtNXK7EPnbmeta';
 const HOLDER_B = 'DMB74TZgN7Rqfwtqqm3VQBgKBb2WYPdBqVtHbvB4LLeV';
 
@@ -39,6 +40,7 @@ describe('SolanaService.getSupplyInfo — excluded holders', () => {
     const svc = serviceWithSupply(TOTAL_RAW);
     const info = await svc.getSupplyInfo(MINT, {
       ...baseAllocation(),
+      balanceSnapshotSlot: 123,
       excludedHolders: [
         { address: HOLDER_A, label: 'external', amount: new BN(100_000).mul(ONE) },
         { address: HOLDER_B, label: 'vesting', amount: new BN(50_000).mul(ONE) },
@@ -52,9 +54,10 @@ describe('SolanaService.getSupplyInfo — excluded holders', () => {
       { amount: '100000', address: HOLDER_A, label: 'external' },
       { amount: '50000', address: HOLDER_B, label: 'vesting' },
     ]);
+    expect(info.allocation?.balanceSnapshotSlot).toBe(123);
   });
 
-  it('omits zero-balance holders from the response but keeps the total accurate', async () => {
+  it('surfaces zero-balance holders so configuration remains observable', async () => {
     const svc = serviceWithSupply(TOTAL_RAW);
     const info = await svc.getSupplyInfo(MINT, {
       ...baseAllocation(),
@@ -67,6 +70,7 @@ describe('SolanaService.getSupplyInfo — excluded holders', () => {
     expect(info.circulatingSupply).toBe('900000');
     expect(info.allocation?.excludedHolders).toEqual([
       { amount: '100000', address: HOLDER_A, label: 'external' },
+      { amount: '0', address: HOLDER_B, label: 'empty' },
     ]);
   });
 
@@ -78,15 +82,167 @@ describe('SolanaService.getSupplyInfo — excluded holders', () => {
     expect(info.allocation?.excludedHolders).toBeUndefined();
   });
 
-  it('clamps circulating supply to 0 rather than going negative', async () => {
+  it('subtracts additional allocation only while it is unclaimed', async () => {
+    const svc = serviceWithSupply(TOTAL_RAW);
+    const amount = new BN(25_000).mul(ONE);
+
+    const unclaimed = await svc.getSupplyInfo(MINT, {
+      ...baseAllocation(),
+      additionalTokenAllocation: {
+        amount,
+        recipient: HOLDER_A,
+        claimed: false,
+      },
+    });
+    const claimed = await svc.getSupplyInfo(MINT, {
+      ...baseAllocation(),
+      additionalTokenAllocation: {
+        amount,
+        recipient: HOLDER_A,
+        claimed: true,
+      },
+    });
+
+    expect(unclaimed.circulatingSupply).toBe('975000');
+    expect(claimed.circulatingSupply).toBe('1000000');
+    expect(unclaimed.allocation?.additionalTokenAllocation?.claimed).toBe(false);
+    expect(claimed.allocation?.additionalTokenAllocation?.claimed).toBe(true);
+  });
+
+  it('does not add the RNGR claimed tranche after the full allocation is claimed', async () => {
+    const svc = serviceWithSupply(TOTAL_RAW);
+    const info = await svc.getSupplyInfo(RNGR_MINT, {
+      ...baseAllocation(),
+      additionalTokenAllocation: {
+        amount: new BN(250_000).mul(ONE),
+        recipient: HOLDER_A,
+        claimed: true,
+      },
+    });
+
+    expect(info.circulatingSupply).toBe('1000000');
+    expect(info.allocation?.initialTokenAllocation).toBeUndefined();
+  });
+
+  it('adds the RNGR claimed tranche back while the remaining allocation is unclaimed', async () => {
+    const svc = serviceWithSupply(TOTAL_RAW);
+    const info = await svc.getSupplyInfo(RNGR_MINT, {
+      ...baseAllocation(),
+      additionalTokenAllocation: {
+        amount: new BN(250_000).mul(ONE),
+        recipient: HOLDER_A,
+        claimed: false,
+      },
+    });
+
+    expect(info.circulatingSupply).toBe('942187.5');
+    expect(info.allocation?.initialTokenAllocation).toEqual({
+      amount: '192187.5',
+      claimed: true,
+    });
+  });
+
+  it('allows a claimed additional recipient to be excluded by its live balance', async () => {
     const svc = serviceWithSupply(TOTAL_RAW);
     const info = await svc.getSupplyInfo(MINT, {
+      ...baseAllocation(),
+      additionalTokenAllocation: {
+        amount: new BN(25_000).mul(ONE),
+        recipient: HOLDER_A,
+        claimed: true,
+      },
+      excludedHolders: [
+        { address: HOLDER_A, amount: new BN(10_000).mul(ONE) },
+      ],
+    });
+
+    expect(info.circulatingSupply).toBe('990000');
+  });
+
+  it('rejects an excluded holder that overlaps the team package owner', async () => {
+    const svc = serviceWithSupply(TOTAL_RAW);
+
+    await expect(svc.getSupplyInfo(MINT, {
+      ...baseAllocation(),
+      teamPerformancePackage: {
+        amount: new BN(100_000).mul(ONE),
+        address: HOLDER_A,
+      },
+      excludedHolders: [
+        { address: HOLDER_A, amount: new BN(100_000).mul(ONE) },
+      ],
+    })).rejects.toThrow('overlaps the team performance package allocation');
+  });
+
+  it('rejects an excluded holder that overlaps an unclaimed additional allocation', async () => {
+    const svc = serviceWithSupply(TOTAL_RAW);
+
+    await expect(svc.getSupplyInfo(MINT, {
+      ...baseAllocation(),
+      additionalTokenAllocation: {
+        amount: new BN(25_000).mul(ONE),
+        recipient: HOLDER_A,
+        claimed: false,
+      },
+      excludedHolders: [
+        { address: HOLDER_A, amount: new BN(25_000).mul(ONE) },
+      ],
+    })).rejects.toThrow('overlaps the unclaimed additional-token allocation');
+  });
+
+  it('rejects an excluded holder that overlaps the DAO treasury owner', async () => {
+    const svc = serviceWithSupply(TOTAL_RAW);
+
+    await expect(svc.getSupplyInfo(MINT, {
+      ...baseAllocation(),
+      daoTreasuryTokens: {
+        amount: new BN(50_000).mul(ONE),
+        vaultAddress: HOLDER_A,
+      },
+      excludedHolders: [
+        { address: HOLDER_A, amount: new BN(50_000).mul(ONE) },
+      ],
+    })).rejects.toThrow('overlaps the DAO treasury allocation');
+  });
+
+  it('rejects overlap between named non-circulating allocation owners', async () => {
+    const svc = serviceWithSupply(TOTAL_RAW);
+
+    await expect(svc.getSupplyInfo(MINT, {
+      ...baseAllocation(),
+      teamPerformancePackage: {
+        amount: new BN(100_000).mul(ONE),
+        address: HOLDER_A,
+      },
+      daoTreasuryTokens: {
+        amount: new BN(50_000).mul(ONE),
+        vaultAddress: HOLDER_A,
+      },
+    })).rejects.toThrow(
+      'overlaps the team performance package and DAO treasury allocations',
+    );
+  });
+
+  it('rejects duplicate excluded-holder addresses', async () => {
+    const svc = serviceWithSupply(TOTAL_RAW);
+
+    await expect(svc.getSupplyInfo(MINT, {
+      ...baseAllocation(),
+      excludedHolders: [
+        { address: HOLDER_A, amount: new BN(10).mul(ONE) },
+        { address: HOLDER_A, amount: new BN(20).mul(ONE) },
+      ],
+    })).rejects.toThrow('configured more than once');
+  });
+
+  it('rejects non-circulating allocations that exceed total supply', async () => {
+    const svc = serviceWithSupply(TOTAL_RAW);
+
+    await expect(svc.getSupplyInfo(MINT, {
       ...baseAllocation(),
       excludedHolders: [
         { address: HOLDER_A, amount: new BN(2_000_000).mul(ONE) },
       ],
-    });
-
-    expect(info.circulatingSupply).toBe('0');
+    })).rejects.toThrow('Non-circulating allocations exceed total supply');
   });
 });

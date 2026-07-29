@@ -49,6 +49,7 @@ export async function getSupplyInfoWithLaunchpadAllocation(
       address: h.wallet.toString(),
       label: h.label,
     })),
+    balanceSnapshotSlot: allocation.balanceSnapshotSlot,
     daoAddress: allocation.daoAddress?.toString(),
     launchAddress: allocation.launchAddress?.toString(),
     version: allocation.version,

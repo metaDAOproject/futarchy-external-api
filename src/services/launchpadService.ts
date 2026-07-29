@@ -1,4 +1,10 @@
-import { Connection, PublicKey, Keypair } from '@solana/web3.js';
+import {
+  Connection,
+  PublicKey,
+  Keypair,
+  type AccountInfo,
+  type ParsedAccountData,
+} from '@solana/web3.js';
 import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
 import {
   LaunchpadClient as LaunchpadClientV06,
@@ -77,6 +83,8 @@ export interface TokenAllocationBreakdown {
   // Operator-configured non-circulating holders (external/vesting/encumbered) for
   // this mint, resolved to their live on-chain balances. Empty when none configured.
   excludedHolders: ExcludedHolderBalance[];
+  // Confirmed Solana slot shared by all live non-circulating balance reads.
+  balanceSnapshotSlot?: number;
   // DAO address (if launch completed)
   daoAddress?: PublicKey;
   // Launch address
@@ -148,6 +156,19 @@ export class LaunchpadService {
     this.cache.set(key, { data, timestamp: Date.now() });
   }
 
+  private parseTokenAmount(
+    account: AccountInfo<Buffer | ParsedAccountData>,
+    description: string,
+  ): BN {
+    const raw = (account.data as any)?.parsed?.info?.tokenAmount?.amount;
+    if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
+      throw new Error(
+        `[Launchpad] Unexpected parsed token-account shape for ${description} — refusing to treat an unreadable balance as 0`,
+      );
+    }
+    return new BN(raw);
+  }
+
   /**
    * Get the Launch PDA address for a given base mint (v0.6 program)
    */
@@ -199,7 +220,9 @@ export class LaunchpadService {
    */
   async getLaunchByBaseMint(baseMint: PublicKey): Promise<LaunchData | null> {
     const cacheKey = `launch_by_mint_${baseMint.toString()}`;
-    const cached = this.getCached<LaunchData>(cacheKey, config.cache.tickersTTL * 10);
+    // Claim state changes circulating supply, so launch data must not outlive the
+    // allocation/supply cache cadence.
+    const cached = this.getCached<LaunchData>(cacheKey, config.cache.tickersTTL);
     if (cached) return cached;
 
     const launchAddressV07 = this.getLaunchAddressV07(baseMint);
@@ -407,47 +430,113 @@ export class LaunchpadService {
   }
 
   /**
-   * Resolve the operator-configured non-circulating holders for a mint to their
-   * live on-chain balances. These are external/vesting/encumbered/protocol-owned
-   * wallets (e.g. Laso's external wallet) whose tokens should be excluded from
-   * circulating supply. Returns [] when none are configured for this mint (no RPC).
-   *
-   * Sums ALL of the wallet's token accounts for the mint (via
-   * getParsedTokenAccountsByOwner), not just the associated account — a wallet can
-   * hold the mint across multiple non-associated accounts, and under-counting here
-   * would overstate circulating supply. An owner with no matching account yields 0
-   * (an empty result, not an error). Any RPC/infra failure PROPAGATES — a silent 0
-   * would overstate circulating supply.
+   * Read every live non-circulating token balance at one confirmed Solana slot.
+   * Separate RPC calls may otherwise straddle a transfer and count the same tokens
+   * twice (or miss them entirely). Slot skew is retried as a unit and ultimately
+   * fails closed instead of serving mixed-snapshot financial data.
    */
-  private async getExcludedHolderBalances(baseMint: PublicKey): Promise<ExcludedHolderBalance[]> {
+  private async getLiveBalanceSnapshot(
+    baseMint: PublicKey,
+    performancePackageAta?: PublicKey,
+    daoTreasuryAta?: PublicKey,
+  ): Promise<{
+    excludedHolders: ExcludedHolderBalance[];
+    performancePackageAmount: BN;
+    daoTreasuryAmount: BN;
+    slot?: number;
+  }> {
     const mint = baseMint.toString();
     const configured = config.circulating.excludedHolders.filter(h => h.mint === mint);
-    if (configured.length === 0) return [];
-
-    const balances: ExcludedHolderBalance[] = [];
-    for (const holder of configured) {
-      // No try/catch: an RPC failure must reject (never a silent 0). An owner that
-      // holds none of the mint simply comes back with an empty `value` array.
-      const resp = await this.connection.getParsedTokenAccountsByOwner(holder.wallet, {
-        mint: baseMint,
-      });
-      let amount = new BN(0);
-      for (const { account } of resp.value) {
-        const raw = (account.data as any)?.parsed?.info?.tokenAmount?.amount;
-        // Fail loud on an unexpected parsed shape: silently treating an
-        // unreadable account as 0 would overstate circulating supply, which is
-        // exactly the mispricing this path must never produce.
-        if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
-          throw new Error(
-            `[Launchpad] Unexpected parsed token-account shape for excluded holder ${holder.wallet.toString()} (mint ${mint}) — refusing to treat an unreadable balance as 0`,
-          );
-        }
-        amount = amount.add(new BN(raw));
-      }
-      logger.info(`[Launchpad] Excluded holder ${holder.wallet.toString()} (${holder.label ?? 'unlabeled'}) holds ${amount.toString()} tokens of ${mint} across ${resp.value.length} account(s)`);
-      balances.push({ wallet: holder.wallet, label: holder.label, amount });
+    if (configured.length === 0 && !performancePackageAta && !daoTreasuryAta) {
+      return {
+        excludedHolders: [],
+        performancePackageAmount: new BN(0),
+        daoTreasuryAmount: new BN(0),
+      };
     }
-    return balances;
+
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const [holderResponses, performancePackageResponse, daoTreasuryResponse] =
+        await Promise.all([
+          Promise.all(
+            configured.map(holder =>
+              this.connection.getParsedTokenAccountsByOwner(holder.wallet, {
+                mint: baseMint,
+              }),
+            ),
+          ),
+          performancePackageAta
+            ? this.connection.getParsedAccountInfo(performancePackageAta)
+            : Promise.resolve(undefined),
+          daoTreasuryAta
+            ? this.connection.getParsedAccountInfo(daoTreasuryAta)
+            : Promise.resolve(undefined),
+        ]);
+
+      const slots = [
+        ...holderResponses.map(response => response.context.slot),
+        ...(performancePackageResponse ? [performancePackageResponse.context.slot] : []),
+        ...(daoTreasuryResponse ? [daoTreasuryResponse.context.slot] : []),
+      ];
+      const uniqueSlots = new Set(slots);
+      if (uniqueSlots.size !== 1) {
+        logger.warn('[Launchpad] Retrying non-circulating balance reads after slot skew', {
+          mint,
+          attempt,
+          slots,
+        });
+        if (attempt < maxAttempts) continue;
+        throw new Error(
+          `[Launchpad] Could not obtain a consistent non-circulating balance snapshot for ${mint} after ${maxAttempts} attempts`,
+        );
+      }
+
+      const excludedHolders = configured.map((holder, index) => {
+        const response = holderResponses[index]!;
+        const amount = response.value.reduce(
+          (sum, { account }) =>
+            sum.add(
+              this.parseTokenAmount(
+                account,
+                `excluded holder ${holder.wallet.toString()} (mint ${mint})`,
+              ),
+            ),
+          new BN(0),
+        );
+        logger.info(
+          `[Launchpad] Excluded holder ${holder.wallet.toString()} (${holder.label ?? 'unlabeled'}) holds ${amount.toString()} tokens of ${mint} across ${response.value.length} account(s)`,
+        );
+        return { wallet: holder.wallet, label: holder.label, amount };
+      });
+
+      const performancePackageAmount = performancePackageResponse?.value
+        ? this.parseTokenAmount(
+            performancePackageResponse.value,
+            `performance package ATA ${performancePackageAta!.toString()}`,
+          )
+        : new BN(0);
+      const daoTreasuryAmount = daoTreasuryResponse?.value
+        ? this.parseTokenAmount(
+            daoTreasuryResponse.value,
+            `DAO treasury ATA ${daoTreasuryAta!.toString()}`,
+          )
+        : new BN(0);
+
+      return {
+        excludedHolders,
+        performancePackageAmount,
+        daoTreasuryAmount,
+        slot: slots[0],
+      };
+    }
+
+    throw new Error(`[Launchpad] Unreachable balance snapshot state for ${mint}`);
+  }
+
+  private async getExcludedHolderBalances(baseMint: PublicKey): Promise<ExcludedHolderBalance[]> {
+    const snapshot = await this.getLiveBalanceSnapshot(baseMint);
+    return snapshot.excludedHolders;
   }
 
   /**
@@ -457,32 +546,14 @@ export class LaunchpadService {
    * - FutarchyAMM Liquidity (internal AMM)
    * - Meteora LP Liquidity (external DEX)
    * - Additional Token Allocation (v0.7+ only, not in circulating supply until claimed)
-   * 
-   * Circulating Supply = Total - Team - FutarchyAMM - Meteora - AdditionalTokens (if unclaimed)
+   *
+   * FutarchyAMM and Meteora liquidity remain circulating. Live non-circulating
+   * balances are read at one confirmed slot and cached for the normal ticker TTL.
    */
   async getTokenAllocationBreakdown(baseMint: PublicKey): Promise<TokenAllocationBreakdown> {
     const cacheKey = `allocation_${baseMint.toString()}`;
-    const cached = this.getCached<TokenAllocationBreakdown>(cacheKey, config.cache.tickersTTL * 5);
+    const cached = this.getCached<TokenAllocationBreakdown>(cacheKey, config.cache.tickersTTL);
     if (cached) return cached;
-
-    // Configured excluded holders are launch-independent — resolve them once and
-    // apply to every return path so an external/vesting wallet is excluded even
-    // for a token whose launch never completed (or was never launchpad-launched).
-    const excludedHolders = await this.getExcludedHolderBalances(baseMint);
-    const excludedHoldersTotal = excludedHolders.reduce(
-      (sum, h) => sum.add(h.amount),
-      new BN(0),
-    );
-
-    const emptyBreakdown: TokenAllocationBreakdown = {
-      version: 'v0.6',
-      teamPerformancePackage: { amount: new BN(0) },
-      futarchyAmmLiquidity: { amount: new BN(0) },
-      meteoraLpLiquidity: { amount: new BN(0) },
-      daoTreasuryTokens: { amount: new BN(0) },
-      excludedHolders,
-      totalNonCirculating: excludedHoldersTotal,
-    };
 
     // No catch-all below: an empty breakdown is returned ONLY for the two
     // genuinely-empty cases (token never launched / launch not completed).
@@ -492,17 +563,44 @@ export class LaunchpadService {
     // the exact mispricing the isTokenAccountAbsent contract exists to prevent.
     const launch = await this.getLaunchByBaseMint(baseMint);
     if (!launch) {
-      // Token was not launched via launchpad
-      return emptyBreakdown;
+      const snapshot = await this.getLiveBalanceSnapshot(baseMint);
+      const excludedHoldersTotal = snapshot.excludedHolders.reduce(
+        (sum, holder) => sum.add(holder.amount),
+        new BN(0),
+      );
+      const breakdown: TokenAllocationBreakdown = {
+        version: 'v0.6',
+        teamPerformancePackage: { amount: new BN(0) },
+        futarchyAmmLiquidity: { amount: new BN(0) },
+        meteoraLpLiquidity: { amount: new BN(0) },
+        daoTreasuryTokens: { amount: new BN(0) },
+        excludedHolders: snapshot.excludedHolders,
+        balanceSnapshotSlot: snapshot.slot,
+        totalNonCirculating: excludedHoldersTotal,
+      };
+      this.setCache(cacheKey, breakdown);
+      return breakdown;
     }
 
     if (!launch.dao) {
-      // Launch not yet completed
-      return {
-        ...emptyBreakdown,
+      const snapshot = await this.getLiveBalanceSnapshot(baseMint);
+      const excludedHoldersTotal = snapshot.excludedHolders.reduce(
+        (sum, holder) => sum.add(holder.amount),
+        new BN(0),
+      );
+      const breakdown: TokenAllocationBreakdown = {
         version: launch.version,
+        teamPerformancePackage: { amount: new BN(0) },
+        futarchyAmmLiquidity: { amount: new BN(0) },
+        meteoraLpLiquidity: { amount: new BN(0) },
+        daoTreasuryTokens: { amount: new BN(0) },
+        excludedHolders: snapshot.excludedHolders,
+        balanceSnapshotSlot: snapshot.slot,
         launchAddress: launch.launchAddress,
+        totalNonCirculating: excludedHoldersTotal,
       };
+      this.setCache(cacheKey, breakdown);
+      return breakdown;
     }
 
     // Get DAO to find quote mint
@@ -514,28 +612,14 @@ export class LaunchpadService {
     // tokens may have been unlocked/claimed (e.g. ZKFG, Loyal), making the configured
     // amount stale and over-subtracting from circulating supply.
     const performancePackageAddress = this.getPerformancePackageAddress(
-      launch.launchAddress, 
-      launch.version
+      launch.launchAddress,
+      launch.version,
     );
-
-    let performancePackageLockedAmount = new BN(0);
-    try {
-      const ppAta = await getAssociatedTokenAddress(
-        baseMint,
-        performancePackageAddress,
-        true
-      );
-      const ppTokenAccount = await getAccount(this.connection, ppAta);
-      performancePackageLockedAmount = new BN(ppTokenAccount.amount.toString());
-      logger.info(`[Launchpad] Performance package at ${performancePackageAddress.toString()} holds ${performancePackageLockedAmount.toString()} tokens (configured: ${launch.performancePackageTokenAmount.toString()})`);
-    } catch (error: any) {
-      // Account genuinely absent → all tokens unlocked/claimed → 0 locked (correct).
-      // An RPC failure must propagate: treating it as 0 locked would OVERSTATE
-      // circulating supply (the live-balance approach exists precisely to avoid
-      // mis-subtracting — so a silent 0 on outage is the exact failure to avoid).
-      if (!isTokenAccountAbsent(error)) throw error;
-      logger.info(`[Launchpad] Performance package token account not found for ${performancePackageAddress.toString()}, 0 locked`);
-    }
+    const performancePackageAta = await getAssociatedTokenAddress(
+      baseMint,
+      performancePackageAddress,
+      true,
+    );
 
     // Get FutarchyAMM liquidity
     const futarchyAmm = await this.getFutarchyAmmLiquidity(launch.dao);
@@ -569,24 +653,41 @@ export class LaunchpadService {
       };
     }
 
-    // Get DAO treasury base token balance (tokens held by the squads vault)
-    let daoTreasuryTokens: { amount: BN; vaultAddress?: PublicKey } = { amount: new BN(0) };
+    // Resolve the DAO treasury owner and ATA before taking the shared live-balance snapshot.
+    let daoTreasuryVaultAddress: PublicKey | undefined;
+    let daoTreasuryAta: PublicKey | undefined;
     if (dao && (dao as any).squadsMultisigVault) {
-      try {
-        const vaultAddress = new PublicKey((dao as any).squadsMultisigVault);
-        const vaultAta = await getAssociatedTokenAddress(baseMint, vaultAddress, true);
-        const tokenAccount = await getAccount(this.connection, vaultAta);
-        daoTreasuryTokens = {
-          amount: new BN(tokenAccount.amount.toString()),
-          vaultAddress,
-        };
-        logger.info(`[Launchpad] DAO treasury holds ${daoTreasuryTokens.amount.toString()} base tokens in vault ${vaultAddress.toString()}`);
-      } catch (error: any) {
-        // Genuinely-absent treasury ATA → 0 treasury tokens (correct). An RPC
-        // failure must propagate (a silent 0 here overstates circulating supply).
-        if (!isTokenAccountAbsent(error)) throw error;
-        logger.info(`[Launchpad] No base token account in DAO treasury vault`);
-      }
+      daoTreasuryVaultAddress = new PublicKey((dao as any).squadsMultisigVault);
+      daoTreasuryAta = await getAssociatedTokenAddress(
+        baseMint,
+        daoTreasuryVaultAddress,
+        true,
+      );
+    }
+
+    const snapshot = await this.getLiveBalanceSnapshot(
+      baseMint,
+      performancePackageAta,
+      daoTreasuryAta,
+    );
+    const performancePackageLockedAmount = snapshot.performancePackageAmount;
+    const excludedHolders = snapshot.excludedHolders;
+    const excludedHoldersTotal = excludedHolders.reduce(
+      (sum, holder) => sum.add(holder.amount),
+      new BN(0),
+    );
+    const daoTreasuryTokens: { amount: BN; vaultAddress?: PublicKey } = {
+      amount: snapshot.daoTreasuryAmount,
+      vaultAddress: daoTreasuryVaultAddress,
+    };
+
+    logger.info(
+      `[Launchpad] Performance package at ${performancePackageAddress.toString()} holds ${performancePackageLockedAmount.toString()} tokens (configured: ${launch.performancePackageTokenAmount.toString()})`,
+    );
+    if (daoTreasuryVaultAddress) {
+      logger.info(
+        `[Launchpad] DAO treasury holds ${daoTreasuryTokens.amount.toString()} base tokens in vault ${daoTreasuryVaultAddress.toString()}`,
+      );
     }
 
     // Calculate total non-circulating supply using live on-chain balance
@@ -621,15 +722,15 @@ export class LaunchpadService {
       additionalTokenAllocation,
       daoTreasuryTokens,
       excludedHolders,
+      balanceSnapshotSlot: snapshot.slot,
       daoAddress: launch.dao,
       launchAddress: launch.launchAddress,
       totalNonCirculating,
     };
 
-  this.setCache(cacheKey, breakdown);
-  return breakdown;
+    this.setCache(cacheKey, breakdown);
+    return breakdown;
   }
 }
 
 export default LaunchpadService;
-

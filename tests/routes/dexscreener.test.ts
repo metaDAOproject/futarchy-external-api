@@ -2,6 +2,18 @@ import { describe, it, expect } from 'bun:test';
 import request from 'supertest';
 import { createTestApp } from '../helpers/testApp.js';
 import type { ExternalDatabaseService } from '../../src/services/externalDatabaseService.js';
+import type { FutarchyService } from '../../src/services/futarchyService.js';
+import type { LaunchpadService } from '../../src/services/launchpadService.js';
+import type { SolanaService } from '../../src/services/solanaService.js';
+
+const VALID_MINT = 'So11111111111111111111111111111111111111112';
+
+function assetMetadataService(): FutarchyService {
+  return {
+    getTokenMetadata: async () => ({ name: 'Wrapped SOL', symbol: 'SOL' }),
+    getTokenDecimals: async () => 9,
+  } as unknown as FutarchyService;
+}
 
 // Stub the served DB with canned user_pool_swaps-shaped rows (the aliased column
 // shape the migrated /events SQL returns) so we test the event-building transform:
@@ -19,6 +31,67 @@ function extDbReturning(rows: any[]): ExternalDatabaseService {
 }
 
 describe('DexScreener Routes', () => {
+  describe('GET /dexscreener/asset', () => {
+    it('returns 503 and does not cache a failed supply read', async () => {
+      let allocationCalls = 0;
+      const launchpadService = {
+        getTokenAllocationBreakdown: async () => {
+          allocationCalls++;
+          throw new Error('RPC connection refused');
+        },
+      } as unknown as LaunchpadService;
+      const app = createTestApp({
+        futarchyService: assetMetadataService(),
+        launchpadService,
+      });
+
+      const first = await request(app).get('/dexscreener/asset').query({ id: VALID_MINT });
+      const second = await request(app).get('/dexscreener/asset').query({ id: VALID_MINT });
+
+      expect(first.status).toBe(503);
+      expect(first.body.code).toBe('SUPPLY_UNAVAILABLE');
+      expect(second.status).toBe(503);
+      expect(allocationCalls).toBe(2);
+    });
+
+    it('returns complete supply data when the allocation snapshot succeeds', async () => {
+      const launchpadService = {
+        getTokenAllocationBreakdown: async () => ({
+          version: 'v0.7',
+          teamPerformancePackage: { amount: { toString: () => '0' } },
+          futarchyAmmLiquidity: { amount: { toString: () => '0' } },
+          meteoraLpLiquidity: { amount: { toString: () => '0' } },
+          daoTreasuryTokens: { amount: { toString: () => '0' } },
+          excludedHolders: [],
+          totalNonCirculating: { toString: () => '0' },
+        }),
+      } as unknown as LaunchpadService;
+      const solanaService = {
+        getSupplyInfo: async () => ({
+          totalSupply: '1000000',
+          circulatingSupply: '875000',
+        }),
+      } as unknown as SolanaService;
+      const app = createTestApp({
+        futarchyService: assetMetadataService(),
+        launchpadService,
+        solanaService,
+      });
+
+      const response = await request(app).get('/dexscreener/asset').query({ id: VALID_MINT });
+
+      expect(response.status).toBe(200);
+      expect(response.body.asset).toMatchObject({
+        id: VALID_MINT,
+        name: 'Wrapped SOL',
+        symbol: 'SOL',
+        totalSupply: 1000000,
+        circulatingSupply: 875000,
+        metadata: { decimals: '9' },
+      });
+    });
+  });
+
   describe('GET /dexscreener/events', () => {
     it('maps buy/sell legs, price, reserves, and txn/event indices from user_pool_swaps', async () => {
       // Two swaps in one signature (same txn → eventIndex 0,1), one in a second txn.

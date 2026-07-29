@@ -16,7 +16,7 @@ export function createRootRouter(_services: ServiceGetters): Router {
         market_data: '/api/market-data - Daily market data from the served user_pool ETL',
         supply: '/api/supply/:mintAddress - Returns complete supply breakdown with allocation details',
         supply_total: '/api/supply/:mintAddress/total - Returns total supply only',
-        supply_circulating: '/api/supply/:mintAddress/circulating - Returns circulating supply (excludes team performance package)',
+        supply_circulating: '/api/supply/:mintAddress/circulating - Returns circulating supply after configured non-circulating allocations',
         health: '/health',
         health_detailed: '/api/health - Comprehensive health with app DB and served ETL contract checks',
       },
@@ -40,10 +40,11 @@ export function createRootRouter(_services: ServiceGetters): Router {
       },
       supplyBreakdown: {
         description: 'For launchpad tokens, supply is broken down into:',
-        circulatingSupply: 'Total supply minus team performance package (liquidity IS circulating)',
+        circulatingSupply: 'Total supply minus non-circulating allocations: team package, additional token allocation, DAO treasury tokens, and configured excluded holders',
         teamPerformancePackage: 'Locked tokens allocated to the team (price-based unlock) - NOT circulating',
-        futarchyAmmLiquidity: 'Tokens in the internal FutarchyAMM for spot trading - IS circulating',
-        meteoraLpLiquidity: 'Tokens in the external Meteora DAMM pool (POL) - IS circulating',
+        futarchyAmmLiquidity: 'Tokens in the internal FutarchyAMM for spot trading - reported for transparency and treated as circulating',
+        meteoraLpLiquidity: 'Tokens in the external Meteora DAMM pool (POL) - reported for transparency and treated as circulating',
+        excludedHolders: 'Operator-configured direct SPL token holder balances excluded from circulating supply; fractional DAMM position ownership is not decoded here',
       },
       note: 'Read-only API. Market data and ticker volume are served from the user_pool ETL in the served DB; no Dune, no in-process indexing.',
     });

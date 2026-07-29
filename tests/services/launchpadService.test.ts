@@ -66,6 +66,7 @@ describe('LaunchpadService.getTokenAllocationBreakdown', () => {
 
 describe('LaunchpadService.getExcludedHolderBalances', () => {
   const HOLDER = new PublicKey('DMB74TZgN7Rqfwtqqm3VQBgKBb2WYPdBqVtHbvB4LLeV');
+  const HOLDER_2 = new PublicKey('5FPGRzY9ArJFwY2Hp2y2eqMzVewyWCBox7esmpuZfCvE');
   const OTHER_MINT = 'So11111111111111111111111111111111111111112';
 
   afterEach(() => {
@@ -78,13 +79,20 @@ describe('LaunchpadService.getExcludedHolderBalances', () => {
     return { account: { data: { parsed: { info: { tokenAmount: { amount } } } } } };
   }
 
+  function tokenAccountsResponse(amounts: string[], slot = 100) {
+    return {
+      context: { slot },
+      value: amounts.map(tokenAccount),
+    };
+  }
+
   it('resolves no excluded holders (and hits no RPC) when none are configured for the mint', async () => {
     const svc = new LaunchpadService();
     let called = false;
     (svc as any).connection = {
       getParsedTokenAccountsByOwner: async () => {
         called = true;
-        return { value: [] };
+        return tokenAccountsResponse([]);
       },
     };
     const balances = await (svc as any).getExcludedHolderBalances(MINT);
@@ -96,7 +104,7 @@ describe('LaunchpadService.getExcludedHolderBalances', () => {
     config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER, label: 'ext' });
     const svc = new LaunchpadService();
     (svc as any).connection = {
-      getParsedTokenAccountsByOwner: async () => ({ value: [tokenAccount('100'), tokenAccount('25')] }),
+      getParsedTokenAccountsByOwner: async () => tokenAccountsResponse(['100', '25']),
     };
     const balances = await (svc as any).getExcludedHolderBalances(MINT);
     expect(balances).toHaveLength(1);
@@ -107,7 +115,9 @@ describe('LaunchpadService.getExcludedHolderBalances', () => {
   it('yields a 0 balance when the holder owns no token accounts of the mint', async () => {
     config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER });
     const svc = new LaunchpadService();
-    (svc as any).connection = { getParsedTokenAccountsByOwner: async () => ({ value: [] }) };
+    (svc as any).connection = {
+      getParsedTokenAccountsByOwner: async () => tokenAccountsResponse([]),
+    };
     const balances = await (svc as any).getExcludedHolderBalances(MINT);
     expect(balances[0].amount.isZero()).toBe(true);
   });
@@ -128,6 +138,7 @@ describe('LaunchpadService.getExcludedHolderBalances', () => {
     const svc = new LaunchpadService();
     (svc as any).connection = {
       getParsedTokenAccountsByOwner: async () => ({
+        context: { slot: 100 },
         value: [{ account: { data: { parsed: { info: {} } } } }],
       }),
     };
@@ -141,11 +152,72 @@ describe('LaunchpadService.getExcludedHolderBalances', () => {
     (svc as any).connection = {
       getParsedTokenAccountsByOwner: async () => {
         called = true;
-        return { value: [] };
+        return tokenAccountsResponse([]);
       },
     };
     const balances = await (svc as any).getExcludedHolderBalances(MINT);
     expect(balances).toEqual([]);
     expect(called).toBe(false);
+  });
+
+  it('retries all holder reads until they share one confirmed slot', async () => {
+    config.circulating.excludedHolders.push(
+      { mint: MINT.toString(), wallet: HOLDER },
+      { mint: MINT.toString(), wallet: HOLDER_2 },
+    );
+    const svc = new LaunchpadService();
+    let calls = 0;
+    (svc as any).connection = {
+      getParsedTokenAccountsByOwner: async () => {
+        const call = calls++;
+        const attempt = Math.floor(call / 2);
+        const holderIndex = call % 2;
+        const slots = attempt === 0 ? [100, 101] : [102, 102];
+        return tokenAccountsResponse(['10'], slots[holderIndex]);
+      },
+    };
+
+    const snapshot = await (svc as any).getLiveBalanceSnapshot(MINT);
+
+    expect(calls).toBe(4);
+    expect(snapshot.slot).toBe(102);
+    expect(snapshot.excludedHolders.map((holder: any) => holder.amount.toString())).toEqual([
+      '10',
+      '10',
+    ]);
+  });
+
+  it('reads performance-package and DAO treasury balances in the shared snapshot', async () => {
+    const svc = new LaunchpadService();
+    (svc as any).connection = {
+      getParsedAccountInfo: async (address: PublicKey) => ({
+        context: { slot: 321 },
+        value: tokenAccount(address.equals(HOLDER) ? '75' : '25').account,
+      }),
+    };
+
+    const snapshot = await (svc as any).getLiveBalanceSnapshot(MINT, HOLDER, HOLDER_2);
+
+    expect(snapshot.slot).toBe(321);
+    expect(snapshot.performancePackageAmount.toString()).toBe('75');
+    expect(snapshot.daoTreasuryAmount.toString()).toBe('25');
+  });
+
+  it('fails closed when holder reads remain on different slots', async () => {
+    config.circulating.excludedHolders.push(
+      { mint: MINT.toString(), wallet: HOLDER },
+      { mint: MINT.toString(), wallet: HOLDER_2 },
+    );
+    const svc = new LaunchpadService();
+    let calls = 0;
+    (svc as any).connection = {
+      getParsedTokenAccountsByOwner: async () =>
+        tokenAccountsResponse(['10'], calls++ % 2 === 0 ? 100 : 101),
+    };
+
+    await expect((svc as any).getLiveBalanceSnapshot(MINT)).rejects.toThrow(
+      'consistent non-circulating balance snapshot',
+    );
+    expect(calls).toBe(6);
   });
 });

@@ -17,19 +17,19 @@ export function createSupplyRouter(services: ServiceGetters): Router {
       throw AppError.badRequest(mintAddressResult.error.message, 'INVALID_MINT_ADDRESS');
     }
     const mintAddress = mintAddressResult.value;
-      const solanaService = getSolanaService();
-      const launchpadService = getLaunchpadService();
+    const solanaService = getSolanaService();
+    const launchpadService = getLaunchpadService();
 
-      const { supplyInfo } = await getSupplyInfoWithLaunchpadAllocation(
-        mintAddress,
-        solanaService,
-        launchpadService,
-      );
+    const { supplyInfo } = await getSupplyInfoWithLaunchpadAllocation(
+      mintAddress,
+      solanaService,
+      launchpadService,
+    );
 
-      res.json({
-        result: supplyInfo.totalSupply,
-        data: supplyInfo,
-      });
+    res.json({
+      result: supplyInfo.totalSupply,
+      data: supplyInfo,
+    });
   }));
 
   // Get total supply for a token
@@ -64,8 +64,8 @@ export function createSupplyRouter(services: ServiceGetters): Router {
       launchpadService,
     );
 
-    const response: { 
-      result: string; 
+    const response: {
+      result: string;
       allocation?: {
         teamPerformancePackageAddress?: string;
         futarchyAmmVaultAddress?: string;
@@ -89,6 +89,7 @@ export function createSupplyRouter(services: ServiceGetters): Router {
           address: string;
           label?: string;
         }>;
+        balanceSnapshotSlot?: number;
         daoAddress?: string;
         launchAddress?: string;
         version?: string;
@@ -102,7 +103,7 @@ export function createSupplyRouter(services: ServiceGetters): Router {
         allocation.meteoraLpLiquidity.poolAddress ||
         allocation.additionalTokenAllocation ||
         !allocation.daoTreasuryTokens.amount.isZero() ||
-        (allocation.excludedHolders?.some(h => !h.amount.isZero()) ?? false)) {
+        (allocation.excludedHolders?.length ?? 0) > 0) {
       response.allocation = {
         teamPerformancePackageAddress: allocation.teamPerformancePackage.address?.toString(),
         futarchyAmmVaultAddress: allocation.futarchyAmmLiquidity.vaultAddress?.toString(),
@@ -112,6 +113,7 @@ export function createSupplyRouter(services: ServiceGetters): Router {
         initialTokenAllocation: supplyInfo.allocation?.initialTokenAllocation,
         daoTreasuryTokens: supplyInfo.allocation?.daoTreasuryTokens,
         excludedHolders: supplyInfo.allocation?.excludedHolders,
+        balanceSnapshotSlot: supplyInfo.allocation?.balanceSnapshotSlot,
         daoAddress: allocation.daoAddress?.toString(),
         launchAddress: allocation.launchAddress?.toString(),
         version: allocation.version,

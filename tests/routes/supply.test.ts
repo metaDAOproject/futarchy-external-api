@@ -72,6 +72,7 @@ describe('Supply Routes', () => {
           meteoraLpLiquidity: { amount: new BN(0) },
           daoTreasuryTokens: { amount: new BN(0) },
           excludedHolders: [{ wallet: { toString: () => holderAddress }, label: 'Laso external', amount: new BN(100) }],
+          balanceSnapshotSlot: 123,
           totalNonCirculating: new BN(100),
         }),
       } as unknown as LaunchpadService;
@@ -87,6 +88,7 @@ describe('Supply Routes', () => {
             rawTotalSupply: '1000000000000',
             allocation: {
               excludedHolders: [{ amount: '0.0001', address: holderAddress, label: 'Laso external' }],
+              balanceSnapshotSlot: 123,
             },
           };
         },
@@ -100,12 +102,14 @@ describe('Supply Routes', () => {
       expect(response.body.allocation.excludedHolders).toEqual([
         { amount: '0.0001', address: holderAddress, label: 'Laso external' },
       ]);
+      expect(response.body.allocation.balanceSnapshotSlot).toBe(123);
       // The breakdown's excludedHolders must be mapped (wallet -> address) and
       // forwarded to getSupplyInfo — guards supplyWithLaunchpadAllocation wiring.
       expect(capturedAllocation.excludedHolders).toHaveLength(1);
       expect(capturedAllocation.excludedHolders[0].address).toBe(holderAddress);
       expect(capturedAllocation.excludedHolders[0].label).toBe('Laso external');
       expect(capturedAllocation.excludedHolders[0].amount.toString()).toBe('100');
+      expect(capturedAllocation.balanceSnapshotSlot).toBe(123);
     });
   });
 
