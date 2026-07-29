@@ -2,8 +2,6 @@ import {
   Connection,
   PublicKey,
   Keypair,
-  type AccountInfo,
-  type ParsedAccountData,
 } from '@solana/web3.js';
 import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
 import {
@@ -21,7 +19,14 @@ import {
   LAUNCHPAD_V0_6_MAINNET_METEORA_CONFIG as MAINNET_METEORA_CONFIG_V06,
   LAUNCHPAD_V0_7_MAINNET_METEORA_CONFIG as MAINNET_METEORA_CONFIG_V07,
 } from "@metadaoproject/programs";
-import { getAccount, getAssociatedTokenAddress } from '@solana/spl-token';
+import {
+  getAccount,
+  getAssociatedTokenAddress,
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  unpackAccount,
+  unpackMint,
+} from '@solana/spl-token';
 import { isTokenAccountAbsent } from '../utils/solanaErrors.js';
 import { config } from '../config.js';
 import BN from 'bn.js';
@@ -83,8 +88,13 @@ export interface TokenAllocationBreakdown {
   // Operator-configured non-circulating holders (external/vesting/encumbered) for
   // this mint, resolved to their live on-chain balances. Empty when none configured.
   excludedHolders: ExcludedHolderBalance[];
-  // Confirmed Solana slot shared by all live non-circulating balance reads.
+  // Confirmed Solana slot for the single mint-supply and live-balance RPC batch.
   balanceSnapshotSlot?: number;
+  // Mint supply read in the same RPC snapshot as the live balances.
+  mintSupplySnapshot: {
+    amount: BN;
+    decimals: number;
+  };
   // DAO address (if launch completed)
   daoAddress?: PublicKey;
   // Launch address
@@ -116,6 +126,9 @@ export type LaunchState =
   | { cancelled: Record<string, never> };
 
 export class LaunchpadService {
+  private static readonly CACHE_MAX_ENTRIES = 1000;
+  private static readonly MAX_SNAPSHOT_ACCOUNTS = 100;
+
   private connection: Connection;
   private clientV06: LaunchpadClientV06;
   private clientV07: LaunchpadClientV07;
@@ -153,20 +166,16 @@ export class LaunchpadService {
   }
 
   private setCache(key: string, data: any): void {
-    this.cache.set(key, { data, timestamp: Date.now() });
-  }
-
-  private parseTokenAmount(
-    account: AccountInfo<Buffer | ParsedAccountData>,
-    description: string,
-  ): BN {
-    const raw = (account.data as any)?.parsed?.info?.tokenAmount?.amount;
-    if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
-      throw new Error(
-        `[Launchpad] Unexpected parsed token-account shape for ${description} — refusing to treat an unreadable balance as 0`,
-      );
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
     }
-    return new BN(raw);
+    if (this.cache.size >= LaunchpadService.CACHE_MAX_ENTRIES) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.cache.delete(oldestKey);
+      }
+    }
+    this.cache.set(key, { data, timestamp: Date.now() });
   }
 
   /**
@@ -430,104 +439,196 @@ export class LaunchpadService {
   }
 
   /**
-   * Read every live non-circulating token balance at one confirmed Solana slot.
-   * Separate RPC calls may otherwise straddle a transfer and count the same tokens
-   * twice (or miss them entirely). Slot skew is retried as a unit and ultimately
-   * fails closed instead of serving mixed-snapshot financial data.
+   * Discover every configured holder's token accounts, then read the mint and all
+   * relevant token accounts in one contextual getMultipleAccounts call. Account
+   * discovery is repeated after the snapshot; if the address set changed around
+   * the snapshot, the whole operation is retried.
    */
   private async getLiveBalanceSnapshot(
     baseMint: PublicKey,
-    performancePackageAta?: PublicKey,
-    daoTreasuryAta?: PublicKey,
+    performancePackageOwner?: PublicKey,
+    daoTreasuryOwner?: PublicKey,
   ): Promise<{
     excludedHolders: ExcludedHolderBalance[];
     performancePackageAmount: BN;
     daoTreasuryAmount: BN;
-    slot?: number;
+    mintSupply: {
+      amount: BN;
+      decimals: number;
+    };
+    tokenProgramId: PublicKey;
+    slot: number;
   }> {
     const mint = baseMint.toString();
     const configured = config.circulating.excludedHolders.filter(h => h.mint === mint);
-    if (configured.length === 0 && !performancePackageAta && !daoTreasuryAta) {
-      return {
-        excludedHolders: [],
-        performancePackageAmount: new BN(0),
-        daoTreasuryAmount: new BN(0),
-      };
-    }
-
     const maxAttempts = 3;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const [holderResponses, performancePackageResponse, daoTreasuryResponse] =
-        await Promise.all([
-          Promise.all(
-            configured.map(holder =>
-              this.connection.getParsedTokenAccountsByOwner(holder.wallet, {
-                mint: baseMint,
-              }),
-            ),
-          ),
-          performancePackageAta
-            ? this.connection.getParsedAccountInfo(performancePackageAta)
-            : Promise.resolve(undefined),
-          daoTreasuryAta
-            ? this.connection.getParsedAccountInfo(daoTreasuryAta)
-            : Promise.resolve(undefined),
-        ]);
 
-      const slots = [
-        ...holderResponses.map(response => response.context.slot),
-        ...(performancePackageResponse ? [performancePackageResponse.context.slot] : []),
-        ...(daoTreasuryResponse ? [daoTreasuryResponse.context.slot] : []),
-      ];
-      const uniqueSlots = new Set(slots);
-      if (uniqueSlots.size !== 1) {
-        logger.warn('[Launchpad] Retrying non-circulating balance reads after slot skew', {
-          mint,
-          attempt,
-          slots,
-        });
-        if (attempt < maxAttempts) continue;
+    const deriveCandidateAtas = async (owner: PublicKey | undefined) => {
+      if (!owner) return undefined;
+      const [legacy, token2022] = await Promise.all([
+        getAssociatedTokenAddress(baseMint, owner, true, TOKEN_PROGRAM_ID),
+        getAssociatedTokenAddress(baseMint, owner, true, TOKEN_2022_PROGRAM_ID),
+      ]);
+      return { legacy, token2022 };
+    };
+    const [performancePackageAtas, daoTreasuryAtas] = await Promise.all([
+      deriveCandidateAtas(performancePackageOwner),
+      deriveCandidateAtas(daoTreasuryOwner),
+    ]);
+
+    const discoverHolderAccounts = async (minContextSlot?: number) =>
+      Promise.all(
+        configured.map(holder =>
+          this.connection.getTokenAccountsByOwner(
+            holder.wallet,
+            { mint: baseMint },
+            {
+              commitment: 'confirmed',
+              ...(minContextSlot !== undefined ? { minContextSlot } : {}),
+            },
+          ),
+        ),
+      );
+
+    const accountAddresses = (
+      responses: Awaited<ReturnType<typeof discoverHolderAccounts>>,
+    ): string[][] =>
+      responses.map(response =>
+        response.value
+          .map(({ pubkey }) => pubkey.toString())
+          .sort(),
+      );
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const firstDiscovery = await discoverHolderAccounts();
+      const minimumSnapshotSlot = firstDiscovery.reduce(
+        (maximum, response) => Math.max(maximum, response.context.slot),
+        0,
+      );
+
+      const uniqueAddresses = new Map<string, PublicKey>();
+      const addAddress = (address: PublicKey | undefined): void => {
+        if (address) uniqueAddresses.set(address.toString(), address);
+      };
+      addAddress(baseMint);
+      for (const response of firstDiscovery) {
+        for (const { pubkey } of response.value) addAddress(pubkey);
+      }
+      addAddress(performancePackageAtas?.legacy);
+      addAddress(performancePackageAtas?.token2022);
+      addAddress(daoTreasuryAtas?.legacy);
+      addAddress(daoTreasuryAtas?.token2022);
+
+      if (uniqueAddresses.size > LaunchpadService.MAX_SNAPSHOT_ACCOUNTS) {
         throw new Error(
-          `[Launchpad] Could not obtain a consistent non-circulating balance snapshot for ${mint} after ${maxAttempts} attempts`,
+          `[Launchpad] Non-circulating snapshot for ${mint} requires ${uniqueAddresses.size} accounts; maximum is ${LaunchpadService.MAX_SNAPSHOT_ACCOUNTS}`,
         );
       }
 
+      const addresses = [...uniqueAddresses.values()];
+      const snapshot = await this.connection.getMultipleAccountsInfoAndContext(
+        addresses,
+        {
+          commitment: 'confirmed',
+          ...(minimumSnapshotSlot > 0 ? { minContextSlot: minimumSnapshotSlot } : {}),
+        },
+      );
+      const secondDiscovery = await discoverHolderAccounts(snapshot.context.slot);
+
+      const firstAddresses = accountAddresses(firstDiscovery);
+      const secondAddresses = accountAddresses(secondDiscovery);
+      if (JSON.stringify(firstAddresses) !== JSON.stringify(secondAddresses)) {
+        logger.warn('[Launchpad] Retrying after token-account topology changed around snapshot', {
+          mint,
+          attempt,
+          snapshotSlot: snapshot.context.slot,
+        });
+        if (attempt < maxAttempts) continue;
+        throw new Error(
+          `[Launchpad] Token-account topology changed around ${mint} snapshot for ${maxAttempts} attempts`,
+        );
+      }
+
+      const accountsByAddress = new Map(
+        addresses.map((address, index) => [
+          address.toString(),
+          snapshot.value[index] ?? null,
+        ]),
+      );
+      const mintAccount = accountsByAddress.get(mint);
+      if (!mintAccount) {
+        throw new Error(`[Launchpad] Mint account ${mint} was absent from balance snapshot`);
+      }
+      if (
+        !mintAccount.owner.equals(TOKEN_PROGRAM_ID) &&
+        !mintAccount.owner.equals(TOKEN_2022_PROGRAM_ID)
+      ) {
+        throw new Error(`[Launchpad] Mint ${mint} is not owned by a supported token program`);
+      }
+      const tokenProgramId = mintAccount.owner;
+      const mintInfo = unpackMint(baseMint, mintAccount, tokenProgramId);
+      const selectAta = (
+        candidates: { legacy: PublicKey; token2022: PublicKey } | undefined,
+      ): PublicKey | undefined =>
+        tokenProgramId.equals(TOKEN_2022_PROGRAM_ID)
+          ? candidates?.token2022
+          : candidates?.legacy;
+      const performancePackageAta = selectAta(performancePackageAtas);
+      const daoTreasuryAta = selectAta(daoTreasuryAtas);
+
+      const readTokenAmount = (
+        address: PublicKey | undefined,
+        description: string,
+        absentIsZero: boolean,
+      ): BN => {
+        if (!address) return new BN(0);
+        const accountInfo = accountsByAddress.get(address.toString());
+        if (!accountInfo) {
+          if (absentIsZero) return new BN(0);
+          throw new Error(`[Launchpad] ${description} was absent from balance snapshot`);
+        }
+        const tokenAccount = unpackAccount(address, accountInfo, tokenProgramId);
+        if (!tokenAccount.mint.equals(baseMint)) {
+          throw new Error(`[Launchpad] ${description} belongs to an unexpected mint`);
+        }
+        return new BN(tokenAccount.amount.toString());
+      };
+
       const excludedHolders = configured.map((holder, index) => {
-        const response = holderResponses[index]!;
-        const amount = response.value.reduce(
-          (sum, { account }) =>
-            sum.add(
-              this.parseTokenAmount(
-                account,
-                `excluded holder ${holder.wallet.toString()} (mint ${mint})`,
-              ),
-            ),
+        const addressesForHolder = firstDiscovery[index]!.value.map(({ pubkey }) => pubkey);
+        const amount = addressesForHolder.reduce(
+          (sum, address) =>
+            sum.add(readTokenAmount(
+              address,
+              `excluded holder account ${address.toString()}`,
+              false,
+            )),
           new BN(0),
         );
         logger.info(
-          `[Launchpad] Excluded holder ${holder.wallet.toString()} (${holder.label ?? 'unlabeled'}) holds ${amount.toString()} tokens of ${mint} across ${response.value.length} account(s)`,
+          `[Launchpad] Excluded holder ${holder.wallet.toString()} (${holder.label ?? 'unlabeled'}) holds ${amount.toString()} tokens of ${mint} across ${addressesForHolder.length} account(s)`,
         );
         return { wallet: holder.wallet, label: holder.label, amount };
       });
 
-      const performancePackageAmount = performancePackageResponse?.value
-        ? this.parseTokenAmount(
-            performancePackageResponse.value,
-            `performance package ATA ${performancePackageAta!.toString()}`,
-          )
-        : new BN(0);
-      const daoTreasuryAmount = daoTreasuryResponse?.value
-        ? this.parseTokenAmount(
-            daoTreasuryResponse.value,
-            `DAO treasury ATA ${daoTreasuryAta!.toString()}`,
-          )
-        : new BN(0);
-
       return {
         excludedHolders,
-        performancePackageAmount,
-        daoTreasuryAmount,
-        slot: slots[0],
+        performancePackageAmount: readTokenAmount(
+          performancePackageAta,
+          `performance package ATA ${performancePackageAta?.toString()}`,
+          true,
+        ),
+        daoTreasuryAmount: readTokenAmount(
+          daoTreasuryAta,
+          `DAO treasury ATA ${daoTreasuryAta?.toString()}`,
+          true,
+        ),
+        mintSupply: {
+          amount: new BN(mintInfo.supply.toString()),
+          decimals: mintInfo.decimals,
+        },
+        tokenProgramId,
+        slot: snapshot.context.slot,
       };
     }
 
@@ -535,6 +636,9 @@ export class LaunchpadService {
   }
 
   private async getExcludedHolderBalances(baseMint: PublicKey): Promise<ExcludedHolderBalance[]> {
+    if (!config.circulating.excludedHolders.some(holder => holder.mint === baseMint.toString())) {
+      return [];
+    }
     const snapshot = await this.getLiveBalanceSnapshot(baseMint);
     return snapshot.excludedHolders;
   }
@@ -547,8 +651,9 @@ export class LaunchpadService {
    * - Meteora LP Liquidity (external DEX)
    * - Additional Token Allocation (v0.7+ only, not in circulating supply until claimed)
    *
-   * FutarchyAMM and Meteora liquidity remain circulating. Live non-circulating
-   * balances are read at one confirmed slot and cached for the normal ticker TTL.
+   * FutarchyAMM and Meteora liquidity remain circulating. Mint supply and live
+   * non-circulating balances are read in one confirmed contextual RPC batch and
+   * cached for the normal ticker TTL.
    */
   async getTokenAllocationBreakdown(baseMint: PublicKey): Promise<TokenAllocationBreakdown> {
     const cacheKey = `allocation_${baseMint.toString()}`;
@@ -576,6 +681,7 @@ export class LaunchpadService {
         daoTreasuryTokens: { amount: new BN(0) },
         excludedHolders: snapshot.excludedHolders,
         balanceSnapshotSlot: snapshot.slot,
+        mintSupplySnapshot: snapshot.mintSupply,
         totalNonCirculating: excludedHoldersTotal,
       };
       this.setCache(cacheKey, breakdown);
@@ -596,6 +702,7 @@ export class LaunchpadService {
         daoTreasuryTokens: { amount: new BN(0) },
         excludedHolders: snapshot.excludedHolders,
         balanceSnapshotSlot: snapshot.slot,
+        mintSupplySnapshot: snapshot.mintSupply,
         launchAddress: launch.launchAddress,
         totalNonCirculating: excludedHoldersTotal,
       };
@@ -615,12 +722,6 @@ export class LaunchpadService {
       launch.launchAddress,
       launch.version,
     );
-    const performancePackageAta = await getAssociatedTokenAddress(
-      baseMint,
-      performancePackageAddress,
-      true,
-    );
-
     // Get FutarchyAMM liquidity
     const futarchyAmm = await this.getFutarchyAmmLiquidity(launch.dao);
 
@@ -634,42 +735,32 @@ export class LaunchpadService {
     // Handle additional token allocation (v0.7+ only)
     let additionalTokenAllocation: AdditionalTokenAllocation | undefined;
     if (launch.version === 'v0.7' && launch.additionalTokensRecipient && launch.additionalTokensAmount) {
-      // Get the token account address for the additional tokens recipient
-      let tokenAccountAddress: PublicKey | undefined;
-      try {
-        tokenAccountAddress = await getAssociatedTokenAddress(
-          baseMint,
-          launch.additionalTokensRecipient
-        );
-      } catch (error) {
-        logger.warn(`[Launchpad] Could not derive additional tokens account for ${launch.additionalTokensRecipient.toString()}`);
-      }
-
       additionalTokenAllocation = {
         recipient: launch.additionalTokensRecipient,
         amount: launch.additionalTokensAmount,
         claimed: launch.additionalTokensClaimed || false,
-        tokenAccountAddress,
       };
     }
 
     // Resolve the DAO treasury owner and ATA before taking the shared live-balance snapshot.
     let daoTreasuryVaultAddress: PublicKey | undefined;
-    let daoTreasuryAta: PublicKey | undefined;
     if (dao && (dao as any).squadsMultisigVault) {
       daoTreasuryVaultAddress = new PublicKey((dao as any).squadsMultisigVault);
-      daoTreasuryAta = await getAssociatedTokenAddress(
-        baseMint,
-        daoTreasuryVaultAddress,
-        true,
-      );
     }
 
     const snapshot = await this.getLiveBalanceSnapshot(
       baseMint,
-      performancePackageAta,
-      daoTreasuryAta,
+      performancePackageAddress,
+      daoTreasuryVaultAddress,
     );
+    if (additionalTokenAllocation) {
+      additionalTokenAllocation.tokenAccountAddress = await getAssociatedTokenAddress(
+        baseMint,
+        additionalTokenAllocation.recipient,
+        true,
+        snapshot.tokenProgramId,
+      );
+    }
     const performancePackageLockedAmount = snapshot.performancePackageAmount;
     const excludedHolders = snapshot.excludedHolders;
     const excludedHoldersTotal = excludedHolders.reduce(
@@ -723,6 +814,7 @@ export class LaunchpadService {
       daoTreasuryTokens,
       excludedHolders,
       balanceSnapshotSlot: snapshot.slot,
+      mintSupplySnapshot: snapshot.mintSupply,
       daoAddress: launch.dao,
       launchAddress: launch.launchAddress,
       totalNonCirculating,

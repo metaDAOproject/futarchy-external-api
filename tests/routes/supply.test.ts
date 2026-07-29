@@ -73,6 +73,7 @@ describe('Supply Routes', () => {
           daoTreasuryTokens: { amount: new BN(0) },
           excludedHolders: [{ wallet: { toString: () => holderAddress }, label: 'Laso external', amount: new BN(100) }],
           balanceSnapshotSlot: 123,
+          mintSupplySnapshot: { amount: new BN(1_000_000_000_000), decimals: 6 },
           totalNonCirculating: new BN(100),
         }),
       } as unknown as LaunchpadService;
@@ -110,6 +111,8 @@ describe('Supply Routes', () => {
       expect(capturedAllocation.excludedHolders[0].label).toBe('Laso external');
       expect(capturedAllocation.excludedHolders[0].amount.toString()).toBe('100');
       expect(capturedAllocation.balanceSnapshotSlot).toBe(123);
+      expect(capturedAllocation.mintSupplySnapshot.amount.toString()).toBe('1000000000000');
+      expect(capturedAllocation.mintSupplySnapshot.decimals).toBe(6);
     });
   });
 
@@ -119,6 +122,21 @@ describe('Supply Routes', () => {
       
       expect(response.status).toBe(400);
       expect(response.body.error).toContain('not a valid Solana public key');
+    });
+
+    it('rejects malformed numeric supply instead of truncating it', async () => {
+      const solanaService = {
+        getSupplyInfo: async () => ({
+          circulatingSupply: '12abc',
+        }),
+      } as unknown as SolanaService;
+      const testApp = createTestApp({ solanaService });
+
+      const response = await request(testApp)
+        .get(`/api/supply/${validMintAddress}/jupiter/circulating`);
+
+      expect(response.status).toBe(500);
+      expect(response.body).not.toHaveProperty('circulatingSupply');
     });
   });
 

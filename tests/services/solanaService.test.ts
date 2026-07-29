@@ -5,6 +5,11 @@
  */
 
 import { describe, it, expect } from 'bun:test';
+import {
+  MintLayout,
+  TOKEN_2022_PROGRAM_ID,
+} from '@solana/spl-token';
+import { PublicKey, type AccountInfo } from '@solana/web3.js';
 import BN from 'bn.js';
 import { SolanaService } from '../../src/services/solanaService.js';
 import type { TokenAllocationInput } from '../../src/services/solanaService.js';
@@ -18,6 +23,30 @@ const DECIMALS = 6;
 const ONE = new BN(10).pow(new BN(DECIMALS));
 // 1,000,000 tokens total supply (raw = 1e6 * 1e6).
 const TOTAL_RAW = new BN(1_000_000).mul(ONE);
+const ZERO_KEY = new PublicKey(new Uint8Array(32));
+
+function token2022MintAccountInfo(
+  supply: bigint,
+  decimals: number,
+): AccountInfo<Buffer> {
+  const data = Buffer.alloc(MintLayout.span);
+  MintLayout.encode({
+    mintAuthorityOption: 0,
+    mintAuthority: ZERO_KEY,
+    supply,
+    decimals,
+    isInitialized: true,
+    freezeAuthorityOption: 0,
+    freezeAuthority: ZERO_KEY,
+  }, data);
+  return {
+    data,
+    executable: false,
+    lamports: 1,
+    owner: TOKEN_2022_PROGRAM_ID,
+    rentEpoch: 0,
+  };
+}
 
 function serviceWithSupply(rawSupply: BN): SolanaService {
   const svc = new SolanaService();
@@ -36,6 +65,42 @@ const baseAllocation = (): TokenAllocationInput => ({
 });
 
 describe('SolanaService.getSupplyInfo — excluded holders', () => {
+  it('reads standalone Token-2022 total supply using the mint account owner', async () => {
+    const svc = new SolanaService();
+    (svc as any).connection = {
+      getAccountInfo: async () =>
+        token2022MintAccountInfo(BigInt(TOTAL_RAW.toString()), DECIMALS),
+    };
+
+    expect(await svc.getTotalSupply(MINT)).toBe('1000000');
+    const info = await svc.getSupplyInfo(MINT);
+    expect(info.totalSupply).toBe('1000000');
+    expect(info.circulatingSupply).toBe('1000000');
+  });
+
+  it('uses the mint supply captured with allocation balances without another RPC read', async () => {
+    const svc = new SolanaService();
+    (svc as any).withRetry = async () => {
+      throw new Error('mint RPC should not be called');
+    };
+
+    const info = await svc.getSupplyInfo(MINT, {
+      ...baseAllocation(),
+      balanceSnapshotSlot: 456,
+      mintSupplySnapshot: {
+        amount: TOTAL_RAW,
+        decimals: DECIMALS,
+      },
+      excludedHolders: [
+        { address: HOLDER_A, amount: new BN(100_000).mul(ONE) },
+      ],
+    });
+
+    expect(info.totalSupply).toBe('1000000');
+    expect(info.circulatingSupply).toBe('900000');
+    expect(info.allocation?.balanceSnapshotSlot).toBe(456);
+  });
+
   it('subtracts configured excluded-holder balances from circulating supply', async () => {
     const svc = serviceWithSupply(TOTAL_RAW);
     const info = await svc.getSupplyInfo(MINT, {
@@ -244,5 +309,17 @@ describe('SolanaService.getSupplyInfo — excluded holders', () => {
         { address: HOLDER_A, amount: new BN(2_000_000).mul(ONE) },
       ],
     })).rejects.toThrow('Non-circulating allocations exceed total supply');
+  });
+
+  it('bounds cached snapshot variants and evicts the oldest entry', () => {
+    const svc = new SolanaService();
+
+    for (let index = 0; index <= 1000; index++) {
+      (svc as any).setCache(`snapshot-${index}`, index);
+    }
+
+    expect((svc as any).cache.size).toBe(1000);
+    expect((svc as any).cache.has('snapshot-0')).toBe(false);
+    expect((svc as any).cache.get('snapshot-1000')?.data).toBe(1000);
   });
 });

@@ -198,7 +198,9 @@ Returns the latest Solana slot for which swap data is available.
 
 #### GET `/dexscreener/asset?id=:mintAddress`
 
-Returns token metadata for a given Solana mint address. Fetched from on-chain Metaplex Token Metadata.
+Returns token metadata and supply for a given Solana mint address. Supply is
+calculated from one confirmed mint/allocation snapshot. If supply cannot be
+verified, the endpoint returns `503` with code `SUPPLY_UNAVAILABLE`.
 
 **Response:**
 ```json
@@ -207,6 +209,8 @@ Returns token metadata for a given Solana mint address. Fetched from on-chain Me
     "id": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta",
     "name": "ZKFG",
     "symbol": "ZKFG",
+    "totalSupply": 1000000,
+    "circulatingSupply": 875000,
     "metadata": {
       "decimals": "6"
     }

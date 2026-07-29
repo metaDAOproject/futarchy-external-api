@@ -34,6 +34,7 @@ describe('DexScreener Routes', () => {
   describe('GET /dexscreener/asset', () => {
     it('returns 503 and does not cache a failed supply read', async () => {
       let allocationCalls = 0;
+      let metadataCalls = 0;
       const launchpadService = {
         getTokenAllocationBreakdown: async () => {
           allocationCalls++;
@@ -41,7 +42,16 @@ describe('DexScreener Routes', () => {
         },
       } as unknown as LaunchpadService;
       const app = createTestApp({
-        futarchyService: assetMetadataService(),
+        futarchyService: {
+          getTokenMetadata: async () => {
+            metadataCalls++;
+            return { name: 'Wrapped SOL', symbol: 'SOL' };
+          },
+          getTokenDecimals: async () => {
+            metadataCalls++;
+            return 9;
+          },
+        } as unknown as FutarchyService,
         launchpadService,
       });
 
@@ -52,6 +62,7 @@ describe('DexScreener Routes', () => {
       expect(first.body.code).toBe('SUPPLY_UNAVAILABLE');
       expect(second.status).toBe(503);
       expect(allocationCalls).toBe(2);
+      expect(metadataCalls).toBe(0);
     });
 
     it('returns complete supply data when the allocation snapshot succeeds', async () => {
@@ -63,6 +74,11 @@ describe('DexScreener Routes', () => {
           meteoraLpLiquidity: { amount: { toString: () => '0' } },
           daoTreasuryTokens: { amount: { toString: () => '0' } },
           excludedHolders: [],
+          balanceSnapshotSlot: 100,
+          mintSupplySnapshot: {
+            amount: { toString: () => '1000000000000' },
+            decimals: 6,
+          },
           totalNonCirculating: { toString: () => '0' },
         }),
       } as unknown as LaunchpadService;
@@ -89,6 +105,24 @@ describe('DexScreener Routes', () => {
         circulatingSupply: 875000,
         metadata: { decimals: '9' },
       });
+    });
+
+    it('rejects numeric-prefix garbage instead of truncating it', async () => {
+      const solanaService = {
+        getSupplyInfo: async () => ({
+          totalSupply: '123abc',
+          circulatingSupply: '100',
+        }),
+      } as unknown as SolanaService;
+      const app = createTestApp({
+        futarchyService: assetMetadataService(),
+        solanaService,
+      });
+
+      const response = await request(app).get('/dexscreener/asset').query({ id: VALID_MINT });
+
+      expect(response.status).toBe(503);
+      expect(response.body.code).toBe('SUPPLY_UNAVAILABLE');
     });
   });
 

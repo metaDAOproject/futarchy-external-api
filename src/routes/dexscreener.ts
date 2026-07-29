@@ -98,11 +98,6 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       return res.status(400).json({ error: 'Invalid asset id (not a valid Solana address)' });
     }
 
-    const [metadata, decimals] = await Promise.all([
-      futarchyService.getTokenMetadata(mintPubkey),
-      futarchyService.getTokenDecimals(mintPubkey),
-    ]);
-
     let totalSupply: number;
     let circulatingSupply: number;
     try {
@@ -111,10 +106,10 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
         solanaService,
         launchpadService,
       );
-      const total = parseFloat(supplyInfo.totalSupply);
-      const circ = parseFloat(supplyInfo.circulatingSupply);
+      const total = Number(supplyInfo.totalSupply);
+      const circ = Number(supplyInfo.circulatingSupply);
       if (!Number.isFinite(total) || !Number.isFinite(circ)) {
-        throw new Error('Supply response was not finite');
+        throw new Error('Supply response was not a finite number');
       }
       totalSupply = total;
       circulatingSupply = circ;
@@ -128,6 +123,11 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
         'SUPPLY_UNAVAILABLE',
       );
     }
+
+    const [metadata, decimals] = await Promise.all([
+      futarchyService.getTokenMetadata(mintPubkey),
+      futarchyService.getTokenDecimals(mintPubkey),
+    ]);
 
     const response: DexScreenerAssetResponse = {
       asset: {

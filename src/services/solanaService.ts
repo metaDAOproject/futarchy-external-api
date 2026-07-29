@@ -1,5 +1,10 @@
 import { Connection, PublicKey } from '@solana/web3.js';
-import { getMint } from '@solana/spl-token';
+import {
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  unpackMint,
+  type Mint,
+} from '@solana/spl-token';
 import { config } from '../config.js';
 import BN from 'bn.js';
 import { retry, isTransientError, createRetryLogger } from '../utils/resilience.js';
@@ -96,12 +101,18 @@ export interface TokenAllocationInput {
     label?: string;
   }>;
   balanceSnapshotSlot?: number;
+  mintSupplySnapshot?: {
+    amount: BN;
+    decimals: number;
+  };
   daoAddress?: string;
   launchAddress?: string;
   version?: string;
 }
 
 export class SolanaService {
+  private static readonly CACHE_MAX_ENTRIES = 1000;
+
   private connection: Connection;
   private cache: Map<string, { data: any; timestamp: number }>;
 
@@ -119,6 +130,15 @@ export class SolanaService {
   }
 
   private setCache(key: string, data: any): void {
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    }
+    if (this.cache.size >= SolanaService.CACHE_MAX_ENTRIES) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.cache.delete(oldestKey);
+      }
+    }
     this.cache.set(key, { data, timestamp: Date.now() });
   }
 
@@ -185,6 +205,22 @@ export class SolanaService {
     });
   }
 
+  private async getMintInfo(mintAddress: PublicKey): Promise<Mint> {
+    const accountInfo = await this.connection.getAccountInfo(mintAddress, 'confirmed');
+    if (!accountInfo) {
+      throw new Error(`Mint account ${mintAddress.toString()} was not found`);
+    }
+    if (
+      !accountInfo.owner.equals(TOKEN_PROGRAM_ID) &&
+      !accountInfo.owner.equals(TOKEN_2022_PROGRAM_ID)
+    ) {
+      throw new Error(
+        `Mint ${mintAddress.toString()} is not owned by a supported token program`,
+      );
+    }
+    return unpackMint(mintAddress, accountInfo, accountInfo.owner);
+  }
+
   /**
    * Validate if a string is a valid Solana public key
    */
@@ -209,7 +245,7 @@ export class SolanaService {
 
     try {
       const mintPubkey = new PublicKey(mintAddress);
-      const mintInfo = await this.withRetry(() => getMint(this.connection, mintPubkey));
+      const mintInfo = await this.withRetry(() => this.getMintInfo(mintPubkey));
       const supply = Number(mintInfo.supply);
       const decimals = mintInfo.decimals;
 
@@ -278,6 +314,12 @@ export class SolanaService {
             label: holder.label,
           })),
           balanceSnapshotSlot: allocation.balanceSnapshotSlot,
+          mintSupplySnapshot: allocation.mintSupplySnapshot
+            ? {
+                amount: allocation.mintSupplySnapshot.amount.toString(),
+                decimals: allocation.mintSupplySnapshot.decimals,
+              }
+            : undefined,
           daoAddress: allocation.daoAddress,
           launchAddress: allocation.launchAddress,
           version: allocation.version,
@@ -290,11 +332,21 @@ export class SolanaService {
     if (cached !== null) return cached;
 
     try {
-      const mintPubkey = new PublicKey(mintAddress);
-      const mintInfo = await this.withRetry(() => getMint(this.connection, mintPubkey));
-      const rawSupply = mintInfo.supply.toString();
-      const totalSupplyBN = new BN(mintInfo.supply.toString());
-      const decimals = mintInfo.decimals;
+      let totalSupplyBN: BN;
+      let decimals: number;
+      if (allocation?.mintSupplySnapshot) {
+        totalSupplyBN = allocation.mintSupplySnapshot.amount;
+        decimals = allocation.mintSupplySnapshot.decimals;
+      } else {
+        const mintPubkey = new PublicKey(mintAddress);
+        const mintInfo = await this.withRetry(() => this.getMintInfo(mintPubkey));
+        totalSupplyBN = new BN(mintInfo.supply.toString());
+        decimals = mintInfo.decimals;
+      }
+      if (!Number.isInteger(decimals) || decimals < 0) {
+        throw new Error(`Invalid mint decimals for ${mintAddress}`);
+      }
+      const rawSupply = totalSupplyBN.toString();
       const divisor = Math.pow(10, decimals);
 
       const totalSupplyWithDecimals = Number(totalSupplyBN.toString()) / divisor;

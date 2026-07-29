@@ -50,6 +50,7 @@ export async function getSupplyInfoWithLaunchpadAllocation(
       label: h.label,
     })),
     balanceSnapshotSlot: allocation.balanceSnapshotSlot,
+    mintSupplySnapshot: allocation.mintSupplySnapshot,
     daoAddress: allocation.daoAddress?.toString(),
     launchAddress: allocation.launchAddress?.toString(),
     version: allocation.version,

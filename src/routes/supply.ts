@@ -5,6 +5,14 @@ import { asyncHandler, AppError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 import { getSupplyInfoWithLaunchpadAllocation } from '../services/supplyWithLaunchpadAllocation.js';
 
+function parseFiniteSupply(value: string): number {
+  const supply = Number(value);
+  if (!Number.isFinite(supply)) {
+    throw new Error('Supply response was not a finite number');
+  }
+  return supply;
+}
+
 export function createSupplyRouter(services: ServiceGetters): Router {
   const router = Router();
   const { getSolanaService, getLaunchpadService } = services;
@@ -140,7 +148,7 @@ export function createSupplyRouter(services: ServiceGetters): Router {
       launchpadService,
     );
 
-    res.json({ circulatingSupply: parseFloat(supplyInfo.circulatingSupply) });
+    res.json({ circulatingSupply: parseFiniteSupply(supplyInfo.circulatingSupply) });
   }));
 
   // Jupiter-compatible total supply
@@ -153,7 +161,7 @@ export function createSupplyRouter(services: ServiceGetters): Router {
     const solanaService = getSolanaService();
     const supplyInfo = await solanaService.getSupplyInfo(mintAddressResult.value);
 
-    res.json({ totalSupply: parseFloat(supplyInfo.totalSupply) });
+    res.json({ totalSupply: parseFiniteSupply(supplyInfo.totalSupply) });
   }));
 
   return router;
