@@ -6,6 +6,32 @@ A multi-aggregator DEX API for the Futarchy protocol that automatically discover
 
 **Base URL:** `https://your-api-domain.com`
 
+**Reference:** `GET /docs` renders the full API reference, and `GET /openapi.json`
+serves the machine-readable OpenAPI 3.1 contract (`src/openapi.ts`). A test
+fails if the spec documents a route the app doesn't serve.
+
+### Versioning
+
+Every data endpoint is served under a version prefix: `/v1/api/tickers`,
+`/v1/cmc/summary`, `/v1/dexscreener/events`, `/v1/api/launches/live`, and so on.
+New integrations should use the versioned URLs.
+
+- **Unversioned paths** (`/api/tickers`, `/cmc/summary`, …) are a frozen alias
+  of v1, kept so existing partner integrations keep working. The paths below
+  are written unversioned; prefix them with `/v1`.
+- **Not versioned:** health, probe, metrics and docs endpoints (`/health*`,
+  `/api/health`, `/metrics`, `/docs`, `/openapi.json`, `/`). They are operational, not part of the API
+  contract.
+- **Breaking changes** ship as a new version (`/v2/...`). Earlier versions are
+  left unchanged.
+- **Deprecation:** a deprecated version (or the unversioned alias) answers
+  every request with `Deprecation` ([RFC 9745](https://www.rfc-editor.org/rfc/rfc9745)),
+  `Sunset` ([RFC 8594](https://www.rfc-editor.org/rfc/rfc8594)) and
+  `Link: <…>; rel="successor-version"` headers. It is removed after its sunset date.
+
+Versions and their deprecation status are configured in one place,
+`API_VERSIONS` and `UNVERSIONED_ALIAS` in `src/routes/index.ts`.
+
 ---
 
 ### CoinGecko Endpoints
@@ -56,7 +82,14 @@ Returns all DAO tickers with pricing, volume, and liquidity information. Automat
 | `startDate` | First trade date for the token |
 
 **Volume source**: `futarchy.user_pool_spot_ohlcv` in the served ETL DB. If the
-served DB is unavailable, the endpoint returns `503` instead of reporting zero volume.
+served DB is unavailable, the endpoint returns `503 SERVED_DB_UNAVAILABLE` instead of
+reporting zero volume.
+
+**Stale data**: if the newest FutarchyAMM spot swap is older than `SERVED_DATA_MAX_AGE_SECONDS`
+(default 6h), `/api/tickers`, `/cmc/summary` and `/cmc/ticker` return
+`503 SERVED_DATA_STALE`. A stalled ETL would otherwise serve rolling-24h volume that
+drains toward zero while looking healthy; with a 503, pollers keep their last good
+data and the alert fires.
 
 ---
 
@@ -209,8 +242,8 @@ verified, the endpoint returns `503` with code `SUPPLY_UNAVAILABLE`.
     "id": "ZKFHiLAfAFMTcDAuCtjNW54VzpERvoe7PBF9mYgmeta",
     "name": "ZKFG",
     "symbol": "ZKFG",
-    "totalSupply": 1000000,
-    "circulatingSupply": 875000,
+    "totalSupply": 1000000000,
+    "circulatingSupply": 412500000,
     "metadata": {
       "decimals": "6"
     }
@@ -266,7 +299,8 @@ Returns swap events in the given Solana slot range (both inclusive). Events are 
 - **Buy** (user sends USDC → receives token): `asset1In` + `asset0Out`
 - **Sell** (user sends token → receives USDC): `asset0In` + `asset1Out`
 - `priceNative` = price of asset0 (base token) in asset1 (USDC)
-- All amounts are decimalized (divided by `10^6`)
+- Swap amounts and reserves are divided by `10^decimals` for their respective base or quote mint; tokens are not assumed to share six decimals. `priceNative` is quote tokens per base token after normalization.
+- Mint decimals use cached on-chain metadata, resolved once per distinct mint per request in batches of at most eight lookups. If metadata cannot be loaded, the events request returns 5xx instead of defaulting to a decimal count or returning partial data.
 
 ---
 
@@ -275,6 +309,12 @@ Returns swap events in the given Solana slot range (both inclusive). Events are 
 #### GET `/api/market-data?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&tokens=TOKEN1,TOKEN2`
 
 Returns daily market data for the given date range, split by Futarchy AMM and Meteora sources.
+
+Both dates are required, must be real calendar dates, and `startDate` must be on
+or before `endDate`, and the range may span at most `MARKET_DATA_MAX_RANGE_DAYS`
+(default 366) days, so fetch longer histories in several requests. `tokens` is
+optional: up to 100 comma-separated base-token mint addresses. Anything else is a `400 INVALID_QUERY_PARAMETER` naming the
+`field`, returned before the database is touched.
 
 **Data source**: both FutarchyAMM and Meteora data come from the unified
 `futarchy.user_pool_daily` ETL table in the served DB. The served DB is a hard
@@ -310,16 +350,90 @@ does not decode fractional ownership of DAMM pool positions.
 
 ---
 
+### Launch Endpoints
+
+#### GET `/api/launches/live`
+
+Launches still accepting commitments across launchpad v0.6, v0.7 and v0.8 —
+on-chain state `live` with a close time in the future — read directly from Solana and cached for `CACHE_LIVE_LAUNCHES_TTL`
+(default 5 minutes). RPC failures return 5xx, never an empty list.
+
+```json
+{
+  "count": 1,
+  "updatedAt": "2026-10-09T17:00:00.000Z",
+  "launches": [
+    {
+      "launchAddress": "…",
+      "version": "v0.7",
+      "tokenAddress": "…",
+      "quoteMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "quoteDecimals": 6,
+      "committerCount": 412,
+      "totalCommitted": "251.5",
+      "totalCommittedRaw": "251500000",
+      "minimumRaise": "500000",
+      "minimumRaiseRaw": "500000000000",
+      "closeTime": 1760345600,
+      "tokenName": "The Syndicate",
+      "tokenSymbol": "GANG"
+    }
+  ]
+}
+```
+
+- `tokenAddress` — mint of the token being launched; `tokenName` / `tokenSymbol`
+  come from its Metaplex metadata (`null` if it has none).
+- `committerCount` / `totalCommitted` — count and sum of the launch's funding
+  records with a non-zero `committedAmount` (one record per funder).
+- `minimumRaise` — the launch's on-chain `minimumRaiseAmount`.
+- `closeTime` — unix seconds, `unixTimestampStarted + secondsForLaunch`. Launches
+  past this time stay `live` on-chain until someone calls `closeLaunch` (many
+  never are); they are excluded at request time, even within a cache window.
+
+---
+
 ### Health & Admin
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /health` | Liveness: process status and uptime (no dependency checks) |
-| `GET /api/health` | Readiness: served DB connectivity, ETL data contract, and data freshness |
-| `GET /metrics` | Prometheus metrics (HTTP, served-DB health gauges, heartbeat) |
+| `GET /health/startup` | Startup probe: 200 once the served DB connected at boot, else 503 |
+| `GET /health/ready` | Readiness probe: 200 while the served DB answers `SELECT 1` within 2s, else 503 |
+| `GET /health/live` | Liveness probe: 200 whenever the process can respond (no dependency checks) |
+| `GET /health` | Process status and uptime (no dependency checks) |
+| `GET /api/health` | Detailed status: served DB connectivity, ETL data contract, and data freshness |
+| `GET /metrics` | Prometheus metrics (HTTP, served-DB health gauges, heartbeat). Requires `Authorization: Bearer <METRICS_TOKEN>` when `METRICS_TOKEN` is set |
 
-`/api/health` reports `status: "degraded"` (with a `message`) when the served DB
-is unreachable, the served-data contract check fails, or the freshness query fails.
+`/api/health` returns `200` when healthy and `503` with `status: "degraded"`
+(and a `message`) when the served DB is unreachable, the served-data contract
+check fails, or the freshness query fails. Use it for dashboards and uptime
+monitors, not container probes. Don't point a Northflank liveness probe at it:
+a 503 there would restart containers during a DB outage.
+
+#### Container probes (Northflank)
+
+The `/health/{startup,ready,live}` probes skip the rate limiter and request
+metrics. Probes run inside the container and all share the 127.0.0.1 rate-limit
+bucket, and a 429 on liveness would restart a healthy container.
+
+| Probe | Path | Initial delay | Interval | Timeout | Max failures | Success threshold |
+|-------|------|---------------|----------|---------|--------------|-------------------|
+| Startup | `/health/startup` | 2s | 5s | 3s | 12 (~60s to start) | 1 |
+| Readiness | `/health/ready` | 1s | 10s | 3s | 3 (~30s to leave the LB) | 1 |
+| Liveness | `/health/live` | 1s | 15s | 3s | 4 (~60s unresponsive → restart) | 1 |
+
+All three use HTTP on port `3000` (`PORT`). Why these values:
+
+- **Startup.** Boot usually takes 1–3s. The initial DB connect can take up to its
+  10s connection timeout. If the DB never connects, the startup probe fails and
+  the container restarts. Without that, the container would never recover,
+  because the DB reconnect loop only starts after a successful first connect.
+- **Readiness.** The probe gives up on the DB ping at 2s, under the 3s probe
+  timeout, so a hung DB returns a clean 503. Three failures in a row tolerate a
+  single blip.
+- **Liveness.** It has no dependencies, so a DB or RPC outage never causes
+  restart loops. The settings are lenient because a restart costs more than a
+  brief event-loop stall.
 
 **Heartbeat**: a background self-check runs every `HEARTBEAT_INTERVAL_MS` (default
 1 min). It verifies served-DB connectivity, alerts when the newest swap is older
@@ -360,16 +474,28 @@ Create a `.env` file in the root directory (see `example.env` for reference):
 | `SOLANA_WS_URL` / `RPCPOOL_WS_URL` | Solana WebSocket endpoint | `wss://api.mainnet-beta.solana.com` |
 | **Server** | | |
 | `PORT` | Server port | `3000` |
-| `SERVER_REQUEST_TIMEOUT` | Request timeout (ms) | `300000` |
+| `SERVER_REQUEST_TIMEOUT` | Max time (ms) to respond; slower requests get `503 REQUEST_TIMEOUT` | `30000` |
+| `METRICS_TOKEN` | Bearer token required by `GET /metrics` (open, with a startup warning, when unset) | — |
 | `TRUST_PROXY_HOPS` | Reverse-proxy hops in front of the API (needed for per-IP rate limiting behind a LB) | `0` |
 | `TRUSTED_API_KEYS` | Comma-separated allowlist of trusted partner keys | — |
 | `TRUSTED_RATE_LIMIT_MAX` | Per-bucket request count per minute for trusted keys | `600` |
-| `CACHE_TICKERS_TTL` | On-chain data cache TTL (ms) | `55000` |
+| `CACHE_TICKERS_TTL` | On-chain DAO/pool snapshot TTL (ms); older snapshots refresh in the background | `55000` |
+| `CACHE_TICKERS_MAX_STALE` | Max age (ms) of a snapshot served while refreshing; past it requests wait and fail (5xx) if the RPC is down | `300000` |
+| `RPC_TIMEOUT_MS` | Per-request Solana RPC timeout (ms) | `20000` |
+| `CACHE_CONTROL_MAX_AGE` | `Cache-Control` max-age (seconds) on successful data responses | `30` |
+| `SHUTDOWN_DRAIN_MS` | On SIGTERM, report not-ready and keep serving this long before closing. Keep it + 15s under the container's termination grace period | `10000` |
+| `CACHE_LIVE_LAUNCHES_TTL` | `/api/launches/live` snapshot TTL (ms) | `300000` |
+| `CACHE_SERVED_METRICS_TTL` | Reuse window (ms) for the served-DB aggregates behind `/api/tickers` and `/cmc/*` (24h volume, 24h-ago reserves, first-trade dates). Concurrent requests share one query; failures are never cached. `0` only coalesces concurrent queries | `30000` |
+| `RATE_LIMIT_REDIS_URL` | `redis://` / `rediss://` URL for rate-limit counters shared by every replica. Unset: each replica counts on its own (N replicas allow N× the limits). If Redis becomes unreachable or slow (>250ms), requests fall back to per-process counting and it reconnects automatically | — |
+| `SERVED_DATA_MAX_AGE_SECONDS` | `/api/tickers` and `/cmc/summary`/`/cmc/ticker` return `503 SERVED_DATA_STALE` when the newest FutarchyAMM spot swap is older than this. `0` disables | `21600` |
+| `MARKET_DATA_MAX_RANGE_DAYS` | Max inclusive days per `/api/market-data` request. `0` disables | `366` |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARN` or `ERROR`. `INFO` writes one structured access-log line per request (probes and `/metrics` excluded) | `INFO` |
 | **Served indexer DB (required — the only database this API uses)** | | |
 | `DATABASE_PG_URL` | Read-only connection to the served indexer DB (Meteora, tickers, DexScreener, first-trade-dates). **Required** — `/api/market-data`, `/api/tickers`, `/cmc/summary`, `/cmc/ticker`, and the DexScreener routes return 503 without it. | — |
 | `DATABASE_PG_SSL` | Enable SSL (server cert verified against system CAs) | `false` |
 | `DATABASE_PG_CA_CERT` | PEM CA cert content for private-CA verification | — |
 | `DATABASE_PG_SSL_NO_VERIFY` | Explicit opt-out of TLS verification (stopgap only) | `false` |
+| `DATABASE_PG_STATEMENT_TIMEOUT_MS` | Postgres cancels statements running longer than this (ms), so a slow query can't hold a pool connection after its request timed out. `0` disables | `25000` |
 | **Heartbeat** | | |
 | `HEARTBEAT_INTERVAL_MS` | Background self-check cadence (0 disables) | `60000` |
 | `HEARTBEAT_MAX_DATA_AGE_SECONDS` | Stale-data alert threshold (0 disables) | `21600` |
@@ -393,12 +519,13 @@ src/
 │   └── heartbeat.ts              # Background self-check (served DB, freshness, contract)
 ├── config.ts                     # Environment variables & configuration
 ├── routes/
-│   ├── index.ts                  # Route registration
+│   ├── index.ts                  # Route registration + API versions (/v1, unversioned alias)
 │   ├── coingecko.ts              # GET /api/tickers
 │   ├── coinmarketcap.ts          # CoinMarketCap DEX adapter (summary/ticker/assets)
 │   ├── dexscreener.ts            # DexScreener adapter (4 endpoints)
 │   ├── market.ts                 # GET /api/market-data (user_pool ETL)
 │   ├── supply.ts                 # GET /api/supply/*
+│   ├── launches.ts               # GET /api/launches/live
 │   ├── health.ts                 # Liveness + readiness checks
 │   ├── metrics.ts                # Prometheus metrics
 │   └── root.ts                   # GET / (API info)
@@ -407,7 +534,7 @@ src/
 │   ├── priceService.ts           # Price, spread, liquidity calculations
 │   ├── externalDatabaseService.ts # Read-only served ETL DB connection (the only DB)
 │   ├── solanaService.ts          # SPL token supply queries
-│   ├── launchpadService.ts       # Token allocation breakdown
+│   ├── launchpadService.ts       # Token allocation breakdown + live launches
 │   └── metricsService.ts         # Prometheus counters/histograms
 ├── types/
 │   ├── coingecko.ts              # CoinGecko response types
@@ -442,25 +569,60 @@ The DexScreener adapter reads **directly from the external indexer DB** (`v0_6_s
 - **Trusted partners:** 600 requests per minute per key (configurable via `TRUSTED_RATE_LIMIT_MAX`). Send the issued key in the `X-API-Key` header. Each key has its own bucket — partners do not share quota.
 - Requests sent with an `X-API-Key` header that does not match the server-side allowlist receive `401 Unauthorized` with `code: "INVALID_API_KEY"`.
 - Keys are issued out-of-band by the team. Contact us if you need elevated access.
+- Every rate-limited response carries `RateLimit-Limit`, `RateLimit-Remaining`
+  and `RateLimit-Reset` (seconds) headers; a `429` also carries `Retry-After`.
+- If requests arrive with `X-Forwarded-For` while `TRUST_PROXY_HOPS=0`, the API
+  logs a one-time warning, since every client then shares the proxy's bucket.
+- **Multiple replicas:** set `RATE_LIMIT_REDIS_URL` so the limits above hold for
+  the whole deployment. Without it, each replica counts on its own. Trusted
+  keys are stored in Redis only as SHA-256 hashes. Rate limiting never takes the
+  API down: if Redis is unreachable or slow, each replica counts on its own until
+  Redis recovers.
+
+## Caching, Compression and CORS
+
+- Successful data responses send `Cache-Control: private, max-age=30`
+  (`CACHE_CONTROL_MAX_AGE`), so a client can reuse a response for 30s. It's
+  `private`, not `public`, because responses carry per-caller headers
+  (`RateLimit-*`, `X-Request-Id`) that a shared cache would replay to other
+  callers. Errors, health, probe and metrics responses send `no-store`.
+- Responses over 1 KB are compressed (`br`, `gzip` or `deflate`) when the client
+  sends `Accept-Encoding` (`Vary: Accept-Encoding` is set). JSON feeds shrink
+  about 85% (the OpenAPI spec goes from 68 KB to 10 KB).
+- CORS is open for read-only use: any origin, `GET`/`OPTIONS`, and the
+  `X-API-Key` and `X-Request-Id` request headers. Preflight `OPTIONS` requests
+  are answered directly with `204` and don't count toward the rate limit.
+
+Numeric settings are validated at startup; an invalid value (e.g. `PORT=30s`)
+exits with an error instead of silently becoming `NaN`.
 
 ## Error Handling
 
+Every error, on every endpoint, uses one JSON shape:
+
 ```json
 {
-  "error": "Error message",
-  "code": "ERROR_CODE",
+  "error": "startDate must be on or before endDate",
+  "code": "INVALID_QUERY_PARAMETER",
+  "field": "startDate",
   "requestId": "uuid"
 }
 ```
 
+Branch on `code` (stable); `error` is a human-readable message and may change.
+`field` appears on a 400 and names the rejected parameter. `requestId` matches
+the `X-Request-Id` response header and the server's access log, so quote it when
+reporting a problem.
+
 | Code | Description |
 |------|-------------|
-| `400` | Bad Request (missing/invalid parameters) |
+| `400` | `INVALID_QUERY_PARAMETER` (missing, malformed or repeated query parameter) or `INVALID_MINT_ADDRESS` |
 | `401` | Unauthorized (invalid `X-API-Key`) |
-| `404` | Not Found |
+| `404` | Not Found (unknown routes also answer in this JSON shape, `code: "NOT_FOUND"`) |
 | `429` | Rate limit exceeded |
-| `503` | Service unavailable (DB not connected) |
-| `500` | Internal server error |
+| `503` | `code: "REQUEST_TIMEOUT"` when the response took longer than `SERVER_REQUEST_TIMEOUT` |
+| `503` | `SERVED_DB_UNAVAILABLE` (served DB not connected), `SERVED_DATA_STALE` (ETL stalled) and other dependency outages |
+| `500` | `INTERNAL_ERROR` (unexpected server or upstream RPC/DB failure); retry later |
 
 ## License
 

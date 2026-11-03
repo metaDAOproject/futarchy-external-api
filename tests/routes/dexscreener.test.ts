@@ -14,6 +14,33 @@ function assetMetadataService(): FutarchyService {
     getTokenDecimals: async () => 9,
   } as unknown as FutarchyService;
 }
+import { PublicKey } from '@solana/web3.js';
+
+const BASE_MINT = new PublicKey(new Uint8Array(32).fill(1)).toBase58();
+const QUOTE_MINT = new PublicKey(new Uint8Array(32).fill(2)).toBase58();
+
+function decimalsService(baseDecimals = 6, quoteDecimals = 6, calls: string[] = []): FutarchyService {
+  return {
+    getTokenDecimals: async (mint: PublicKey) => {
+      const address = mint.toBase58();
+      calls.push(address);
+      if (address === BASE_MINT) return baseDecimals;
+      if (address === QUOTE_MINT) return quoteDecimals;
+      throw new Error('Unexpected mint');
+    },
+  } as unknown as FutarchyService;
+}
+
+// Raw units reconstructed from the reported block 451277837 event.
+const sanctumBuy = {
+  signature: '4yWsBcQ2QDJ7bHAnptJbh84md7Ae2RxAuPAjHTfx9Tu2eWeF2EhyUKegJns3csMudSaHxGwZ11pQw3zEZsp52dMZ',
+  slot: 451277837, unix_timestamp: '1790587475',
+  dao_addr: 'CATL7SAzmnytyYmr9sVs92PQ2YDWowS3LN2xz3MMnB6H',
+  user_addr: 'DCXBVytwaBxTaeDErhTKdMvAk246pvssPb9adc7BYaUt',
+  base_mint: BASE_MINT, quote_mint: QUOTE_MINT,
+  swap_type: 'buy', input_amount: '4767277', output_amount: '58706559303',
+  amm_base_amount: '1407179424717063', amm_quote_amount: '113703642670',
+};
 
 // Stub the served DB with canned user_pool_swaps-shaped rows (the aliased column
 // shape the migrated /events SQL returns) so we test the event-building transform:
@@ -141,7 +168,12 @@ describe('DexScreener Routes', () => {
           swap_type: 'buy',  input_amount: '1000000',  output_amount: '20000000',
           amm_base_amount: '990000000', amm_quote_amount: '50500000' },
       ];
-      const app = createTestApp({ externalDatabaseService: extDbReturning(rows) });
+      const app = createTestApp({
+        externalDatabaseService: extDbReturning(rows.map(row => ({
+          ...row, base_mint: BASE_MINT, quote_mint: QUOTE_MINT,
+        }))),
+        futarchyService: decimalsService(),
+      });
 
       const res = await request(app).get('/dexscreener/events').query({ fromBlock: 0, toBlock: 100 });
       expect(res.status).toBe(200);
@@ -177,6 +209,141 @@ describe('DexScreener Routes', () => {
       expect(buy2.eventIndex).toBe(0);
     });
 
+    it('normalizes the reported Sanctum buy using nine base decimals and six quote decimals', async () => {
+      const app = createTestApp({
+        externalDatabaseService: extDbReturning([sanctumBuy]),
+        futarchyService: decimalsService(9, 6),
+      });
+      const res = await request(app).get('/dexscreener/events')
+        .query({ fromBlock: 451277837, toBlock: 451277837 });
+      expect(res.status).toBe(200);
+      expect(res.body.events).toEqual([{
+        block: { blockNumber: 451277837, blockTimestamp: 1790587475 },
+        eventType: 'swap', txnId: sanctumBuy.signature, txnIndex: 0, eventIndex: 0,
+        maker: sanctumBuy.user_addr, pairId: sanctumBuy.dao_addr,
+        asset1In: 4.767277, asset0Out: 58.706559303,
+        priceNative: 0.08120518484816712,
+        reserves: { asset0: 1407179.424717063, asset1: 113703.64267 },
+      }]);
+    });
+
+    for (const [baseDecimals, quoteDecimals] of [[9, 6], [6, 9], [0, 6]] as const) {
+      it(`normalizes sells with ${baseDecimals}/${quoteDecimals} decimals and omits absent reserves`, async () => {
+        const app = createTestApp({
+          externalDatabaseService: extDbReturning([{
+            ...sanctumBuy, swap_type: 'sell',
+            input_amount: String(10 * 10 ** baseDecimals),
+            output_amount: String(2 * 10 ** quoteDecimals),
+            amm_base_amount: null, amm_quote_amount: null,
+          }]),
+          futarchyService: decimalsService(baseDecimals, quoteDecimals),
+        });
+        const res = await request(app).get('/dexscreener/events').query({ fromBlock: 451277837, toBlock: 451277837 });
+        expect(res.status).toBe(200);
+        expect(res.body.events[0]).toMatchObject({ asset0In: 10, asset1Out: 2, priceNative: 0.2 });
+        expect(res.body.events[0]).not.toHaveProperty('reserves');
+      });
+    }
+
+    it('selects both mint identities in the bounded swaps query and normalizes sell reserves', async () => {
+      const app = createTestApp({
+        externalDatabaseService: {
+          isAvailable: () => true,
+          query: async (sql: string, params: unknown[]) => {
+            const selection = sql.split('FROM futarchy.user_pool_swaps')[0]!;
+            expect(selection).toContain('u.base_mint');
+            expect(selection).toContain('u.quote_mint');
+            expect(sql).toContain('u.slot >= $1 AND u.slot <= $2');
+            expect(params).toEqual([451277837, 451277837]);
+            return { rows: [{ ...sanctumBuy, swap_type: 'sell',
+              input_amount: '58706559303', output_amount: '4767277' }] };
+          },
+        } as unknown as ExternalDatabaseService,
+        futarchyService: decimalsService(9, 6),
+      });
+      const res = await request(app).get('/dexscreener/events').query({ fromBlock: 451277837, toBlock: 451277837 });
+      expect(res.status).toBe(200);
+      expect(res.body.events[0]).toMatchObject({
+        asset0In: 58.706559303, asset1Out: 4.767277, priceNative: 0.08120518484816712,
+        reserves: { asset0: 1407179.424717063, asset1: 113703.64267 },
+      });
+    });
+
+    it('uses each mint independently across mixed pairs and resolves each mint once per request', async () => {
+      const calls: string[] = [];
+      const app = createTestApp({
+        externalDatabaseService: extDbReturning([
+          sanctumBuy,
+          { ...sanctumBuy, base_mint: QUOTE_MINT, quote_mint: BASE_MINT,
+            input_amount: '2000000000', output_amount: '10000000',
+            amm_base_amount: '100000000', amm_quote_amount: '20000000000' },
+          { ...sanctumBuy, slot: 451277838 },
+        ]),
+        futarchyService: decimalsService(9, 6, calls),
+      });
+      const res = await request(app).get('/dexscreener/events').query({ fromBlock: 451277837, toBlock: 451277838 });
+      expect(res.status).toBe(200);
+      expect(res.body.events[1]).toMatchObject({
+        asset1In: 2, asset0Out: 10, priceNative: 0.2,
+        reserves: { asset0: 100, asset1: 20 }, txnIndex: 0, eventIndex: 1,
+      });
+      expect(res.body.events[2]).toMatchObject({ asset0Out: 58.706559303, txnIndex: 0, eventIndex: 0 });
+      expect(calls.sort()).toEqual([BASE_MINT, QUOTE_MINT].sort());
+    });
+
+    it('overlaps cold mint lookups without exceeding eight concurrent reads', async () => {
+      let active = 0;
+      let peak = 0;
+      const calls: string[] = [];
+      const rows = Array.from({ length: 12 }, (_, i) => ({
+        ...sanctumBuy, base_mint: new PublicKey(new Uint8Array(32).fill(i + 3)).toBase58(),
+      }));
+      const app = createTestApp({
+        externalDatabaseService: extDbReturning(rows),
+        futarchyService: {
+          getTokenDecimals: async (mint: PublicKey) => {
+            calls.push(mint.toBase58());
+            peak = Math.max(peak, ++active);
+            await new Promise(resolve => setTimeout(resolve, 5));
+            active--;
+            return 6;
+          },
+        } as unknown as FutarchyService,
+      });
+      const res = await request(app).get('/dexscreener/events').query({ fromBlock: 451277837, toBlock: 451277837 });
+      expect(res.status).toBe(200);
+      expect(res.body.events).toHaveLength(12);
+      expect(calls).toHaveLength(13);
+      expect(new Set(calls).size).toBe(13);
+      expect(peak).toBeGreaterThan(2);
+      expect(peak).toBeLessThanOrEqual(8);
+      expect(active).toBe(0);
+    });
+
+    for (const failedMint of [BASE_MINT, QUOTE_MINT]) {
+      it(`fails the whole response when decimals cannot be loaded for ${failedMint}`, async () => {
+        const app = createTestApp({
+          externalDatabaseService: extDbReturning([sanctumBuy]),
+          futarchyService: {
+            getTokenDecimals: async (mint: PublicKey) => {
+              if (mint.toBase58() === failedMint) throw new Error('RPC unavailable');
+              return 6;
+            },
+          } as unknown as FutarchyService,
+        });
+        const res = await request(app).get('/dexscreener/events').query({ fromBlock: 451277837, toBlock: 451277837 });
+        expect(res.status).toBeGreaterThanOrEqual(500);
+        expect(res.body).not.toHaveProperty('events');
+      });
+    }
+
+    it('returns an empty range without needing mint metadata', async () => {
+      const app = createTestApp({ externalDatabaseService: extDbReturning([]) });
+      const res = await request(app).get('/dexscreener/events').query({ fromBlock: 0, toBlock: 1 });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ events: [] });
+    });
+
     it('returns 503 when the served DB is unavailable', async () => {
       const app = createTestApp({
         externalDatabaseService: { isAvailable: () => false } as unknown as ExternalDatabaseService,
@@ -185,10 +352,60 @@ describe('DexScreener Routes', () => {
       expect(res.status).toBe(503);
     });
 
+    it.each([' ', '0x10', '1e3', '-1', '1.5'])('rejects fromBlock=%p as not a slot, before querying', async (fromBlock) => {
+      const app = createTestApp({ externalDatabaseService: extDbReturning([]) });
+      const res = await request(app).get('/dexscreener/events').query({ fromBlock, toBlock: 100 });
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ code: 'INVALID_QUERY_PARAMETER', field: 'fromBlock' });
+    });
+
     it('rejects an out-of-order block range', async () => {
       const app = createTestApp({ externalDatabaseService: extDbReturning([]) });
       const res = await request(app).get('/dexscreener/events').query({ fromBlock: 100, toBlock: 10 });
       expect(res.status).toBe(400);
+    });
+  });
+
+  describe('GET /dexscreener/pair', () => {
+    it('rejects a non-address id with 400 before querying the DB', async () => {
+      let queried = false;
+      const app = createTestApp({
+        externalDatabaseService: {
+          isAvailable: () => true,
+          query: async () => { queried = true; return { rows: [] }; },
+        } as unknown as ExternalDatabaseService,
+      });
+      const res = await request(app).get('/dexscreener/pair').query({ id: 'not-a-dao' });
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ code: 'INVALID_QUERY_PARAMETER', field: 'id' });
+      expect(queried).toBe(false);
+    });
+  });
+
+  describe('GET /dexscreener/asset', () => {
+    it('fails 5xx when supply cannot be loaded, and does not cache the failure', async () => {
+      let supplyUp = false;
+      const app = createTestApp({
+        futarchyService: {
+          getTokenMetadata: async () => ({ name: 'Token', symbol: 'TKN' }),
+          getTokenDecimals: async () => 6,
+        } as unknown as FutarchyService,
+        solanaService: {
+          getSupplyInfo: async () => {
+            if (!supplyUp) throw new Error('RPC unavailable');
+            return { totalSupply: '1000', circulatingSupply: '400' };
+          },
+        } as unknown as SolanaService,
+      });
+
+      const down = await request(app).get('/dexscreener/asset').query({ id: BASE_MINT });
+      expect(down.status).toBeGreaterThanOrEqual(500);
+      expect(down.body).not.toHaveProperty('asset');
+
+      supplyUp = true;
+      const up = await request(app).get('/dexscreener/asset').query({ id: BASE_MINT });
+      expect(up.status).toBe(200);
+      expect(up.body.asset).toMatchObject({ id: BASE_MINT, symbol: 'TKN', totalSupply: 1000, circulatingSupply: 400 });
     });
   });
 

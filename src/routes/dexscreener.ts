@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { PublicKey } from '@solana/web3.js';
 import { AppError, asyncHandler } from '../middleware/errorHandler.js';
+import { parseSolanaAddress, orBadRequest } from '../utils/validation.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 import type { ServiceGetters } from './types.js';
@@ -15,8 +16,6 @@ import { getSupplyInfoWithLaunchpadAllocation } from '../services/supplyWithLaun
 
 const DEX_KEY = 'futarchyAMM';
 const FEE_BPS = Math.round(config.fees.protocolFeeRate * 10000); // 0.005 → 50
-const TOKEN_DECIMALS = 6; // All futarchy tokens + USDC use 6 decimals
-const DECIMALIZE = Math.pow(10, TOKEN_DECIMALS);
 
 export function createDexScreenerRouter(services: ServiceGetters): Router {
   const router = Router();
@@ -32,6 +31,14 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
   const PAIR_CACHE_TTL_MS = 5 * 60 * 1000;
   const CACHE_MAX_ENTRIES = 1000;
 
+  function requireServedDb() {
+    const extDb = getExternalDatabaseService();
+    if (!extDb?.isAvailable()) {
+      throw AppError.serviceUnavailable('Served database not available', 'SERVED_DB_UNAVAILABLE');
+    }
+    return extDb;
+  }
+
   function cachePut<T>(cache: Map<string, T>, key: string, value: T): void {
     if (cache.size >= CACHE_MAX_ENTRIES) {
       // Evict oldest insertion (Map preserves insertion order)
@@ -45,10 +52,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
   // GET /dexscreener/latest-block
   // ---------------------------------------------------------------
   router.get('/dexscreener/latest-block', asyncHandler(async (_req: Request, res: Response) => {
-    const extDb = getExternalDatabaseService();
-    if (!extDb || !extDb.isAvailable()) {
-      return res.status(503).json({ error: 'External database not available' });
-    }
+    const extDb = requireServedDb();
 
     const result = await extDb.query(`
       SELECT slot, extract(epoch FROM block_time)::bigint AS unix_timestamp
@@ -59,7 +63,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
     `);
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'No blocks available' });
+      throw AppError.notFound('No blocks available', 'NOT_FOUND');
     }
 
     const row = result.rows[0];
@@ -77,10 +81,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
   // GET /dexscreener/asset?id=:string
   // ---------------------------------------------------------------
   router.get('/dexscreener/asset', asyncHandler(async (req: Request, res: Response) => {
-    const id = req.query.id as string;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing required parameter: id' });
-    }
+    const id = orBadRequest(parseSolanaAddress(req.query.id as string, 'id'));
 
     const cached = assetCache.get(id);
     if (cached && cached.expiresAt > Date.now()) {
@@ -91,12 +92,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
     const solanaService = getSolanaService();
     const launchpadService = getLaunchpadService();
 
-    let mintPubkey: PublicKey;
-    try {
-      mintPubkey = new PublicKey(id);
-    } catch {
-      return res.status(400).json({ error: 'Invalid asset id (not a valid Solana address)' });
-    }
+    const mintPubkey = new PublicKey(id);
 
     let totalSupply: number;
     let circulatingSupply: number;
@@ -153,20 +149,14 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
   // GET /dexscreener/pair?id=:string
   // ---------------------------------------------------------------
   router.get('/dexscreener/pair', asyncHandler(async (req: Request, res: Response) => {
-    const id = req.query.id as string;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing required parameter: id' });
-    }
+    const id = orBadRequest(parseSolanaAddress(req.query.id as string, 'id'));
 
     const cached = pairCache.get(id);
     if (cached && cached.expiresAt > Date.now()) {
       return res.json(cached.data);
     }
 
-    const extDb = getExternalDatabaseService();
-    if (!extDb || !extDb.isAvailable()) {
-      return res.status(503).json({ error: 'External database not available' });
-    }
+    const extDb = requireServedDb();
 
     // Pair identity + creation (first spot swap) from the unified ETL output. One
     // query: the earliest futarchy spot swap for the DAO carries its base/quote
@@ -186,7 +176,7 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
     );
 
     if (pairResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Pair not found' });
+      throw AppError.notFound('Pair not found', 'NOT_FOUND');
     }
 
     const dao = pairResult.rows[0];
@@ -215,26 +205,29 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
   // GET /dexscreener/events?fromBlock=:number&toBlock=:number
   // ---------------------------------------------------------------
   router.get('/dexscreener/events', asyncHandler(async (req: Request, res: Response) => {
+    // Digits only: Number() also reads '' and ' ' as 0, '0x10' as 16 and
+    // '1e3' as 1000, none of which is a slot the caller meant.
+    const isSlot = (value: unknown) => typeof value === 'string' && /^\d+$/.test(value);
     const fromBlock = Number(req.query.fromBlock);
     const toBlock = Number(req.query.toBlock);
 
-    if (!Number.isSafeInteger(fromBlock) || !Number.isSafeInteger(toBlock) || fromBlock < 0) {
-      return res.status(400).json({ error: 'fromBlock and toBlock must be non-negative integers' });
+    if (!isSlot(req.query.fromBlock) || !Number.isSafeInteger(fromBlock)) {
+      throw AppError.badRequest('fromBlock must be a non-negative integer', 'INVALID_QUERY_PARAMETER', 'fromBlock');
+    }
+    if (!isSlot(req.query.toBlock) || !Number.isSafeInteger(toBlock)) {
+      throw AppError.badRequest('toBlock must be a non-negative integer', 'INVALID_QUERY_PARAMETER', 'toBlock');
     }
 
     if (toBlock < fromBlock) {
-      return res.status(400).json({ error: 'toBlock must be >= fromBlock' });
+      throw AppError.badRequest('toBlock must be >= fromBlock', 'INVALID_QUERY_PARAMETER', 'toBlock');
     }
 
     const MAX_BLOCK_WINDOW = 500_000;
     if (toBlock - fromBlock > MAX_BLOCK_WINDOW) {
-      return res.status(400).json({ error: `Block range too large (max ${MAX_BLOCK_WINDOW} slots per request)` });
+      throw AppError.badRequest(`Block range too large (max ${MAX_BLOCK_WINDOW} slots per request)`, 'INVALID_QUERY_PARAMETER', 'toBlock');
     }
 
-    const extDb = getExternalDatabaseService();
-    if (!extDb || !extDb.isAvailable()) {
-      return res.status(503).json({ error: 'External database not available' });
-    }
+    const extDb = requireServedDb();
 
     // Query swap events in the slot range (both inclusive) from the unified ETL
     // output. Columns are aliased to the legacy v0_6 shape so the builder below is
@@ -257,6 +250,8 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
          extract(epoch FROM u.block_time)::bigint                       AS unix_timestamp,
          u.dao_addr,
          u.user_addr,
+         u.base_mint,
+         u.quote_mint,
          u.side                                                         AS swap_type,
          CASE WHEN u.side = 'buy' THEN u.quote_amount ELSE u.base_amount  END AS input_amount,
          CASE WHEN u.side = 'buy' THEN u.base_amount  ELSE u.quote_amount END AS output_amount,
@@ -277,6 +272,19 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
     let txnIndex = -1;
     let eventIndex = 0;
 
+    // Resolve distinct mints in bounded batches to avoid both serial cold-cache
+    // latency and an unbounded RPC burst. Reuse the service's on-chain cache;
+    // failed lookups fail the request rather than defaulting to six decimals.
+    const divisors = new Map<string, number>();
+    const mints = [...new Set<string>(result.rows.flatMap(row => [row.base_mint, row.quote_mint]))];
+    const MINT_LOOKUP_BATCH_SIZE = 8;
+    for (let i = 0; i < mints.length; i += MINT_LOOKUP_BATCH_SIZE) {
+      await Promise.all(mints.slice(i, i + MINT_LOOKUP_BATCH_SIZE).map(async mint => {
+        const decimals = await getFutarchyService().getTokenDecimals(new PublicKey(mint));
+        divisors.set(mint, 10 ** decimals);
+      }));
+    }
+
     for (const row of result.rows) {
       const slot = Number(row.slot);
       const sig = row.signature;
@@ -296,13 +304,15 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       }
 
       const swapType = row.swap_type.trim().toLowerCase();
-      const inputAmount = Number(row.input_amount) / DECIMALIZE;
-      const outputAmount = Number(row.output_amount) / DECIMALIZE;
+      const baseDivisor = divisors.get(row.base_mint)!;
+      const quoteDivisor = divisors.get(row.quote_mint)!;
+      const inputAmount = Number(row.input_amount) / (swapType === 'buy' ? quoteDivisor : baseDivisor);
+      const outputAmount = Number(row.output_amount) / (swapType === 'buy' ? baseDivisor : quoteDivisor);
 
       // Post-swap reserves from the DB (may be null for older rows)
       const hasReserves = row.amm_base_amount != null && row.amm_quote_amount != null;
       const reserves = hasReserves
-        ? { asset0: Number(row.amm_base_amount) / DECIMALIZE, asset1: Number(row.amm_quote_amount) / DECIMALIZE }
+        ? { asset0: Number(row.amm_base_amount) / baseDivisor, asset1: Number(row.amm_quote_amount) / quoteDivisor }
         : undefined;
 
       let priceNative: number;

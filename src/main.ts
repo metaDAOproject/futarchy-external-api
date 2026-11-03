@@ -3,6 +3,7 @@ import { config } from './config.js';
 import { closeDataStores, createServices, initializeRuntimeDataStores } from './runtime/services.js';
 import { startHeartbeat } from './runtime/heartbeat.js';
 import { logger } from './utils/logger.js';
+import { startDraining } from './routes/health.js';
 import type { Server } from 'http';
 
 const SHUTDOWN_TIMEOUT_MS = 15_000;
@@ -25,9 +26,16 @@ async function main(): Promise<void> {
     logger.info('Trusted API keys loaded', {
       count: config.server.trustedApiKeys.size,
     });
+
+    if (!config.metrics.token) {
+      logger.warn('METRICS_TOKEN is not set: /metrics is publicly readable. Set it and give your Prometheus scraper the bearer token.');
+    }
   });
 
-  server.timeout = config.server.requestTimeout;
+  // Backstop only: the request-timeout middleware answers 503 at
+  // requestTimeout; this closes sockets that stay silent a little longer.
+  // 0 keeps meaning "no timeout".
+  server.timeout = config.server.requestTimeout === 0 ? 0 : config.server.requestTimeout + 5_000;
   server.keepAliveTimeout = config.server.keepAliveTimeout;
   server.headersTimeout = config.server.keepAliveTimeout + 1000;
 
@@ -39,14 +47,22 @@ async function main(): Promise<void> {
 
     heartbeat?.stop();
 
-    // Order matters: stop accepting requests and drain in-flight ones FIRST,
-    // close the DB pools after — closing pools first makes every in-flight
-    // request fail during a deploy.
+    // Order matters:
+    // 1. Report not-ready and keep serving for shutdownDrainMs, so the load
+    //    balancer stops routing here before the listener closes (closing at
+    //    once refuses requests still being routed to this container).
+    // 2. Stop accepting requests and drain in-flight ones.
+    // 3. Close the DB pools last — closing them first fails in-flight requests.
+    startDraining();
     const forceExit = setTimeout(() => {
       logger.error('Graceful shutdown timed out — forcing exit');
       process.exit(1);
-    }, SHUTDOWN_TIMEOUT_MS);
+    }, config.server.shutdownDrainMs + SHUTDOWN_TIMEOUT_MS);
 
+    setTimeout(() => closeServer(forceExit), config.server.shutdownDrainMs);
+  };
+
+  const closeServer = (forceExit: ReturnType<typeof setTimeout>): void => {
     server.close(() => {
       closeDataStores(services)
         .catch((error) => logger.error('Error closing data stores during shutdown', error))

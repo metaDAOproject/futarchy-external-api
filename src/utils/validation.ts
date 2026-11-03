@@ -1,3 +1,6 @@
+import { PublicKey } from '@solana/web3.js';
+import { AppError } from '../middleware/errorHandler.js';
+
 /**
  * Input validation helpers for API routes.
  * These prevent 500 errors from bad user input by returning
@@ -131,9 +134,12 @@ export function parseDateParam(
     };
   }
 
-  // Validate it's an actual date
-  const date = new Date(value);
-  if (isNaN(date.getTime())) {
+  // Validate it's an actual calendar date Postgres accepts, or it rejects the
+  // string and a client error becomes a 500. `new Date('2024-02-31')` rolls
+  // over to March 2 instead of failing, so require the parse to round-trip;
+  // year 0000 round-trips in JS but doesn't exist in Postgres.
+  const date = new Date(`${value}T00:00:00Z`);
+  if (value.startsWith('0000') || isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) {
     return {
       success: false,
       error: {
@@ -209,10 +215,12 @@ export function parseSolanaAddress(
     };
   }
 
-  // Base58 character set (no 0, O, I, l)
+  // Base58 character set (no 0, O, I, l), and it must decode to exactly 32
+  // bytes: a well-formed-looking string like 44 'z's passes the regex but
+  // makes `new PublicKey` throw, which callers would surface as a 500.
   const base58Regex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-  
-  if (!base58Regex.test(value)) {
+
+  if (!base58Regex.test(value) || !isPublicKey(value)) {
     return {
       success: false,
       error: {
@@ -224,6 +232,15 @@ export function parseSolanaAddress(
   }
 
   return { success: true, value };
+}
+
+function isPublicKey(value: string): boolean {
+  try {
+    new PublicKey(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -416,4 +433,13 @@ export function parseTimestampAsUTC(
   }
 
   return { success: true, value: date };
+}
+
+/**
+ * Unwrap a validation result, or throw a 400 in the standard error shape
+ * (`{ error, code, field, requestId }`) for the error handler to send.
+ */
+export function orBadRequest<T>(result: ValidationResult<T>, code = 'INVALID_QUERY_PARAMETER'): T {
+  if (!result.success) throw AppError.badRequest(result.error.message, code, result.error.field);
+  return result.value;
 }

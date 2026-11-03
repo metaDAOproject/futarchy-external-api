@@ -37,7 +37,7 @@ export interface ServiceGetters {
 }
 
 function requireService<T>(service: T | undefined, name: string): T {
-  if (!service) throw new AppError(`${name} service not available`, 503);
+  if (!service) throw AppError.serviceUnavailable(`${name} service not available`, 'SERVICE_UNAVAILABLE');
   return service;
 }
 

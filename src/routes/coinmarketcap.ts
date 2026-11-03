@@ -13,6 +13,7 @@ import { AppError, asyncHandler } from '../middleware/errorHandler.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { sendAlert } from '../utils/alerts.js';
+import { requireFreshServedDb } from './servedData.js';
 
 // Fees reported on /cmc/assets. Both maker and taker pay the same flat protocol
 // fee on the FutarchyAMM — there is no maker/taker distinction on an AMM.
@@ -195,16 +196,7 @@ export function createCoinMarketCapRouter(services: ServiceGetters): Router {
   ): Promise<CmcPair[]> {
     const futarchyService = getFutarchyService();
     const priceService = getPriceService();
-    const externalDatabaseService = getExternalDatabaseService();
-
-    if (!externalDatabaseService?.isAvailable()) {
-      logger.warn('Served database unavailable for /cmc endpoint', { requestId: req.requestId });
-      sendAlert(
-        'Served database unavailable for /cmc — refusing to report zero volume',
-        { cooldownKey: 'cmc-served-db-unavailable', cooldownMs: 10 * 60 * 1000 }
-      );
-      throw AppError.serviceUnavailable('Served database not available', 'SERVED_DB_UNAVAILABLE');
-    }
+    const externalDatabaseService = await requireFreshServedDb(getExternalDatabaseService(), req, '/cmc');
 
     const allDaos = servedDaos(await futarchyService.getAllDaos());
 

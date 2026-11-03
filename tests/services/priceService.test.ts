@@ -16,6 +16,13 @@ describe('PriceService', () => {
       expect(parseFloat(price!)).toBeCloseTo(50, 1); // ~50 USDC per token
     });
 
+    it('should price pools whose reserves exceed 2^53 (BN.toNumber would throw)', () => {
+      const baseReserves = new BN('20000000000000000'); // 20M tokens (9 decimals) > 2^53 raw
+      const quoteReserves = new BN('1000000000000');    // 1M USDC (6 decimals)
+
+      expect(parseFloat(priceService.calculatePrice(baseReserves, quoteReserves, 9, 6)!)).toBeCloseTo(0.05, 6);
+    });
+
     it('should return null for zero base reserves', () => {
       const baseReserves = new BN(0);
       const quoteReserves = new BN('50000000000');

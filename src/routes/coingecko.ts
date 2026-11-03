@@ -1,7 +1,8 @@
 import { Router, type Request, type Response } from 'express';
 import type { CoinGeckoTicker } from '../types/coingecko.js';
 import type { ServiceGetters } from './types.js';
-import { AppError, asyncHandler } from '../middleware/errorHandler.js';
+import { asyncHandler } from '../middleware/errorHandler.js';
+import { requireFreshServedDb } from './servedData.js';
 import { logger } from '../utils/logger.js';
 import { sendAlert } from '../utils/alerts.js';
 
@@ -13,19 +14,7 @@ export function createCoinGeckoRouter(services: ServiceGetters): Router {
   router.get('/api/tickers', asyncHandler(async (req: Request, res: Response) => {
       const futarchyService = getFutarchyService();
       const priceService = getPriceService();
-      const externalDatabaseService = getExternalDatabaseService();
-
-      if (!externalDatabaseService?.isAvailable()) {
-        logger.warn('Served database unavailable for /api/tickers', { requestId: req.requestId });
-        sendAlert(
-          'Served database unavailable for /api/tickers — refusing to report zero volume',
-          { cooldownKey: 'tickers-served-db-unavailable', cooldownMs: 10 * 60 * 1000 }
-        );
-        throw AppError.serviceUnavailable(
-          'Served database not available',
-          'SERVED_DB_UNAVAILABLE'
-        );
-      }
+      const externalDatabaseService = await requireFreshServedDb(getExternalDatabaseService(), req, '/api/tickers');
 
       const allDaos = await futarchyService.getAllDaos();
 

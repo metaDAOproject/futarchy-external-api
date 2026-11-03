@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'bun:test';
-import { createTestApp } from '../helpers/testApp.js';
+import { createTestApp, freshServedData } from '../helpers/testApp.js';
 import request from 'supertest';
 import { config } from '../../src/config.js';
 import type { FutarchyService, DaoTickerData } from '../../src/services/futarchyService.js';
@@ -38,6 +38,7 @@ function futarchyReturning(daos: DaoTickerData[]): FutarchyService {
 function extDbWithMetrics(): ExternalDatabaseService {
   return {
     isAvailable: () => true,
+    getFutarchySpotFreshness: freshServedData,
     getSpotRolling24hMetrics: async () =>
       new Map([
         ['BASE1', { token: 'BASE1', base_volume_24h: '100', target_volume_24h: '5', high_24h: '0.06', low_24h: '0.04', trade_count_24h: 3 }],
@@ -54,6 +55,7 @@ function extDbWithMetrics(): ExternalDatabaseService {
 function extDbThatThrows(): ExternalDatabaseService {
   return {
     isAvailable: () => true,
+    getFutarchySpotFreshness: freshServedData,
     getSpotRolling24hMetrics: async () => {
       throw new Error('query failed');
     },
@@ -73,6 +75,7 @@ function extDbWithMalformedMetric(
   base[field] = bad;
   return {
     isAvailable: () => true,
+    getFutarchySpotFreshness: freshServedData,
     getSpotRolling24hMetrics: async () => new Map([['BASE1', base]]),
     getSpotReserves24hAgo: async () => new Map(),
   } as unknown as ExternalDatabaseService;
@@ -453,6 +456,7 @@ describe('CoinMarketCap Routes', () => {
     ): ExternalDatabaseService {
       return {
         isAvailable: () => true,
+        getFutarchySpotFreshness: freshServedData,
         getSpotRolling24hMetrics: async () =>
           new Map([['BASE1', { token: 'BASE1', base_volume_24h: '100', target_volume_24h: '5', high_24h: '0', low_24h: '0', trade_count_24h: 3 }]]),
         getSpotReserves24hAgo: async () => reserves,
@@ -489,6 +493,7 @@ describe('CoinMarketCap Routes', () => {
       // never a 5xx (unlike the volume source), and price/volume still serve.
       const extDb = {
         isAvailable: () => true,
+        getFutarchySpotFreshness: freshServedData,
         getSpotRolling24hMetrics: async () =>
           new Map([['BASE1', { token: 'BASE1', base_volume_24h: '100', target_volume_24h: '5', high_24h: '0', low_24h: '0', trade_count_24h: 3 }]]),
         getSpotReserves24hAgo: async () => { throw new Error('swaps query failed'); },

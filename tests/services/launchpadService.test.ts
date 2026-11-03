@@ -6,19 +6,23 @@
  * silently returning zero allocations.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, setSystemTime } from 'bun:test';
 import {
+  ACCOUNT_SIZE,
   AccountLayout,
+  getAssociatedTokenAddressSync,
   AccountState,
   getAssociatedTokenAddress,
   MintLayout,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
-import { PublicKey, type AccountInfo } from '@solana/web3.js';
+import { Keypair, PublicKey, type AccountInfo } from '@solana/web3.js';
 import BN from 'bn.js';
 import { config } from '../../src/config.js';
 import { LaunchpadService } from '../../src/services/launchpadService.js';
+import { SolanaService } from '../../src/services/solanaService.js';
+import { getSupplyInfoWithLaunchpadAllocation } from '../../src/services/supplyWithLaunchpadAllocation.js';
 
 const MINT = new PublicKey('SoLo9oxzLDpcq1dpqAgMwgce5WqkRDtNXK7EPnbmeta');
 const HOLDER = new PublicKey('DMB74TZgN7Rqfwtqqm3VQBgKBb2WYPdBqVtHbvB4LLeV');
@@ -100,6 +104,9 @@ function snapshotStub() {
     mintSupply: { amount: new BN(1_000_000), decimals: 6 },
     tokenProgramId: TOKEN_PROGRAM_ID,
     slot: 100,
+    futarchyAmmAmount: new BN(0),
+    meteoraLpAmount: new BN(0),
+    additionalTokensClaimed: false,
   };
 }
 
@@ -179,7 +186,6 @@ describe('LaunchpadService.getTokenAllocationBreakdown', () => {
       fetchDao: async () => ({ quoteMint: undefined }),
     };
     (svc as any).getPerformancePackageAddress = () => ACCOUNT_B;
-    (svc as any).getFutarchyAmmLiquidity = async () => ({ amount: new BN(0) });
     (svc as any).getLiveBalanceSnapshot = async () => ({
       ...snapshotStub(),
       tokenProgramId: TOKEN_2022_PROGRAM_ID,
@@ -547,15 +553,336 @@ describe('LaunchpadService allocation snapshots', () => {
     expect(calls).toBe(6);
   });
 
-  it('bounds allocation cache entries and evicts the oldest entry', () => {
-    const svc = new LaunchpadService();
+});
 
-    for (let index = 0; index <= 1000; index++) {
-      (svc as any).setCache(`allocation-${index}`, index);
+describe('LaunchpadService.getLiveLaunches', () => {
+  const LAUNCH = new PublicKey('5FPGRzY9ArJFwY2Hp2y2eqMzVewyWCBox7esmpuZfCvE');
+  const USDC = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+
+  function fakeProgram(launches: any[], fundingRecords: any[] = [], calls = { launch: 0, fundingRecord: 0 }) {
+    return {
+      account: {
+        launch: { all: async () => { calls.launch++; return launches; } },
+        fundingRecord: { all: async () => { calls.fundingRecord++; return fundingRecords; } },
+      },
+    };
+  }
+
+  afterEach(() => setSystemTime());
+
+  function serviceWith(programs: { v06?: any; v07?: any; v08?: any }) {
+    const svc = new LaunchpadService();
+    (svc as any).clientV06 = { launchpad: programs.v06 ?? fakeProgram([]) };
+    (svc as any).clientV07 = { launchpad: programs.v07 ?? fakeProgram([]) };
+    (svc as any).clientV08 = { launchpad: programs.v08 ?? fakeProgram([]) };
+    (svc as any).getMintDecimals = async () => 6;
+    return svc;
+  }
+
+  const STARTED = Math.floor(Date.now() / 1000) - 60 * 60;
+  const DURATION = 4 * 24 * 60 * 60;
+  const liveLaunch = {
+    publicKey: LAUNCH,
+    account: {
+      state: { live: {} },
+      baseMint: MINT,
+      quoteMint: USDC,
+      minimumRaiseAmount: new BN('500000000000'),
+      unixTimestampStarted: new BN(STARTED),
+      secondsForLaunch: DURATION,
+    },
+  };
+
+  it('aggregates funding records for open live launches only', async () => {
+    const completed = { ...liveLaunch, account: { ...liveLaunch.account, state: { complete: {} } } };
+    // Still `live` on-chain, but its close time passed and nobody called closeLaunch.
+    const pastClose = {
+      ...liveLaunch,
+      account: { ...liveLaunch.account, unixTimestampStarted: new BN(STARTED - 2 * DURATION) },
+    };
+    const calls = { launch: 0, fundingRecord: 0 };
+    const svc = serviceWith({
+      v07: fakeProgram([liveLaunch, completed, pastClose], [
+        { account: { committedAmount: new BN('1500000') } },
+        { account: { committedAmount: new BN('250000000') } },
+        { account: { committedAmount: new BN(0) } },
+      ], calls),
+    });
+
+    const { launches } = await svc.getLiveLaunches();
+
+    expect(launches).toEqual([{
+      launchAddress: LAUNCH.toBase58(),
+      version: 'v0.7',
+      tokenAddress: MINT.toBase58(),
+      quoteMint: USDC.toBase58(),
+      quoteDecimals: 6,
+      committerCount: 2,
+      totalCommitted: '251.5',
+      totalCommittedRaw: '251500000',
+      minimumRaise: '500000',
+      minimumRaiseRaw: '500000000000',
+      closeTime: STARTED + DURATION,
+    }]);
+    // Funding records are read for the open launch only, not the expired one.
+    expect(calls.fundingRecord).toBe(1);
+  });
+
+  it('shares one scan per TTL window and drops launches the moment they close', async () => {
+    const now = Date.now();
+    setSystemTime(new Date(now));
+    const closingSoon = {
+      ...liveLaunch,
+      account: {
+        ...liveLaunch.account,
+        unixTimestampStarted: new BN(Math.floor(now / 1000) - DURATION + 60),
+      },
+    };
+    const calls = { launch: 0, fundingRecord: 0 };
+    const svc = serviceWith({ v08: fakeProgram([closingSoon], [], calls) });
+
+    // Concurrent callers share the in-flight scan.
+    const [a, b] = await Promise.all([svc.getLiveLaunches(), svc.getLiveLaunches()]);
+    expect(a.launches).toHaveLength(1);
+    expect(b).toEqual(a);
+    expect(calls.launch).toBe(1);
+
+    // Within the TTL but past the close time: served from cache, launch filtered out.
+    setSystemTime(new Date(now + 120_000));
+    expect((await svc.getLiveLaunches()).launches).toEqual([]);
+    expect(calls.launch).toBe(1);
+
+    // After the TTL: rescanned.
+    setSystemTime(new Date(now + config.cache.liveLaunchesTTL + 1));
+    await svc.getLiveLaunches();
+    expect(calls.launch).toBe(2);
+  });
+
+  it('propagates RPC failures instead of serving an empty list, and does not cache them', async () => {
+    let fail = true;
+    const svc = serviceWith({
+      v06: {
+        account: {
+          launch: { all: async () => { if (fail) throw new Error('RPC connection refused'); return []; } },
+          fundingRecord: { all: async () => [] },
+        },
+      },
+    });
+
+    await expect(svc.getLiveLaunches()).rejects.toThrow('RPC connection refused');
+    fail = false;
+    expect((await svc.getLiveLaunches()).launches).toEqual([]);
+  });
+});
+
+describe('LaunchpadService batched allocation reads', () => {
+  const USDC = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+  const DAO = Keypair.generate().publicKey;
+  const AMM_VAULT = Keypair.generate().publicKey;
+  const SQUADS_VAULT = Keypair.generate().publicKey;
+  const LAUNCH = new PublicKey('5FPGRzY9ArJFwY2Hp2y2eqMzVewyWCBox7esmpuZfCvE');
+
+  const tokenAccount = (owner: PublicKey, amount: bigint) => {
+    const data = Buffer.alloc(ACCOUNT_SIZE);
+    AccountLayout.encode({
+      mint: MINT, owner, amount, delegateOption: 0, delegate: PublicKey.default, state: 1,
+      isNativeOption: 0, isNative: 0n, delegatedAmount: 0n, closeAuthorityOption: 0, closeAuthority: PublicKey.default,
+    }, data);
+    return { data, owner: TOKEN_PROGRAM_ID, lamports: 1, executable: false };
+  };
+
+  function completedLaunchService(balances: (keys: PublicKey[]) => Promise<unknown[]>) {
+    const svc = new LaunchpadService();
+    const calls = { daoFetches: 0, balanceReads: 0 };
+    (svc as any).getLaunchByBaseMint = async () => ({
+      launchAddress: LAUNCH, baseMint: MINT, version: 'v0.7', dao: DAO,
+      performancePackageTokenAmount: new BN(0),
+    });
+    (svc as any).futarchyClient = {
+      fetchDao: async () => { calls.daoFetches++; return { quoteMint: USDC, amm: { ammBaseVault: AMM_VAULT }, squadsMultisigVault: SQUADS_VAULT }; },
+    };
+    (svc as any).connection = {
+      getMultipleAccountsInfoAndContext: async (keys: PublicKey[]) => {
+        calls.balanceReads++;
+        const values = await balances(keys);
+        return {
+          context: { slot: 321 },
+          value: keys.map((key, index) => key.equals(MINT) ? mintAccountInfo() : values[index]),
+        };
+      },
+    };
+    return { svc, calls };
+  }
+
+  it('reads every balance in one call, fetches the DAO once, and treats absent accounts as 0', async () => {
+    const treasuryAta = getAssociatedTokenAddressSync(MINT, SQUADS_VAULT, true);
+    const { svc, calls } = completedLaunchService(async (keys) => keys.map((key) => {
+      if (key.equals(AMM_VAULT)) return tokenAccount(AMM_VAULT, 5_000n);
+      if (key.equals(treasuryAta)) return tokenAccount(SQUADS_VAULT, 7_000n);
+      return null; // performance package and Meteora vault absent
+    }));
+
+    const breakdown = await svc.getTokenAllocationBreakdown(MINT);
+
+    expect(calls).toEqual({ daoFetches: 1, balanceReads: 1 });
+    expect(breakdown.futarchyAmmLiquidity.amount.toString()).toBe('5000');
+    expect(breakdown.futarchyAmmLiquidity.vaultAddress?.equals(AMM_VAULT)).toBe(true);
+    expect(breakdown.daoTreasuryTokens.amount.toString()).toBe('7000');
+    expect(breakdown.daoTreasuryTokens.vaultAddress?.equals(SQUADS_VAULT)).toBe(true);
+    // Absent accounts: 0, and (as before) no pool/vault address reported for them.
+    expect(breakdown.teamPerformancePackage.amount.isZero()).toBe(true);
+    expect(breakdown.teamPerformancePackage.address).toBeDefined();
+    expect(breakdown.meteoraLpLiquidity).toEqual({ amount: new BN(0) });
+    expect(breakdown.totalNonCirculating.toString()).toBe('7000');
+  });
+
+  it('rejects instead of reading zeros when the balance read fails', async () => {
+    const { svc } = completedLaunchService(async () => { throw new Error('RPC connection refused'); });
+
+    await expect(svc.getTokenAllocationBreakdown(MINT)).rejects.toThrow('RPC connection refused');
+  });
+
+  it('shares one load between concurrent requests for a mint', async () => {
+    const { svc, calls } = completedLaunchService(async (keys) => keys.map(() => null));
+
+    await Promise.all([1, 2, 3, 4, 5].map(() => svc.getTokenAllocationBreakdown(MINT)));
+
+    expect(calls).toEqual({ daoFetches: 1, balanceReads: 1 });
+  });
+
+  it('reads both launch program versions in one call and caches "no launch"', async () => {
+    const svc = new LaunchpadService();
+    let reads = 0;
+    (svc as any).connection = {
+      getMultipleAccountsInfo: async (keys: PublicKey[]) => { reads++; expect(keys).toHaveLength(2); return [null, null]; },
+    };
+
+    expect(await svc.getLaunchByBaseMint(MINT)).toBeNull();
+    expect(await svc.getLaunchByBaseMint(MINT)).toBeNull();
+    expect(reads).toBe(1);
+  });
+
+  describe('decoding real launch accounts', () => {
+    const GRANTEE = Keypair.generate().publicKey;
+    const RECIPIENT = Keypair.generate().publicKey;
+
+    // Default value for every field of an Anchor (0.29 IDL) type.
+    const defaultFor = (type: any): unknown => {
+      if (typeof type === 'string') {
+        if (type === 'publicKey') return PublicKey.default;
+        if (type === 'bool') return false;
+        if (/^[ui](8|16|32)$/.test(type)) return 0;
+        return new BN(0); // u64 / i64 / u128
+      }
+      if ('option' in type) return null;
+      if ('vec' in type) return [];
+      if ('array' in type) return Array.from({ length: type.array[1] }, () => defaultFor(type.array[0]));
+      return { live: {} }; // the only defined type in Launch is the LaunchState enum
+    };
+
+    async function launchAccount(svc: LaunchpadService, version: 'v0.6' | 'v0.7', fields: Record<string, unknown>) {
+      const program = (svc as any)[version === 'v0.7' ? 'clientV07' : 'clientV06'].launchpad;
+      const idlFields = program.idl.accounts.find((a: any) => a.name === 'launch').type.fields;
+      const account = Object.fromEntries(idlFields.map((f: any) => [f.name, defaultFor(f.type)]));
+      const data = await program.coder.accounts.encode('launch', { ...account, ...fields });
+      return { data, owner: program.programId, lamports: 1, executable: false };
     }
 
-    expect((svc as any).cache.size).toBe(1000);
-    expect((svc as any).cache.has('allocation-0')).toBe(false);
-    expect((svc as any).cache.get('allocation-1000')?.data).toBe(1000);
+    const lookup = async (svc: LaunchpadService, v07: unknown, v06: unknown) => {
+      (svc as any).connection = { getMultipleAccountsInfo: async () => [v07, v06] };
+      return svc.getLaunchByBaseMint(MINT);
+    };
+
+    for (const claimState of [false, true, 'missing', 'malformed']) {
+      it(`uses snapshotted claim state ${claimState} with recipient balances despite cached launch state`, async () => {
+        const svc = new LaunchpadService();
+        const launchAddress = svc.getLaunchAddressV07(MINT);
+        const fields = {
+          baseMint: MINT, dao: DAO, performancePackageTokenAmount: new BN(0),
+          additionalTokensAmount: new BN(100), additionalTokensRecipient: RECIPIENT,
+          additionalTokensClaimed: false, state: { complete: {} },
+        };
+        const unclaimed = await launchAccount(svc, 'v0.7', fields);
+        expect((await lookup(svc, unclaimed, null))?.additionalTokensClaimed).toBeUndefined();
+        const currentLaunch = typeof claimState === 'boolean'
+          ? await launchAccount(svc, 'v0.7', { ...fields, additionalTokensClaimed: claimState })
+          : claimState === 'missing' ? null : { ...unclaimed, data: Buffer.alloc(1) };
+        config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: RECIPIENT });
+        const amount = claimState === true ? 225n : 125n;
+        const holderAccounts = [{ pubkey: ACCOUNT_A, info: tokenAccountInfo(RECIPIENT, amount) }];
+        (svc as any).futarchyClient = { fetchDao: async () => ({ amm: {} }) };
+        (svc as any).connection = {
+          getTokenAccountsByOwner: async () => discovery(holderAccounts),
+          getMultipleAccountsInfoAndContext: async (keys: PublicKey[]) => ({
+            context: { slot: 321 },
+            value: keys.map(key => {
+              if (key.equals(MINT)) return mintAccountInfo(1_000n, 0);
+              if (key.equals(launchAddress)) return currentLaunch;
+              if (key.equals(ACCOUNT_A)) return holderAccounts[0]!.info;
+              return null;
+            }),
+          }),
+        };
+
+        const result = getSupplyInfoWithLaunchpadAllocation(MINT.toString(), new SolanaService(), svc);
+        if (typeof claimState === 'boolean') {
+          const { supplyInfo } = await result;
+          expect(supplyInfo.circulatingSupply).toBe('775');
+          expect(supplyInfo.allocation?.additionalTokenAllocation?.claimed).toBe(claimState);
+          expect(supplyInfo.allocation?.balanceSnapshotSlot).toBe(321);
+        } else {
+          await expect(result).rejects.toThrow();
+          expect((svc as any).cache.get(`allocation_${MINT}`, config.cache.tickersTTL)).toBeUndefined();
+        }
+      });
+    }
+
+    it('decodes a v0.7 launch, including its additional-token fields', async () => {
+      const svc = new LaunchpadService();
+      const v07 = await launchAccount(svc, 'v0.7', {
+        baseMint: MINT, dao: DAO, performancePackageGrantee: GRANTEE,
+        performancePackageTokenAmount: new BN(123), additionalTokensAmount: new BN(456),
+        additionalTokensRecipient: RECIPIENT, additionalTokensClaimed: true, state: { complete: {} },
+      });
+
+      const launch = (await lookup(svc, v07, null))!;
+
+      expect(launch.version).toBe('v0.7');
+      expect(launch.launchAddress.equals(svc.getLaunchAddressV07(MINT))).toBe(true);
+      expect(launch.baseMint.equals(MINT)).toBe(true);
+      expect(launch.dao!.equals(DAO)).toBe(true);
+      expect(launch.performancePackageGrantee.equals(GRANTEE)).toBe(true);
+      expect(launch.performancePackageTokenAmount.toString()).toBe('123');
+      expect(launch.additionalTokensAmount!.toString()).toBe('456');
+      expect(launch.additionalTokensRecipient!.equals(RECIPIENT)).toBe(true);
+      expect(launch.additionalTokensClaimed).toBe(true);
+      expect(launch.state).toEqual({ complete: {} });
+    });
+
+    it('decodes a v0.6 launch at the v0.6 address', async () => {
+      const svc = new LaunchpadService();
+      const v06 = await launchAccount(svc, 'v0.6', {
+        baseMint: MINT, dao: DAO, performancePackageTokenAmount: new BN(789),
+      });
+
+      const launch = (await lookup(svc, null, v06))!;
+
+      expect(launch.version).toBe('v0.6');
+      expect(launch.launchAddress.equals(svc.getLaunchAddressV06(MINT))).toBe(true);
+      expect(launch.dao!.equals(DAO)).toBe(true);
+      expect(launch.performancePackageTokenAmount.toString()).toBe('789');
+      expect(launch.additionalTokensAmount).toBeUndefined();
+    });
+
+    it('prefers the v0.7 launch when both versions exist', async () => {
+      const svc = new LaunchpadService();
+      const v07 = await launchAccount(svc, 'v0.7', { baseMint: MINT, performancePackageTokenAmount: new BN(7) });
+      const v06 = await launchAccount(svc, 'v0.6', { baseMint: MINT, performancePackageTokenAmount: new BN(6) });
+
+      const launch = (await lookup(svc, v07, v06))!;
+
+      expect(launch.version).toBe('v0.7');
+      expect(launch.performancePackageTokenAmount.toString()).toBe('7');
+    });
   });
 });

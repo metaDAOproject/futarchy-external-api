@@ -27,6 +27,13 @@ describe('Supply Routes', () => {
       expect(response.body.error).toContain('not a valid Solana public key');
     });
 
+    it('rejects base58 that does not decode to a 32-byte key with 400, not 500', async () => {
+      const response = await request(app).get(`/api/supply/${'z'.repeat(44)}`);
+
+      expect(response.status).toBe(400);
+      expect(response.body).toMatchObject({ code: 'INVALID_MINT_ADDRESS', field: 'mintAddress' });
+    });
+
     it('should accept valid Solana address format', async () => {
       const response = await request(app).get(`/api/supply/${validMintAddress}`);
       

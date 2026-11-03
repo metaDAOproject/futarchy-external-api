@@ -1,11 +1,21 @@
-import { Connection, PublicKey, Keypair } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair, type AccountInfo } from '@solana/web3.js';
 import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
 import { FutarchyClient } from "@metadaoproject/programs/futarchy/v0.6";
-import { getMint, getAssociatedTokenAddress, getAccount } from '@solana/spl-token';
+import {
+  getMint,
+  getAssociatedTokenAddressSync,
+  unpackAccount,
+  unpackMint,
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+} from '@solana/spl-token';
 import { config } from '../config.js';
 import BN from 'bn.js';
 import { retry, isTransientError, createRetryLogger } from '../utils/resilience.js';
 import { logger } from '../utils/logger.js';
+import { createSolanaConnection } from '../utils/solanaConnection.js';
+import { TtlCache } from '../utils/ttlCache.js';
+import { metricsService } from './metricsService.js';
 
 export interface PoolData {
   baseReserves: BN;
@@ -41,43 +51,117 @@ interface PoolState {
   quoteProtocolFeeBalance?: number | BN | string;
 }
 
+const TOKEN_METADATA_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
+const USDC_MINT = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+// getMultipleAccountsInfo accepts at most 100 keys per call.
+const MAX_ACCOUNTS_PER_RPC = 100;
+
+function metadataAddress(mint: PublicKey): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('metadata'), TOKEN_METADATA_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+    TOKEN_METADATA_PROGRAM_ID
+  )[0];
+}
+
+/**
+ * Name/symbol from a Metaplex metadata account: key (1) + update authority (32)
+ * + mint (32), then borsh strings name, symbol (4-byte length prefix each).
+ */
+function parseTokenMetadata(data: Buffer, mint: PublicKey): TokenMetadata {
+  let offset = 1 + 32 + 32;
+  const nameLength = data.readUInt32LE(offset);
+  offset += 4;
+  const name = data.subarray(offset, offset + nameLength).toString('utf8').replace(/\0/g, '');
+  offset += nameLength;
+  const symbolLength = data.readUInt32LE(offset);
+  offset += 4;
+  const symbol = data.subarray(offset, offset + symbolLength).toString('utf8').replace(/\0/g, '');
+  return {
+    symbol: symbol || mint.toString().slice(0, 8),
+    name: name || mint.toString().slice(0, 8),
+  };
+}
+
+/**
+ * The DAO's spot pool from its (already fetched) on-chain account, or null if
+ * it has none / it's empty. Conditional (pass/fail) pools are never used.
+ */
+function extractSpotPool(dao: any): PoolData | null {
+  const state = dao?.amm?.state;
+  if (!state) return null;
+
+  let pool: PoolState | null = null;
+  if ('spot' in state) {
+    const spotState = state.spot as any;
+    if (spotState && typeof spotState === 'object') {
+      if ('spot' in spotState && spotState.spot) pool = spotState.spot;
+      else if ('pool' in spotState && spotState.pool) pool = spotState.pool;
+      else if ('baseReserves' in spotState || 'quoteReserves' in spotState) pool = spotState;
+    }
+  } else if ('futarchy' in state) {
+    const spot = (state.futarchy as any)?.spot;
+    if (spot && typeof spot === 'object') {
+      pool = 'pool' in spot ? spot.pool : spot;
+    }
+  }
+  if (!pool) return null;
+
+  let baseReserves: BN;
+  let quoteReserves: BN;
+  try {
+    baseReserves = new BN(pool.baseReserves);
+    quoteReserves = new BN(pool.quoteReserves);
+  } catch {
+    return null;
+  }
+  // BN comparisons, not toNumber(): u64 reserves can exceed 2^53, where
+  // toNumber() throws and would silently drop the DAO from every feed.
+  if (baseReserves.isZero() || quoteReserves.isZero() || baseReserves.isNeg() || quoteReserves.isNeg()) {
+    return null;
+  }
+
+  return {
+    baseReserves,
+    quoteReserves,
+    baseProtocolFees: new BN(pool.baseProtocolFeeBalance || 0),
+    quoteProtocolFees: new BN(pool.quoteProtocolFeeBalance || 0),
+  };
+}
+
 export class FutarchyService {
   private connection: Connection;
   private client: FutarchyClient;
-  private cache: Map<string, { data: any; timestamp: number }>;
+  // Keyed by mints, some caller-supplied (DexScreener /asset), so bounded.
+  private cache = new TtlCache(10_000);
   private rateLimitErrors: number = 0;
-  private lastRateLimitTime: number = 0;
+  private allDaos: { data: DaoTickerData[]; fetchedAt: number } | null = null;
+  private allDaosInFlight: Promise<DaoTickerData[]> | null = null;
 
   constructor() {
-    this.connection = new Connection(config.solana.rpcUrl, 'confirmed');
-    
-    // Create a dummy wallet for read-only operations
-    // If ANCHOR_WALLET is set, use it; otherwise use a generated keypair
+    this.connection = createSolanaConnection();
+
+    // Read-only: a generated keypair is enough unless ANCHOR_WALLET is set.
     let wallet: Wallet;
     try {
       wallet = Wallet.local();
-    } catch (error) {
-      // If ANCHOR_WALLET is not set, create a dummy wallet for read-only operations
-      const dummyKeypair = Keypair.generate();
-      wallet = new Wallet(dummyKeypair);
+    } catch {
+      wallet = new Wallet(Keypair.generate());
     }
-    
+
     const provider = new AnchorProvider(this.connection, wallet, {
       commitment: 'confirmed',
     });
     this.client = FutarchyClient.createClient({ provider });
-    this.cache = new Map();
   }
 
   private isRateLimitError(error: any): boolean {
     const errorMessage = error?.message?.toLowerCase() || '';
     const errorString = String(error).toLowerCase();
-    
+
     return (
       errorMessage.includes('rate limit') ||
       errorMessage.includes('429') ||
       errorMessage.includes('too many requests') ||
-      errorMessage.includes('429 too many requests') ||
       errorString.includes('rate limit') ||
       errorString.includes('429') ||
       error?.code === 429 ||
@@ -95,10 +179,8 @@ export class FutarchyService {
       initialDelayMs: baseDelay,
       maxDelayMs: 10000,
       isRetryable: (error) => {
-        // Track rate limit errors for monitoring
         if (this.isRateLimitError(error)) {
           this.rateLimitErrors++;
-          this.lastRateLimitTime = Date.now();
           return true;
         }
         return isTransientError(error);
@@ -108,135 +190,25 @@ export class FutarchyService {
   }
 
   private getCached<T>(key: string, ttl: number): T | null {
-    const cached = this.cache.get(key);
-    if (cached && Date.now() - cached.timestamp < ttl) {
-      return cached.data as T;
-    }
-    return null;
+    return this.cache.get<T>(key, ttl) ?? null;
   }
 
-  private setCache(key: string, data: any): void {
-    this.cache.set(key, { data, timestamp: Date.now() });
+  private setCache(key: string, data: unknown): void {
+    this.cache.set(key, data);
   }
 
-  async getPoolData(daoAddress?: PublicKey): Promise<PoolData | null> {
-    const daoPubkey = daoAddress;
-    if (!daoPubkey) {
-      throw new Error('DAO address is required. Provide daoAddress parameter or set DAO_PUBLIC_KEY environment variable.');
-    }
-    const cacheKey = `pool_data_${daoPubkey.toString()}`;
-    const cached = this.getCached<PoolData>(cacheKey, config.cache.tickersTTL);
-    if (cached) return cached;
-
-    let dao: any;
-    try {
-      dao = await this.retryWithBackoff(() => this.client.getDao(daoPubkey));
-    } catch (error: any) {
-      const isRateLimited = this.isRateLimitError(error);
-      if (isRateLimited) {
-        logger.error(`Rate limited while fetching DAO ${daoPubkey.toString()}:`, error);
-      } else {
-        logger.error(`Error fetching DAO ${daoPubkey.toString()}:`, error);
-      }
-      throw error;
-    }
-    
-    // Try to find a pool with non-zero reserves
-    // Check all possible pools: spot, and if futarchy, check all available pools
-    const poolsToCheck: PoolState[] = [];
-    
-    if (!dao?.amm || !dao?.amm?.state) {
-      return null;
-    }
-    
-    if ('spot' in dao.amm.state) {
-      // Simple spot state - check if it has a nested pool field
-      const spotState = dao.amm.state.spot as any;
-      
-      if (spotState && typeof spotState === 'object') {
-        // Check for nested structures: spot.spot, spot.pool, or spot itself
-        if ('spot' in spotState && spotState.spot) {
-          // Double-nested: spot.spot contains the pool
-          poolsToCheck.push(spotState.spot as unknown as PoolState);
-        } else if ('pool' in spotState && spotState.pool) {
-          // Nested pool: spot.pool contains the pool
-          poolsToCheck.push(spotState.pool as unknown as PoolState);
-        } else {
-          // Spot might be the pool itself (check if it has reserves)
-          if ('baseReserves' in spotState || 'quoteReserves' in spotState) {
-            poolsToCheck.push(spotState as unknown as PoolState);
-          }
-        }
-      }
-    } else if ('futarchy' in dao.amm.state) {
-      // Futarchy state - ONLY use spot pool, ignore conditional pools (pass/fail)
-      const futarchyState = dao.amm.state.futarchy as any;
-      
-      // Check spot pool only - it might be directly accessible or nested in a pool field
-      if (futarchyState.spot) {
-        // The spot might be an enum variant with a pool inside it
-        if (typeof futarchyState.spot === 'object') {
-          // Check if spot has a pool field (nested structure)
-          if ('pool' in futarchyState.spot) {
-            poolsToCheck.push(futarchyState.spot.pool as unknown as PoolState);
-          } else {
-            // Spot might be the pool itself
-            poolsToCheck.push(futarchyState.spot as unknown as PoolState);
-          }
-        }
-      }
-      
-      // Explicitly do NOT check conditional pools (pass/fail) - only use spot
-    } else {
-      return null;
-    }
-    
-    if (poolsToCheck.length === 0) {
-      return null;
-    }
-
-    // Find the pool with the highest liquidity (sum of base and quote reserves)
-    let bestPool: PoolState | null = null;
-    let bestLiquidity = new BN(0);
-
-    for (let i = 0; i < poolsToCheck.length; i++) {
-      const pool = poolsToCheck[i];
-      if (!pool) continue;
-      
-      try {
-        const baseReserves = new BN(pool.baseReserves);
-        const quoteReserves = new BN(pool.quoteReserves);
-        const totalLiquidity = baseReserves.add(quoteReserves);
-        
-        // Only consider pools with non-zero reserves
-        if (totalLiquidity.gt(new BN(0)) && totalLiquidity.gt(bestLiquidity)) {
-          bestPool = pool;
-          bestLiquidity = totalLiquidity;
-        }
-      } catch (error) {
-        // Skip invalid pools
-        continue;
-      }
-    }
-
-    if (!bestPool) {
-      return null;
-    }
-
-    const poolData: PoolData = {
-      baseReserves: new BN(bestPool.baseReserves),
-      quoteReserves: new BN(bestPool.quoteReserves),
-      baseProtocolFees: new BN(bestPool.baseProtocolFeeBalance || 0),
-      quoteProtocolFees: new BN(bestPool.quoteProtocolFeeBalance || 0),
-    };
-
-    this.setCache(cacheKey, poolData);
-    return poolData;
-  }
+  // Decimals never change and token names rarely do; cache them far longer
+  // than the price snapshot.
+  private static readonly DECIMALS_TTL_MS = config.cache.tickersTTL * 10;
+  private static readonly METADATA_TTL_MS = config.cache.tickersTTL * 100;
+  // A mint with no Metaplex metadata account (confirmed by a successful RPC
+  // read, not an error) is remembered for a while so it isn't re-fetched on
+  // every refresh; a later-created metadata account is picked up after this.
+  private static readonly METADATA_ABSENT_TTL_MS = config.cache.tickersTTL * 10;
 
   async getTokenDecimals(mintAddress: PublicKey): Promise<number> {
     const cacheKey = `token_decimals_${mintAddress.toString()}`;
-    const cached = this.getCached<number>(cacheKey, config.cache.tickersTTL * 10); // Cache decimals longer
+    const cached = this.getCached<number>(cacheKey, FutarchyService.DECIMALS_TTL_MS);
     if (cached !== null) return cached;
 
     // No fallback default: a wrong decimals value silently scales price by
@@ -250,213 +222,212 @@ export class FutarchyService {
     return decimals;
   }
 
-  private async findMetadataPDA(mintAddress: PublicKey): Promise<PublicKey> {
-    // Metaplex Token Metadata Program ID
-    const TOKEN_METADATA_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
-    
-    // Derive the metadata PDA
-    const [metadataPDA] = PublicKey.findProgramAddressSync(
-      [
-        Buffer.from('metadata'),
-        TOKEN_METADATA_PROGRAM_ID.toBuffer(),
-        mintAddress.toBuffer(),
-      ],
-      TOKEN_METADATA_PROGRAM_ID
-    );
-    
-    return metadataPDA;
-  }
-
   async getTokenMetadata(mintAddress: PublicKey): Promise<TokenMetadata | null> {
     const cacheKey = `token_metadata_${mintAddress.toString()}`;
-    const cached = this.getCached<TokenMetadata>(cacheKey, config.cache.tickersTTL * 100); // Cache metadata much longer
+    const cached = this.getCached<TokenMetadata>(cacheKey, FutarchyService.METADATA_TTL_MS);
     if (cached) return cached;
+    if (this.getCached<true>(`token_metadata_absent_${mintAddress}`, FutarchyService.METADATA_ABSENT_TTL_MS)) {
+      return null;
+    }
 
     try {
-      const metadataPDA = await this.findMetadataPDA(mintAddress);
-      const accountInfo = await this.retryWithBackoff(() => 
-        this.connection.getAccountInfo(metadataPDA)
+      const accountInfo = await this.retryWithBackoff(() =>
+        this.connection.getAccountInfo(metadataAddress(mintAddress))
       );
-
-      if (!accountInfo || !accountInfo.data) {
+      if (!accountInfo?.data) {
+        this.setCache(`token_metadata_absent_${mintAddress}`, true);
         return null;
       }
 
-      // Parse Metaplex Token Metadata structure
-      // Offset 1: key (1 byte) - skip
-      // Offset 1-33: update authority (32 bytes) - skip
-      // Offset 33-65: mint (32 bytes) - skip
-      // Offset 65-97: data struct starts
-      //   - name string (4 bytes length + string)
-      //   - symbol string (4 bytes length + string)
-      //   - uri string (4 bytes length + string)
-
-      const data = accountInfo.data;
-      let offset = 1 + 32 + 32; // Skip key, update authority, mint
-
-      // Read name
-      const nameLength = data.readUInt32LE(offset);
-      offset += 4;
-      const name = data.slice(offset, offset + nameLength).toString('utf8').replace(/\0/g, '');
-      offset += nameLength;
-
-      // Read symbol
-      const symbolLength = data.readUInt32LE(offset);
-      offset += 4;
-      const symbol = data.slice(offset, offset + symbolLength).toString('utf8').replace(/\0/g, '');
-
-      const metadata: TokenMetadata = {
-        symbol: symbol || mintAddress.toString().slice(0, 8),
-        name: name || mintAddress.toString().slice(0, 8),
-      };
-
+      const metadata = parseTokenMetadata(accountInfo.data, mintAddress);
       this.setCache(cacheKey, metadata);
       return metadata;
-    } catch (error: any) {
-      // Return null if we can't fetch metadata - we'll use the mint address as fallback
+    } catch (error) {
+      // Identification only — callers fall back to the mint address.
+      logger.warn('[Futarchy] Token metadata lookup failed; falling back to the mint address', {
+        mint: mintAddress.toString(),
+        error: error instanceof Error ? error.message : String(error),
+      });
       return null;
+    }
+  }
+
+  /** getMultipleAccountsInfo in chunks of 100, results aligned with `keys`. */
+  private async getAccountsBatched(keys: PublicKey[]): Promise<Array<AccountInfo<Buffer> | null>> {
+    const results: Array<AccountInfo<Buffer> | null> = [];
+    for (let i = 0; i < keys.length; i += MAX_ACCOUNTS_PER_RPC) {
+      const chunk = keys.slice(i, i + MAX_ACCOUNTS_PER_RPC);
+      results.push(...await this.retryWithBackoff(() => this.connection.getMultipleAccountsInfo(chunk)));
+    }
+    return results;
+  }
+
+  /**
+   * Fill the decimals/metadata caches for every mint not already cached, in
+   * batched RPC calls (instead of 2 calls per mint). Mints that fail to load
+   * here are simply left uncached; getTokenDecimals/getTokenMetadata then
+   * fetch them individually and surface their errors as before.
+   */
+  private async prefetchMints(mints: PublicKey[]): Promise<void> {
+    const unique = [...new Map(mints.map((m) => [m.toBase58(), m])).values()];
+    const needDecimals = unique.filter(
+      (m) => this.getCached<number>(`token_decimals_${m}`, FutarchyService.DECIMALS_TTL_MS) === null
+    );
+    const needMetadata = unique.filter(
+      (m) => !this.getCached<TokenMetadata>(`token_metadata_${m}`, FutarchyService.METADATA_TTL_MS)
+        && !this.getCached<true>(`token_metadata_absent_${m}`, FutarchyService.METADATA_ABSENT_TTL_MS)
+    );
+    if (needDecimals.length === 0 && needMetadata.length === 0) return;
+
+    try {
+      const infos = await this.getAccountsBatched([...needDecimals, ...needMetadata.map(metadataAddress)]);
+      needDecimals.forEach((mint, i) => {
+        const info = infos[i];
+        if (!info) return;
+        if (!info.owner.equals(TOKEN_PROGRAM_ID) && !info.owner.equals(TOKEN_2022_PROGRAM_ID)) return;
+        this.setCache(`token_decimals_${mint}`, unpackMint(mint, info, info.owner).decimals);
+      });
+      needMetadata.forEach((mint, i) => {
+        const info = infos[needDecimals.length + i];
+        if (info?.data) this.setCache(`token_metadata_${mint}`, parseTokenMetadata(info.data, mint));
+        else this.setCache(`token_metadata_absent_${mint}`, true);
+      });
+    } catch (error) {
+      logger.warn('[Futarchy] Batched mint prefetch failed; falling back to per-mint lookups', {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
   /**
-   * Get USDC balance for a given vault address (owner)
-   * USDC mint on Solana mainnet: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+   * USDC balance (UI units) of each treasury vault's associated token account,
+   * in batched RPC calls. A vault without a USDC account is absent from the
+   * map. Treasury AUM is informational, so a failed lookup omits the field
+   * (logged) rather than failing the ticker feed.
    */
-  async getUsdcBalanceForVault(vaultAddress: PublicKey): Promise<string | null> {
-    const cacheKey = `usdc_balance_${vaultAddress.toString()}`;
-    const cached = this.getCached<string>(cacheKey, config.cache.tickersTTL);
-    if (cached !== null) return cached;
-
+  private async getTreasuryUsdcBalances(vaults: PublicKey[]): Promise<Map<string, string>> {
+    const balances = new Map<string, string>();
+    if (vaults.length === 0) return balances;
     try {
-      // USDC mint address on Solana mainnet
-      const USDC_MINT = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
-      
-      // Get the associated token account address for the vault
-      const tokenAccountAddress = await getAssociatedTokenAddress(
-        USDC_MINT,
-        vaultAddress,
-        true
-      );
-
-      // Get the token account
-      const tokenAccount = await this.retryWithBackoff(() => 
-        getAccount(this.connection, tokenAccountAddress)
-      );
-
-      // USDC has 6 decimals
-      const balance = tokenAccount.amount.toString();
-      const balanceFormatted = (Number(balance) / 1e6).toFixed(6);
-
-      this.setCache(cacheKey, balanceFormatted);
-      return balanceFormatted;
-    } catch (error: any) {
-      // If token account doesn't exist or other error, return null
-      // This is expected for vaults that don't have USDC
-      return null;
+      const atas = vaults.map((vault) => getAssociatedTokenAddressSync(USDC_MINT, vault, true));
+      const infos = await this.getAccountsBatched(atas);
+      infos.forEach((info, i) => {
+        if (!info) return;
+        const account = unpackAccount(atas[i]!, info);
+        balances.set(vaults[i]!.toBase58(), (Number(account.amount) / 1e6).toFixed(6));
+      });
+    } catch (error) {
+      logger.warn('[Futarchy] Treasury USDC balance lookup failed; omitting treasury AUM', {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
+    return balances;
   }
 
+  /**
+   * Every served DAO with live spot-pool reserves, from a snapshot that is
+   * kept warm with stale-while-revalidate:
+   * - younger than `cache.tickersTTL`: served as is;
+   * - older, but younger than `cache.tickersMaxStale`: served immediately
+   *   while one background refresh runs;
+   * - older than that (or none yet): the caller waits for a fresh scan, which
+   *   throws (→ 5xx) if the RPC is down — prices older than the cap are never
+   *   served.
+   */
   async getAllDaos(): Promise<DaoTickerData[]> {
-    const cacheKey = 'all_daos';
-    const cached = this.getCached<DaoTickerData[]>(cacheKey, config.cache.tickersTTL);
-    if (cached) return cached;
+    const ageMs = this.allDaos ? Date.now() - this.allDaos.fetchedAt : Infinity;
+    // Both limits apply, so a cap configured below the TTL is still honored.
+    if (this.allDaos && ageMs < config.cache.tickersTTL && ageMs < config.cache.tickersMaxStale) {
+      return this.allDaos.data;
+    }
 
-    // Single-flight: concurrent callers after cache expiry share one scan instead
-    // of each launching a full DAO+RPC sweep (cache stampede against the RPC).
-    if (this.allDaosInFlight) return this.allDaosInFlight;
-    this.allDaosInFlight = this.fetchAllDaos(cacheKey).finally(() => {
-      this.allDaosInFlight = null;
-    });
+    const refresh = this.refreshAllDaos();
+    if (this.allDaos && ageMs < config.cache.tickersMaxStale) {
+      refresh.catch(() => {}); // logged in fetchAllDaos; the next caller retries
+      return this.allDaos.data;
+    }
+    return refresh;
+  }
+
+  // Single-flight: concurrent callers share one scan instead of each
+  // launching a full DAO+RPC sweep (cache stampede against the RPC).
+  private refreshAllDaos(): Promise<DaoTickerData[]> {
+    if (!this.allDaosInFlight) {
+      this.allDaosInFlight = this.fetchAllDaos()
+        .then(({ data, readAt }) => {
+          // The snapshot is as old as its reserves, not as old as the end of
+          // the refresh: a slow refresh must not make old prices look fresh.
+          const ageMs = Date.now() - readAt;
+          if (ageMs >= config.cache.tickersMaxStale) {
+            throw new Error(`DAO snapshot took ${ageMs}ms to build, past the ${config.cache.tickersMaxStale}ms max-stale cap; discarding it`);
+          }
+          this.allDaos = { data, fetchedAt: readAt };
+          metricsService.markDaoSnapshotRefreshed(data.length, readAt);
+          return data;
+        })
+        .finally(() => {
+          this.allDaosInFlight = null;
+        });
+    }
     return this.allDaosInFlight;
   }
 
-  private allDaosInFlight: Promise<DaoTickerData[]> | null = null;
-
-  private async fetchAllDaos(cacheKey: string): Promise<DaoTickerData[]> {
+  private async fetchAllDaos(): Promise<{ data: DaoTickerData[]; readAt: number }> {
     try {
-      // Fetch all DAO accounts with retry logic
+      const readAt = Date.now();
       let daoAccounts: any[];
       try {
         daoAccounts = await this.retryWithBackoff(() => this.client.futarchy.account.dao.all());
       } catch (error: any) {
-        const isRateLimited = this.isRateLimitError(error);
-        if (isRateLimited) {
-          logger.error('Rate limited while fetching all DAOs:', error);
-        } else {
-          logger.error('Error fetching all DAOs:', error);
-        }
+        logger.error(this.isRateLimitError(error) ? 'Rate limited while fetching all DAOs:' : 'Error fetching all DAOs:', error);
         throw error;
       }
-      
-      // Process DAOs sequentially with delays to avoid rate limiting
+
+      // Pool reserves come straight from the scanned DAO accounts — one
+      // consistent read, no per-DAO refetch.
+      const candidates: Array<{ daoAddress: PublicKey; dao: any; poolData: PoolData; vault?: PublicKey }> = [];
+      for (const daoAccount of daoAccounts) {
+        if (!daoAccount) continue;
+        const daoAddress: PublicKey = daoAccount.publicKey;
+        if (config.excludedDaos.some((excluded) => excluded.equals(daoAddress))) continue;
+
+        const dao = daoAccount.account;
+        const poolData = extractSpotPool(dao);
+        if (!poolData) continue;
+
+        let vault: PublicKey | undefined;
+        if (dao.squadsMultisigVault) {
+          try {
+            vault = new PublicKey(dao.squadsMultisigVault);
+          } catch {
+            logger.warn(`Invalid squads vault for DAO ${daoAddress.toString()}`);
+          }
+        }
+        candidates.push({ daoAddress, dao, poolData, vault });
+      }
+
+      const [treasuryBalances] = await Promise.all([
+        this.getTreasuryUsdcBalances(candidates.flatMap((c) => (c.vault ? [c.vault] : []))),
+        this.prefetchMints(candidates.flatMap((c) => [c.dao.baseMint, c.dao.quoteMint])),
+      ]);
+
       const validDaoData: DaoTickerData[] = [];
       let perDaoErrors = 0;
 
-      for (let i = 0; i < daoAccounts.length; i++) {
-        const daoAccount = daoAccounts[i];
-        if (!daoAccount) continue;
-        
-        const daoAddress = daoAccount.publicKey;
-        
-        // Check if this DAO is in the excluded list
-        if (config.excludedDaos.some(excluded => excluded.equals(daoAddress))) {
-          continue;
-        }
-        
+      for (const { daoAddress, dao, poolData, vault } of candidates) {
         try {
-          // Add a small delay between requests to avoid rate limiting
-          if (i > 0 && i % 10 === 0) {
-            await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay every 10 DAOs
-          }
-          
-          const dao = daoAccount.account;
-          
-          // Extract base and quote mints from DAO account
-          const baseMint = dao.baseMint;
-          const quoteMint = dao.quoteMint;
+          const baseMint: PublicKey = dao.baseMint;
+          const quoteMint: PublicKey = dao.quoteMint;
 
-          // Get token decimals and metadata
+          // Cache hits after prefetchMints; a mint the batch couldn't load is
+          // fetched individually here and, on failure, fails only this DAO.
           const [baseDecimals, quoteDecimals, baseMetadata, quoteMetadata] = await Promise.all([
             this.getTokenDecimals(baseMint),
             this.getTokenDecimals(quoteMint),
             this.getTokenMetadata(baseMint),
             this.getTokenMetadata(quoteMint),
           ]);
-          
-          // Get pool data for this DAO
-          const poolData = await this.getPoolData(daoAddress);
-          
-          // Skip if no valid pool found
-          if (!poolData) {
-            continue;
-          }
-          
-          // Validate pool data - filter out pools with zero or invalid reserves
-          const baseReservesNum = poolData.baseReserves.toNumber();
-          const quoteReservesNum = poolData.quoteReserves.toNumber();
-          
-          if (baseReservesNum === 0 || quoteReservesNum === 0 ||
-              !isFinite(baseReservesNum) || !isFinite(quoteReservesNum) ||
-              isNaN(baseReservesNum) || isNaN(quoteReservesNum)) {
-            continue;
-          }
-          
-          // Get treasury USDC balance if squads_multisig_vault exists
-          let treasuryUsdcAum: string | undefined;
-          let treasuryVaultAddress: string | undefined;
-          
-          if (dao.squadsMultisigVault) {
-            try {
-              const vaultAddress = new PublicKey(dao.squadsMultisigVault);
-              treasuryVaultAddress = vaultAddress.toString();
-              const usdcBalance = await this.getUsdcBalanceForVault(vaultAddress);
-              treasuryUsdcAum = usdcBalance || undefined;
-            } catch (error: any) {
-              // If vault address is invalid or balance can't be fetched, continue without it
-              logger.warn(`Could not fetch USDC balance for vault ${dao.squads_multisig_vault} for DAO ${daoAddress.toString()}:`, { error: error.message });
-            }
-          }
-          
+
           validDaoData.push({
             daoAddress,
             baseMint,
@@ -468,25 +439,19 @@ export class FutarchyService {
             quoteSymbol: quoteMetadata?.symbol,
             quoteName: quoteMetadata?.name,
             poolData,
-            treasuryUsdcAum,
-            treasuryVaultAddress,
+            treasuryUsdcAum: vault ? treasuryBalances.get(vault.toBase58()) : undefined,
+            treasuryVaultAddress: vault?.toBase58(),
           });
         } catch (error: any) {
-          // A per-DAO fetch failed (RPC/decimals/pool/metadata). Skip THIS dao so
-          // one flaky account doesn't take down the whole feed — but count it, so
-          // we can refuse to serve a silently-shrunken list below (see guard).
+          // Skip THIS dao so one flaky account doesn't take down the whole
+          // feed — but count it, so we can refuse to serve an all-failed list.
           perDaoErrors++;
-          const isRateLimited = this.isRateLimitError(error);
-          if (isRateLimited) {
-            // Wait longer if rate limited
-            await new Promise(resolve => setTimeout(resolve, 2000));
-          }
-          // Continue processing other DAOs
+          logger.warn(`Skipping DAO ${daoAddress.toString()}: ${error?.message ?? error}`);
         }
       }
 
       if (this.rateLimitErrors > 0) {
-        logger.warn(`⚠️  Encountered ${this.rateLimitErrors} rate limit errors during processing`);
+        logger.warn(`Encountered ${this.rateLimitErrors} rate limit errors during processing`);
       }
 
       // Don't serve an empty (or all-failed) ticker set as if it were real: if we
@@ -494,18 +459,16 @@ export class FutarchyService {
       // an infrastructure problem (RPC degraded), not a genuinely empty market.
       // Throw so /api/tickers returns an error the poller retries — never an empty
       // 200 that reads as "everything delisted / zero volume".
-      if (validDaoData.length === 0 && daoAccounts.length > 0 && perDaoErrors > 0) {
+      if (validDaoData.length === 0 && candidates.length > 0 && perDaoErrors > 0) {
         throw new Error(
-          `getAllDaos produced 0 tickers from ${daoAccounts.length} DAOs with ${perDaoErrors} fetch errors — refusing to serve an empty set`,
+          `getAllDaos produced 0 tickers from ${candidates.length} DAOs with ${perDaoErrors} fetch errors — refusing to serve an empty set`,
         );
       }
 
-      this.setCache(cacheKey, validDaoData);
-      return validDaoData;
+      return { data: validDaoData, readAt };
     } catch (error) {
       logger.error('Error fetching all DAOs:', error);
       throw error;
     }
   }
-
 }

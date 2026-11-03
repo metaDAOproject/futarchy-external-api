@@ -56,6 +56,7 @@ const mockExternalDatabaseService = {
   isAvailable: jest.fn().mockReturnValue(true),
   getSpotRolling24hMetrics: jest.fn().mockResolvedValue(new Map()),
   getFirstTradeDates: jest.fn().mockResolvedValue(new Map()),
+  getFutarchySpotFreshness: jest.fn().mockResolvedValue({ latestSwapAt: '2024-01-01T00:00:00.000Z', ageSeconds: 30 }),
   checkServedDataContract: jest.fn().mockResolvedValue({
     ok: true,
     checkedAt: '2024-01-01T00:00:00.000Z',

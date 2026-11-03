@@ -6,17 +6,22 @@ import type { ExternalDatabaseService } from '../../src/services/externalDatabas
 import type { SolanaService } from '../../src/services/solanaService.js';
 import type { LaunchpadService } from '../../src/services/launchpadService.js';
 
+/** A served DB whose newest swap is 30s old: passes the stale-data guard. */
+export const freshServedData = async () => ({
+  latestSwapAt: new Date().toISOString(),
+  ageSeconds: 30,
+});
+
 export function createMockExternalDatabaseService(): ExternalDatabaseService {
   return {
     isAvailable: () => true,
+    ping: async () => {},
     getSpotRolling24hMetrics: async () => new Map(),
     getDailyMeteoraVolumes: async () => [],
     getFutarchyAmmDailyActivity: async () => [],
     getFirstTradeDates: async () => new Map(),
-    getServedDataFreshness: async () => ({
-      latestSwapAt: new Date().toISOString(),
-      ageSeconds: 30,
-    }),
+    getServedDataFreshness: freshServedData,
+    getFutarchySpotFreshness: freshServedData,
     checkServedDataContract: async () => ({
       ok: true,
       checkedAt: new Date().toISOString(),

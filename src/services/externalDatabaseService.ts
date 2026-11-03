@@ -1,6 +1,7 @@
 import pg from 'pg';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { TtlCache } from '../utils/ttlCache.js';
 
 // Force pg to serialize Date parameters as ISO-8601 UTC strings so PostgreSQL
 // doesn't receive un-parseable local-timezone names like "GMT-0700".
@@ -42,6 +43,13 @@ export class ExternalDatabaseService {
   private isConnected: boolean = false;
   private healthCheckInterval: NodeJS.Timeout | null = null;
   private consecutiveFailures: number = 0;
+  private pingWork: Promise<void> | null = null;
+  private pingClient: pg.PoolClient | null = null;
+  // Aggregates read by every /api/tickers and /cmc/* request. Concurrent
+  // callers share one in-flight query and its result is reused for
+  // CACHE_SERVED_METRICS_TTL, so a burst of pollers costs one query, not one
+  // per request against a 5-connection pool. Failures are never cached.
+  private aggregateCache = new TtlCache(100);
 
   private static readonly HEALTH_CHECK_INTERVAL_MS = 60_000;
   private static readonly MAX_FAILURES_BEFORE_RECONNECT = 3;
@@ -97,6 +105,10 @@ export class ExternalDatabaseService {
     if (tokens.length === 0) {
       return new Map();
     }
+    return this.cachedAggregate(`spot24h:${[...tokens].sort().join(',')}`, () => this.fetchSpotRolling24hMetrics(tokens));
+  }
+
+  private async fetchSpotRolling24hMetrics(tokens: string[]): Promise<Map<string, Rolling24hMetrics>> {
     if (!this.pool || !this.isConnected) {
       throw new Error('External database not connected');
     }
@@ -178,6 +190,10 @@ export class ExternalDatabaseService {
     if (tokens.length === 0) {
       return new Map();
     }
+    return this.cachedAggregate(`reserves24h:${[...tokens].sort().join(',')}`, () => this.fetchSpotReserves24hAgo(tokens));
+  }
+
+  private async fetchSpotReserves24hAgo(tokens: string[]): Promise<Map<string, { baseReserves: string; quoteReserves: string }>> {
     if (!this.pool || !this.isConnected) {
       throw new Error('External database not connected');
     }
@@ -409,6 +425,10 @@ export class ExternalDatabaseService {
    * Map<token(base mint), 'YYYY-MM-DD'>. Throws on connection or query failure.
    */
   async getFirstTradeDates(): Promise<Map<string, string>> {
+    return this.cachedAggregate('firstTradeDates', () => this.fetchFirstTradeDates());
+  }
+
+  private async fetchFirstTradeDates(): Promise<Map<string, string>> {
     if (!this.pool || !this.isConnected) {
       throw new Error('External database not connected');
     }
@@ -435,6 +455,46 @@ export class ExternalDatabaseService {
    * Throws on connection or query failure.
    */
   async getServedDataFreshness(): Promise<ServedDataFreshness> {
+    // Read by the heartbeat and by every /api/health request; MAX(block_time)
+    // over every swap is not free. ageSeconds can be up to
+    // CACHE_SERVED_METRICS_TTL behind, far below the hours-scale thresholds it
+    // is compared against.
+    return this.cachedAggregate('freshness', () => this.fetchServedDataFreshness());
+  }
+
+  /**
+   * Freshness of the FutarchyAMM spot swaps alone: the source behind the
+   * rolling-24h volume of /api/tickers and /cmc/*. getServedDataFreshness
+   * also counts Meteora rows, which come from a separate ETL and would keep
+   * reporting "fresh" while the FutarchyAMM pipeline is stalled. Same
+   * newest-slot query as /dexscreener/latest-block. Cached like the other
+   * aggregates; throws on connection or query failure.
+   */
+  async getFutarchySpotFreshness(): Promise<ServedDataFreshness> {
+    return this.cachedAggregate('futarchySpotFreshness', async () => {
+      if (!this.pool || !this.isConnected) {
+        throw new Error('External database not connected');
+      }
+      const result = await this.pool.query(
+        `SELECT block_time AS latest_swap_at,
+                extract(epoch FROM now() - block_time)::bigint AS age_seconds
+         FROM futarchy.user_pool_swaps
+         WHERE source = 'futarchy_amm' AND market_kind = 'spot'
+         ORDER BY slot DESC
+         LIMIT 1`
+      );
+      const row = result.rows[0];
+      if (!row || row.latest_swap_at == null) {
+        return { latestSwapAt: null, ageSeconds: null };
+      }
+      return {
+        latestSwapAt: new Date(row.latest_swap_at).toISOString(),
+        ageSeconds: Number(row.age_seconds),
+      };
+    });
+  }
+
+  private async fetchServedDataFreshness(): Promise<ServedDataFreshness> {
     if (!this.pool || !this.isConnected) {
       throw new Error('External database not connected');
     }
@@ -452,6 +512,10 @@ export class ExternalDatabaseService {
       latestSwapAt: new Date(row.latest_swap_at).toISOString(),
       ageSeconds: Number(row.age_seconds),
     };
+  }
+
+  private cachedAggregate<T>(key: string, load: () => Promise<T>): Promise<T> {
+    return this.aggregateCache.getOrLoad(key, config.cache.servedMetricsTTL, load);
   }
 
   async checkServedDataContract(): Promise<ServedDataContractStatus> {
@@ -563,6 +627,62 @@ export class ExternalDatabaseService {
     }
   }
 
+  /**
+   * `SELECT 1` with a hard deadline, for the readiness probe. Rejects if the
+   * DB is disconnected, errors, or doesn't answer within `timeoutMs`.
+   *
+   * The ping's work is bounded, not just its wait, so a hung DB can't make
+   * probes eat the shared 5-connection pool that API reads need:
+   *  - at most one ping runs at a time; later callers wait on it with their
+   *    own deadline instead of starting another connect/query;
+   *  - a ping that times out mid-query destroys its connection. A ping stuck
+   *    connecting is bounded by the pool's connectionTimeoutMillis.
+   */
+  ping(timeoutMs: number): Promise<void> {
+    const pool = this.pool;
+    if (!pool || !this.isConnected) {
+      return Promise.reject(new Error('External database not connected'));
+    }
+    if (!this.pingWork) {
+      this.pingWork = this.runPing(pool).finally(() => {
+        this.pingWork = null;
+      });
+    }
+    const work = this.pingWork;
+
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const client = this.pingClient;
+        if (client) {
+          this.pingClient = null;
+          client.release(true); // destroy: aborts the hung query, frees the slot
+        }
+        reject(new Error(`Served database ping timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      work.then(
+        () => { clearTimeout(timer); resolve(); },
+        (error) => { clearTimeout(timer); reject(error); }
+      );
+    });
+  }
+
+  private async runPing(pool: pg.Pool): Promise<void> {
+    const client = await pool.connect();
+    this.pingClient = client;
+    let error: unknown;
+    try {
+      await client.query('SELECT 1');
+    } catch (e) {
+      error = e ?? new Error('Served database ping failed');
+    }
+    // Skip if a timeout already destroyed this client.
+    if (this.pingClient === client) {
+      this.pingClient = null;
+      client.release(error !== undefined); // destroy a connection that failed
+    }
+    if (error !== undefined) throw error;
+  }
+
   async close(): Promise<void> {
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
@@ -648,6 +768,7 @@ export class ExternalDatabaseService {
       max: 5,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 10_000,
+      statement_timeout: config.externalDatabase.statementTimeoutMs,
     });
 
     this.pool.on('error', (err: Error) => {

@@ -12,8 +12,11 @@ export class PriceService {
       return null;
     }
 
-    const baseReservesNum = baseReserves.toNumber();
-    const quoteReservesNum = quoteReserves.toNumber();
+    // Number(toString()), not toNumber(): u64 reserves can exceed 2^53, where
+    // toNumber() throws. The float conversion keeps ~16 significant digits,
+    // far more than a price needs.
+    const baseReservesNum = Number(baseReserves.toString());
+    const quoteReservesNum = Number(quoteReserves.toString());
 
     // Check for zero or invalid reserves
     if (baseReservesNum === 0 || quoteReservesNum === 0 || 
@@ -65,7 +68,7 @@ export class PriceService {
       return null;
     }
 
-    const quoteReservesNum = quoteReserves.toNumber();
+    const quoteReservesNum = Number(quoteReserves.toString()); // see calculatePrice
     
     // Validate reserves
     if (!isFinite(quoteReservesNum) || isNaN(quoteReservesNum) || quoteReservesNum < 0) {

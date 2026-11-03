@@ -315,15 +315,29 @@ describe('SolanaService.getSupplyInfo — excluded holders', () => {
     })).rejects.toThrow('Non-circulating allocations exceed total supply');
   });
 
-  it('bounds cached snapshot variants and evicts the oldest entry', () => {
-    const svc = new SolanaService();
+});
 
-    for (let index = 0; index <= 1000; index++) {
-      (svc as any).setCache(`snapshot-${index}`, index);
+describe('SolanaService.getSupplyInfo', () => {
+  it('reads the mint once and adds no cache entries as allocation balances change, while each result reflects its own balances', async () => {
+    const svc = new SolanaService();
+    let mintReads = 0;
+    (svc as any).withRetry = async () => { mintReads++; return { supply: 1_000_000_000n, decimals: 6 }; };
+
+    // Balances move between polls: the team package (subtracted) and the AMM
+    // vault (reported, not subtracted) differ on every call.
+    for (const n of [1, 2, 3, 4, 5]) {
+      const result = await svc.getSupplyInfo(MINT, {
+        teamPerformancePackage: { amount: new BN(n * 100_000_000) }, // n * 100 tokens
+        futarchyAmmLiquidity: { amount: new BN(n * 1_000_000) },     // n tokens
+        meteoraLpLiquidity: { amount: new BN(0) },
+      });
+
+      expect(result.totalSupply).toBe('1000');
+      expect(result.circulatingSupply).toBe(String(1000 - n * 100));
+      expect(result.allocation?.futarchyAmmLiquidity?.amount).toBe(String(n));
     }
 
-    expect((svc as any).cache.size).toBe(1000);
-    expect((svc as any).cache.has('snapshot-0')).toBe(false);
-    expect((svc as any).cache.get('snapshot-1000')?.data).toBe(1000);
+    expect(mintReads).toBe(1);
+    expect((svc as any).cache.size).toBe(1);
   });
 });

@@ -5,22 +5,25 @@ export class AppError extends Error {
   public readonly statusCode: number;
   public readonly isOperational: boolean;
   public readonly code?: string;
+  /** The request parameter a 4xx is about, echoed in the response body. */
+  public readonly field?: string;
 
   constructor(
     message: string,
     statusCode: number = 500,
-    options?: { code?: string; isOperational?: boolean }
+    options?: { code?: string; isOperational?: boolean; field?: string }
   ) {
     super(message);
     this.statusCode = statusCode;
     this.isOperational = options?.isOperational ?? true;
     this.code = options?.code;
+    this.field = options?.field;
     Object.setPrototypeOf(this, AppError.prototype);
     Error.captureStackTrace(this, this.constructor);
   }
 
-  static badRequest(message: string, code?: string): AppError {
-    return new AppError(message, 400, { code });
+  static badRequest(message: string, code?: string, field?: string): AppError {
+    return new AppError(message, 400, { code, field });
   }
 
   static unauthorized(message: string = 'Unauthorized', code?: string): AppError {
@@ -48,6 +51,13 @@ export function errorHandler(
 ): void {
   const requestId = req.requestId || 'unknown';
 
+  // The response already went out (e.g. the request timed out while the
+  // handler was still running): log, but don't try to write a second one.
+  if (res.headersSent) {
+    logger.warn('Error after response was sent', { requestId, path: req.path, error: err.message });
+    return;
+  }
+
   if (err instanceof AppError) {
     logger.warn('Operational error', {
       requestId,
@@ -61,6 +71,7 @@ export function errorHandler(
     res.status(err.statusCode).json({
       error: err.message,
       code: err.code,
+      ...(err.field ? { field: err.field } : {}),
       requestId,
     });
     return;
@@ -74,6 +85,7 @@ export function errorHandler(
 
   res.status(500).json({
     error: 'Internal server error',
+    code: 'INTERNAL_ERROR',
     requestId,
   });
 }

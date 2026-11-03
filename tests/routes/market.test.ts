@@ -4,6 +4,8 @@ import { createTestApp } from '../helpers/testApp.js';
 import type { ExternalDatabaseService } from '../../src/services/externalDatabaseService.js';
 
 const app = createTestApp();
+const TOKEN_A = 'So11111111111111111111111111111111111111112';
+const TOKEN_B = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
 // A served-DB stub seeded with one futarchy row (spot + conditional pivoted by
 // getFutarchyAmmDailyActivity) and one meteora row, so the happy path asserts the
@@ -34,26 +36,24 @@ function seededExternalDb(): ExternalDatabaseService {
 
 describe('Market Routes', () => {
   describe('GET /api/market-data', () => {
-    it('returns 400 with field=startDate when startDate is missing', async () => {
-      const response = await request(app).get('/api/market-data').query({ endDate: '2024-01-15' });
+    // Every rejection uses the standard error body and names the bad field.
+    it.each([
+      ['startDate is missing', { endDate: '2024-01-15' }, 'startDate'],
+      ['endDate is missing', { startDate: '2024-01-01' }, 'endDate'],
+      ['startDate is malformed', { startDate: '01-01-2024', endDate: '2024-01-15' }, 'startDate'],
+      // new Date() rolls 2024-02-31 over to March 2; Postgres would reject it (500).
+      ['startDate is not a calendar date', { startDate: '2024-02-31', endDate: '2024-03-15' }, 'startDate'],
+      ['startDate is year 0000 (absent in Postgres)', { startDate: '0000-01-01', endDate: '0000-01-02' }, 'startDate'],
+      ['tokens lists no mints', { startDate: '2024-01-01', endDate: '2024-01-15', tokens: ',,' }, 'tokens'],
+      ['startDate is after endDate', { startDate: '2024-02-01', endDate: '2024-01-01' }, 'startDate'],
+      ['a token is not a mint address', { startDate: '2024-01-01', endDate: '2024-01-15', tokens: 'ZKFG' }, 'tokens'],
+      ['the range spans more than 366 days', { startDate: '2024-01-01', endDate: '2025-01-01' }, 'endDate'],
+    ])('returns 400 when %s', async (_case, query, field) => {
+      const response = await request(app).get('/api/market-data').query(query);
       expect(response.status).toBe(400);
-      expect(response.body.error).toBe('Missing required parameter');
-      expect(response.body.field).toBe('startDate');
-    });
-
-    it('returns 400 with field=endDate when endDate is missing', async () => {
-      const response = await request(app).get('/api/market-data').query({ startDate: '2024-01-01' });
-      expect(response.status).toBe(400);
-      expect(response.body.error).toBe('Missing required parameter');
-      expect(response.body.field).toBe('endDate');
-    });
-
-    it('returns 400 Invalid date format for a malformed startDate', async () => {
-      const response = await request(app)
-        .get('/api/market-data')
-        .query({ startDate: '01-01-2024', endDate: '2024-01-15' });
-      expect(response.status).toBe(400);
-      expect(response.body.error).toBe('Invalid date format');
+      expect(response.body).toMatchObject({ code: 'INVALID_QUERY_PARAMETER', field });
+      expect(typeof response.body.error).toBe('string');
+      expect(response.body.requestId).toBe(response.headers['x-request-id']);
     });
 
     it('returns 503 when the served DB is unavailable', async () => {
@@ -64,7 +64,7 @@ describe('Market Routes', () => {
         .get('/api/market-data')
         .query({ startDate: '2024-01-01', endDate: '2024-01-15' });
       expect(response.status).toBe(503);
-      expect(response.body.error).toBe('Served database not available');
+      expect(response.body.code).toBe('SERVED_DB_UNAVAILABLE');
     });
 
     it('serves futarchy + meteora rows from the user_pool ETL with exact values', async () => {
@@ -103,13 +103,18 @@ describe('Market Routes', () => {
       expect(met.token_per_usdc).toBe('0.1');
     });
 
+    it('accepts a range of exactly 366 days (a full leap year)', async () => {
+      const response = await request(app).get('/api/market-data').query({ startDate: '2024-01-01', endDate: '2024-12-31' });
+      expect(response.status).toBe(200);
+    });
+
     it('passes the tokens filter through to the response envelope', async () => {
       const seededApp = createTestApp({ externalDatabaseService: seededExternalDb() });
       const response = await request(seededApp)
         .get('/api/market-data')
-        .query({ startDate: '2024-01-01', endDate: '2024-01-15', tokens: 'token1,token2' });
+        .query({ startDate: '2024-01-01', endDate: '2024-01-15', tokens: `${TOKEN_A},${TOKEN_B}` });
       expect(response.status).toBe(200);
-      expect(response.body.filters.tokens).toEqual(['token1', 'token2']);
+      expect(response.body.filters.tokens).toEqual([TOKEN_A, TOKEN_B]);
     });
   });
 });

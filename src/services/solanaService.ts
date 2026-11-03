@@ -3,10 +3,11 @@ import {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   unpackMint,
-  type Mint,
 } from '@solana/spl-token';
 import { config } from '../config.js';
 import BN from 'bn.js';
+import { createSolanaConnection } from '../utils/solanaConnection.js';
+import { TtlCache } from '../utils/ttlCache.js';
 import { retry, isTransientError, createRetryLogger } from '../utils/resilience.js';
 import { logger } from '../utils/logger.js';
 
@@ -111,35 +112,11 @@ export interface TokenAllocationInput {
 }
 
 export class SolanaService {
-  private static readonly CACHE_MAX_ENTRIES = 1000;
-
   private connection: Connection;
-  private cache: Map<string, { data: any; timestamp: number }>;
+  private cache = new TtlCache(10_000);
 
   constructor() {
-    this.connection = new Connection(config.solana.rpcUrl, 'confirmed');
-    this.cache = new Map();
-  }
-
-  private getCached<T>(key: string, ttl: number): T | null {
-    const cached = this.cache.get(key);
-    if (cached && Date.now() - cached.timestamp < ttl) {
-      return cached.data as T;
-    }
-    return null;
-  }
-
-  private setCache(key: string, data: any): void {
-    if (this.cache.has(key)) {
-      this.cache.delete(key);
-    }
-    if (this.cache.size >= SolanaService.CACHE_MAX_ENTRIES) {
-      const oldestKey = this.cache.keys().next().value;
-      if (oldestKey !== undefined) {
-        this.cache.delete(oldestKey);
-      }
-    }
-    this.cache.set(key, { data, timestamp: Date.now() });
+    this.connection = createSolanaConnection();
   }
 
   private assertNonOverlappingAllocations(allocation: TokenAllocationInput): void {
@@ -197,20 +174,17 @@ export class SolanaService {
     });
   }
 
-  private async getMintInfo(mintAddress: PublicKey): Promise<Mint> {
-    const accountInfo = await this.connection.getAccountInfo(mintAddress, 'confirmed');
-    if (!accountInfo) {
-      throw new Error(`Mint account ${mintAddress.toString()} was not found`);
-    }
-    if (
-      !accountInfo.owner.equals(TOKEN_PROGRAM_ID) &&
-      !accountInfo.owner.equals(TOKEN_2022_PROGRAM_ID)
-    ) {
-      throw new Error(
-        `Mint ${mintAddress.toString()} is not owned by a supported token program`,
-      );
-    }
-    return unpackMint(mintAddress, accountInfo, accountInfo.owner);
+  private getMintInfo(mintAddress: string): Promise<{ supply: bigint; decimals: number }> {
+    return this.cache.getOrLoad(`mint_${mintAddress}`, config.cache.tickersTTL, () => this.withRetry(async () => {
+      const mintPubkey = new PublicKey(mintAddress);
+      const accountInfo = await this.connection.getAccountInfo(mintPubkey, 'confirmed');
+      if (!accountInfo) throw new Error(`Mint account ${mintAddress} was not found`);
+      if (!accountInfo.owner.equals(TOKEN_PROGRAM_ID) && !accountInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+        throw new Error(`Mint ${mintAddress} is not owned by a supported token program`);
+      }
+      const mint = unpackMint(mintPubkey, accountInfo, accountInfo.owner);
+      return { supply: mint.supply, decimals: mint.decimals };
+    }));
   }
 
   /**
@@ -231,21 +205,13 @@ export class SolanaService {
    * @returns Promise<string> - The total supply with proper decimals
    */
   async getTotalSupply(mintAddress: string): Promise<string> {
-    const cacheKey = `total_supply_${mintAddress}`;
-    const cached = this.getCached<string>(cacheKey, config.cache.tickersTTL);
-    if (cached !== null) return cached;
-
     try {
-      const mintPubkey = new PublicKey(mintAddress);
-      const mintInfo = await this.withRetry(() => this.getMintInfo(mintPubkey));
+      const mintInfo = await this.getMintInfo(mintAddress);
       const supply = Number(mintInfo.supply);
       const decimals = mintInfo.decimals;
 
       const totalSupply = supply / Math.pow(10, decimals);
-      const result = totalSupply.toString();
-
-      this.setCache(cacheKey, result);
-      return result;
+      return totalSupply.toString();
     } catch (error) {
       logger.error(`Error fetching total supply for ${mintAddress}:`, error);
       throw new Error(`Failed to fetch total supply for token: ${mintAddress}`);
@@ -268,61 +234,6 @@ export class SolanaService {
       (sum, h) => sum.add(h.amount),
       new BN(0),
     );
-    // Key on every response-bearing allocation field, including the live-balance
-    // slot. Equal numeric totals from different owners must not reuse each
-    // other's allocation metadata.
-    const allocationCacheKey = allocation
-      ? JSON.stringify({
-          teamPerformancePackage: {
-            amount: allocation.teamPerformancePackage.amount.toString(),
-            address: allocation.teamPerformancePackage.address,
-          },
-          futarchyAmmLiquidity: {
-            amount: allocation.futarchyAmmLiquidity.amount.toString(),
-            vaultAddress: allocation.futarchyAmmLiquidity.vaultAddress,
-          },
-          meteoraLpLiquidity: {
-            amount: allocation.meteoraLpLiquidity.amount.toString(),
-            poolAddress: allocation.meteoraLpLiquidity.poolAddress,
-            vaultAddress: allocation.meteoraLpLiquidity.vaultAddress,
-          },
-          additionalTokenAllocation: allocation.additionalTokenAllocation
-            ? {
-                amount: allocation.additionalTokenAllocation.amount.toString(),
-                recipient: allocation.additionalTokenAllocation.recipient,
-                claimed: allocation.additionalTokenAllocation.claimed,
-                tokenAccountAddress: allocation.additionalTokenAllocation.tokenAccountAddress,
-              }
-            : undefined,
-          daoTreasuryTokens: allocation.daoTreasuryTokens
-            ? {
-                amount: allocation.daoTreasuryTokens.amount.toString(),
-                vaultAddress: allocation.daoTreasuryTokens.vaultAddress,
-              }
-            : undefined,
-          excludedHolders: excludedHolders.map(holder => ({
-            address: holder.address,
-            amount: holder.amount.toString(),
-            label: holder.label,
-          })),
-          balanceSnapshotSlot: allocation.balanceSnapshotSlot,
-          mintSupplySnapshot: allocation.mintSupplySnapshot
-            ? {
-                amount: allocation.mintSupplySnapshot.amount.toString(),
-                decimals: allocation.mintSupplySnapshot.decimals,
-              }
-            : undefined,
-          daoAddress: allocation.daoAddress,
-          launchAddress: allocation.launchAddress,
-          version: allocation.version,
-        })
-      : 'none';
-    const cacheKey = allocation
-      ? `supply_info_${mintAddress}_${allocationCacheKey}`
-      : `supply_info_${mintAddress}_none`;
-    const cached = this.getCached<TokenSupplyInfo>(cacheKey, config.cache.tickersTTL);
-    if (cached !== null) return cached;
-
     try {
       let totalSupplyBN: BN;
       let decimals: number;
@@ -330,8 +241,7 @@ export class SolanaService {
         totalSupplyBN = allocation.mintSupplySnapshot.amount;
         decimals = allocation.mintSupplySnapshot.decimals;
       } else {
-        const mintPubkey = new PublicKey(mintAddress);
-        const mintInfo = await this.withRetry(() => this.getMintInfo(mintPubkey));
+        const mintInfo = await this.getMintInfo(mintAddress);
         totalSupplyBN = new BN(mintInfo.supply.toString());
         decimals = mintInfo.decimals;
       }
@@ -465,7 +375,6 @@ export class SolanaService {
         allocation: allocationDetails,
       };
 
-      this.setCache(cacheKey, result);
       return result;
     } catch (error) {
       logger.error(`Error fetching supply info for ${mintAddress}:`, error);
