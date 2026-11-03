@@ -77,4 +77,9 @@ describe('parseExcludedHolders', () => {
     expect(holders).toHaveLength(1);
     expect(holders[0]!.label).toBeUndefined();
   });
+
+  it('preserves colons and internal whitespace in labels', () => {
+    const holders = parseExcludedHolders(`${MINT}:${WALLET}: vesting: tranche 1 `);
+    expect(holders[0]!.label).toBe('vesting: tranche 1');
+  });
 });

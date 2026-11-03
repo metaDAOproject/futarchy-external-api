@@ -194,17 +194,101 @@ describe('LaunchpadService.getTokenAllocationBreakdown', () => {
 });
 
 describe('LaunchpadService allocation snapshots', () => {
-  it('resolves no configured holders without RPC when only holder balances are requested', async () => {
+  for (const accountCount of [99, 100, 205]) {
+    it(`serves a holder with ${accountCount} token accounts through the allocation path`, async () => {
+      config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER });
+      const accounts = Array.from({ length: accountCount }, (_, index) => ({
+        pubkey: new PublicKey(new BN(index + 1).toArrayLike(Buffer, 'le', 32)),
+        info: tokenAccountInfo(HOLDER, BigInt(index + 1)),
+      }));
+      const accountMap = new Map([
+        [MINT.toString(), mintAccountInfo()],
+        ...accounts.map(({ pubkey, info }) => [pubkey.toString(), info] as const),
+      ]);
+      const svc = new LaunchpadService();
+      (svc as any).getLaunchByBaseMint = async () => null;
+      const batches: number[] = [];
+      (svc as any).connection = {
+        getTokenAccountsByOwner: async () => discovery(accounts),
+        getMultipleAccountsInfoAndContext: async (addresses: PublicKey[]) => {
+          batches.push(addresses.length);
+          expect(addresses.length).toBeLessThanOrEqual(100);
+          return {
+            context: { slot: 321 },
+            value: addresses.map(address => accountMap.get(address.toString()) ?? null),
+          };
+        },
+      };
+
+      const breakdown = await svc.getTokenAllocationBreakdown(MINT);
+
+      expect(batches.length).toBe(Math.ceil((accountCount + 1) / 100));
+      expect(batches.reduce((sum, count) => sum + count, 0)).toBe(accountCount + 1);
+      expect(breakdown.excludedHolders[0]?.amount.toString()).toBe(String(accountCount * (accountCount + 1) / 2));
+      expect(breakdown.totalNonCirculating.toString()).toBe(String(accountCount * (accountCount + 1) / 2));
+      expect(breakdown.balanceSnapshotSlot).toBe(321);
+    });
+  }
+
+  for (const outcome of ['retry', 'mismatch', 'RPC failure']) {
+    it(`handles multi-batch ${outcome} without mixing slots or caching partial balances`, async () => {
+      config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER });
+      const accounts = Array.from({ length: 100 }, (_, index) => ({
+        pubkey: new PublicKey(new BN(index + 1).toArrayLike(Buffer, 'le', 32)),
+        info: tokenAccountInfo(HOLDER, 1n),
+      }));
+      const svc = new LaunchpadService();
+      (svc as any).getLaunchByBaseMint = async () => null;
+      let calls = 0;
+      (svc as any).connection = {
+        getTokenAccountsByOwner: async () => discovery(accounts),
+        getMultipleAccountsInfoAndContext: async (addresses: PublicKey[], options: { minContextSlot: number }) => {
+          const call = calls++;
+          expect(options.minContextSlot).toBe(100);
+          if (outcome === 'RPC failure' && call === 1) throw new Error('batch RPC failed');
+          const slot = outcome === 'retry' && call >= 2 ? 400 : 200 + call;
+          return {
+            context: { slot },
+            value: addresses.map(address => address.equals(MINT)
+              ? mintAccountInfo()
+              : tokenAccountInfo(HOLDER, slot === 400 ? 2n : 1n)),
+          };
+        },
+      };
+
+      if (outcome === 'retry') {
+        const breakdown = await svc.getTokenAllocationBreakdown(MINT);
+        expect(calls).toBe(4);
+        expect(breakdown.balanceSnapshotSlot).toBe(400);
+        expect(breakdown.excludedHolders[0]?.amount.toString()).toBe('200');
+      } else {
+        await expect(svc.getTokenAllocationBreakdown(MINT)).rejects.toThrow(
+          outcome === 'mismatch' ? 'Balance snapshot slots differed' : 'batch RPC failed',
+        );
+        expect(calls).toBe(outcome === 'mismatch' ? 6 : 2);
+        expect((svc as any).cache.size).toBe(0);
+      }
+    });
+  }
+
+  it('reads mint supply without holder discovery when no holders are configured', async () => {
     const svc = new LaunchpadService();
+    (svc as any).getLaunchByBaseMint = async () => null;
     let called = false;
     (svc as any).connection = {
       getTokenAccountsByOwner: async () => {
         called = true;
         return discovery([]);
       },
+      getMultipleAccountsInfoAndContext: async () => ({
+        context: { slot: 321 },
+        value: [mintAccountInfo()],
+      }),
     };
 
-    expect(await (svc as any).getExcludedHolderBalances(MINT)).toEqual([]);
+    const breakdown = await svc.getTokenAllocationBreakdown(MINT);
+    expect(breakdown.excludedHolders).toEqual([]);
+    expect(breakdown.mintSupplySnapshot.amount.toString()).toBe('1000000');
     expect(called).toBe(false);
   });
 
@@ -292,18 +376,25 @@ describe('LaunchpadService allocation snapshots', () => {
     );
   });
 
-  it('ignores holders configured for another mint without RPC', async () => {
+  it('ignores holders configured for another mint on the allocation path', async () => {
     config.circulating.excludedHolders.push({ mint: OTHER_MINT, wallet: HOLDER });
     const svc = new LaunchpadService();
+    (svc as any).getLaunchByBaseMint = async () => null;
     let called = false;
     (svc as any).connection = {
       getTokenAccountsByOwner: async () => {
         called = true;
         return discovery([]);
       },
+      getMultipleAccountsInfoAndContext: async () => ({
+        context: { slot: 321 },
+        value: [mintAccountInfo()],
+      }),
     };
 
-    expect(await (svc as any).getExcludedHolderBalances(MINT)).toEqual([]);
+    const breakdown = await svc.getTokenAllocationBreakdown(MINT);
+    expect(breakdown.excludedHolders).toEqual([]);
+    expect(breakdown.mintSupplySnapshot.amount.toString()).toBe('1000000');
     expect(called).toBe(false);
   });
 

@@ -37,17 +37,10 @@ export function parseExcludedHolders(raw: string): ExcludedHolder[] {
   for (const entry of raw.split(',')) {
     const trimmed = entry.trim();
     if (!trimmed) continue; // blank entry / trailing comma — not an error
-    // Split into at most 3 parts so a label may itself contain ':'.
-    const firstColon = trimmed.indexOf(':');
-    const secondColon = firstColon === -1 ? -1 : trimmed.indexOf(':', firstColon + 1);
-    const mint = firstColon === -1 ? '' : trimmed.slice(0, firstColon).trim();
-    const wallet =
-      firstColon === -1
-        ? ''
-        : secondColon === -1
-          ? trimmed.slice(firstColon + 1).trim()
-          : trimmed.slice(firstColon + 1, secondColon).trim();
-    const label = secondColon === -1 ? undefined : trimmed.slice(secondColon + 1).trim() || undefined;
+    const [mintPart = '', walletPart = '', ...labelParts] = trimmed.split(':');
+    const mint = mintPart.trim();
+    const wallet = walletPart.trim();
+    const label = labelParts.join(':').trim() || undefined;
     if (!mint || !wallet) {
       throw new Error(
         `Invalid EXCLUDED_CIRCULATING_WALLETS entry "${trimmed}" — expected "<mint>:<wallet>" or "<mint>:<wallet>:<label>"`,

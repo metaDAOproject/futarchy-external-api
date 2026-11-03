@@ -239,10 +239,10 @@ describe('SolanaService.getSupplyInfo — excluded holders', () => {
     })).rejects.toThrow('overlaps the team performance package allocation');
   });
 
-  it('rejects an excluded holder that overlaps an unclaimed additional allocation', async () => {
+  it('subtracts both an unclaimed allocation and its recipient\'s existing excluded balance', async () => {
     const svc = serviceWithSupply(TOTAL_RAW);
 
-    await expect(svc.getSupplyInfo(MINT, {
+    const info = await svc.getSupplyInfo(MINT, {
       ...baseAllocation(),
       additionalTokenAllocation: {
         amount: new BN(25_000).mul(ONE),
@@ -250,9 +250,13 @@ describe('SolanaService.getSupplyInfo — excluded holders', () => {
         claimed: false,
       },
       excludedHolders: [
-        { address: HOLDER_A, amount: new BN(25_000).mul(ONE) },
+        { address: HOLDER_A, amount: new BN(10_000).mul(ONE) },
       ],
-    })).rejects.toThrow('overlaps the unclaimed additional-token allocation');
+    });
+
+    expect(info.circulatingSupply).toBe('965000');
+    expect(info.allocation?.additionalTokenAllocation?.amount).toBe('25000');
+    expect(info.allocation?.excludedHolders?.[0]?.amount).toBe('10000');
   });
 
   it('rejects an excluded holder that overlaps the DAO treasury owner', async () => {

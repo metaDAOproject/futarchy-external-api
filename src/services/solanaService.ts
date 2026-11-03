@@ -166,14 +166,6 @@ export class SolanaService {
       'DAO treasury',
       allocation.daoTreasuryTokens?.amount ?? new BN(0),
     );
-    if (allocation.additionalTokenAllocation && !allocation.additionalTokenAllocation.claimed) {
-      addOccupiedOwner(
-        allocation.additionalTokenAllocation.recipient,
-        'unclaimed additional-token allocation',
-        allocation.additionalTokenAllocation.amount,
-      );
-    }
-
     const seenExcludedOwners = new Set<string>();
     for (const holder of allocation.excludedHolders ?? []) {
       if (seenExcludedOwners.has(holder.address)) {

@@ -88,7 +88,7 @@ export interface TokenAllocationBreakdown {
   // Operator-configured non-circulating holders (external/vesting/encumbered) for
   // this mint, resolved to their live on-chain balances. Empty when none configured.
   excludedHolders: ExcludedHolderBalance[];
-  // Confirmed Solana slot for the single mint-supply and live-balance RPC batch.
+  // Confirmed Solana slot shared by mint-supply and live-balance RPC batches.
   balanceSnapshotSlot?: number;
   // Mint supply read in the same RPC snapshot as the live balances.
   mintSupplySnapshot: {
@@ -127,7 +127,7 @@ export type LaunchState =
 
 export class LaunchpadService {
   private static readonly CACHE_MAX_ENTRIES = 1000;
-  private static readonly MAX_SNAPSHOT_ACCOUNTS = 100;
+  private static readonly SNAPSHOT_BATCH_SIZE = 100;
 
   private connection: Connection;
   private clientV06: LaunchpadClientV06;
@@ -440,7 +440,8 @@ export class LaunchpadService {
 
   /**
    * Discover every configured holder's token accounts, then read the mint and all
-   * relevant token accounts in one contextual getMultipleAccounts call. Account
+   * relevant token accounts in contextual getMultipleAccounts batches at the same
+   * confirmed slot. Account
    * discovery is repeated after the snapshot; if the address set changed around
    * the snapshot, the whole operation is retried.
    */
@@ -519,20 +520,25 @@ export class LaunchpadService {
       addAddress(daoTreasuryAtas?.legacy);
       addAddress(daoTreasuryAtas?.token2022);
 
-      if (uniqueAddresses.size > LaunchpadService.MAX_SNAPSHOT_ACCOUNTS) {
-        throw new Error(
-          `[Launchpad] Non-circulating snapshot for ${mint} requires ${uniqueAddresses.size} accounts; maximum is ${LaunchpadService.MAX_SNAPSHOT_ACCOUNTS}`,
-        );
-      }
-
       const addresses = [...uniqueAddresses.values()];
-      const snapshot = await this.connection.getMultipleAccountsInfoAndContext(
-        addresses,
-        {
+      const batches = [];
+      for (let offset = 0; offset < addresses.length; offset += LaunchpadService.SNAPSHOT_BATCH_SIZE) {
+        batches.push(addresses.slice(offset, offset + LaunchpadService.SNAPSHOT_BATCH_SIZE));
+      }
+      const snapshots = await Promise.all(batches.map(batch =>
+        this.connection.getMultipleAccountsInfoAndContext(batch, {
           commitment: 'confirmed',
           ...(minimumSnapshotSlot > 0 ? { minContextSlot: minimumSnapshotSlot } : {}),
-        },
-      );
+        }),
+      ));
+      const context = snapshots[0]!.context;
+      // minContextSlot is a lower bound, not an exact-slot read. Retry rather
+      // than combine balances from different banks during a transfer or burn.
+      if (snapshots.some(snapshot => snapshot.context.slot !== context.slot)) {
+        if (attempt < maxAttempts) continue;
+        throw new Error(`[Launchpad] Balance snapshot slots differed for ${mint} after ${maxAttempts} attempts`);
+      }
+      const snapshot = { context, value: snapshots.flatMap(batch => batch.value) };
       const secondDiscovery = await discoverHolderAccounts(snapshot.context.slot);
 
       const firstAddresses = accountAddresses(firstDiscovery);
@@ -635,14 +641,6 @@ export class LaunchpadService {
     throw new Error(`[Launchpad] Unreachable balance snapshot state for ${mint}`);
   }
 
-  private async getExcludedHolderBalances(baseMint: PublicKey): Promise<ExcludedHolderBalance[]> {
-    if (!config.circulating.excludedHolders.some(holder => holder.mint === baseMint.toString())) {
-      return [];
-    }
-    const snapshot = await this.getLiveBalanceSnapshot(baseMint);
-    return snapshot.excludedHolders;
-  }
-
   /**
    * Get the complete token allocation breakdown for a launchpad token.
    * This provides a complete picture of where all tokens are allocated:
@@ -652,7 +650,7 @@ export class LaunchpadService {
    * - Additional Token Allocation (v0.7+ only, not in circulating supply until claimed)
    *
    * FutarchyAMM and Meteora liquidity remain circulating. Mint supply and live
-   * non-circulating balances are read in one confirmed contextual RPC batch and
+   * non-circulating balances are read in confirmed contextual RPC batches at one slot and
    * cached for the normal ticker TTL.
    */
   async getTokenAllocationBreakdown(baseMint: PublicKey): Promise<TokenAllocationBreakdown> {
