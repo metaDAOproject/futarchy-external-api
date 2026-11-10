@@ -17,7 +17,7 @@ import {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
-import { Keypair, PublicKey, type AccountInfo } from '@solana/web3.js';
+import { Keypair, PublicKey, SystemProgram, type AccountInfo } from '@solana/web3.js';
 import BN from 'bn.js';
 import { config } from '../../src/config.js';
 import { LaunchpadService } from '../../src/services/launchpadService.js';
@@ -200,6 +200,134 @@ describe('LaunchpadService.getTokenAllocationBreakdown', () => {
 });
 
 describe('LaunchpadService allocation snapshots', () => {
+  for (const recover of [false, true]) {
+    it(`${recover ? 'retries' : 'rejects'} when a temporary account can escape cross-slot discovery`, async () => {
+      config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER });
+      const accounts = [{ pubkey: ACCOUNT_A, info: tokenAccountInfo(HOLDER, 100n) }];
+      const svc = new LaunchpadService();
+      (svc as any).getLaunchByBaseMint = async () => null;
+      let discoveries = 0;
+      let snapshots = 0;
+      (svc as any).connection = {
+        getTokenAccountsByOwner: async () => {
+          const call = discoveries++;
+          if (recover && call >= 2) return discovery(accounts, 103);
+          // An account may exist at 101 but be absent at both 100 and 102.
+          return discovery([], call % 2 === 0 ? 100 : 102);
+        },
+        getMultipleAccountsInfoAndContext: async (addresses: PublicKey[]) => {
+          const slot = recover && snapshots++ > 0 ? 103 : 101;
+          return {
+            context: { slot },
+            value: addresses.map(address => address.equals(MINT)
+              ? mintAccountInfo(1_000n, 0) : accounts[0]!.info),
+          };
+        },
+      };
+
+      const result = getSupplyInfoWithLaunchpadAllocation(MINT.toString(), new SolanaService(), svc);
+      if (recover) {
+        const { supplyInfo } = await result;
+        expect(supplyInfo.circulatingSupply).toBe('900');
+        expect(supplyInfo.allocation?.balanceSnapshotSlot).toBe(103);
+        expect(discoveries).toBe(4);
+      } else {
+        await expect(result).rejects.toThrow('discovery did not match balance snapshot slot');
+        expect(discoveries).toBe(6);
+        expect((svc as any).cache.get(`allocation_${MINT}`, config.cache.tickersTTL)).toBeUndefined();
+      }
+    });
+  }
+
+  it('requires a matching discovery slot for every configured holder', async () => {
+    config.circulating.excludedHolders.push(
+      { mint: MINT.toString(), wallet: HOLDER },
+      { mint: MINT.toString(), wallet: HOLDER_2 },
+    );
+    const svc = new LaunchpadService();
+    (svc as any).getLaunchByBaseMint = async () => null;
+    let otherDiscoveries = 0;
+    (svc as any).connection = {
+      getTokenAccountsByOwner: async (owner: PublicKey) => discovery([], owner.equals(HOLDER)
+        ? 101 : otherDiscoveries++ % 2 === 0 ? 100 : 102),
+      getMultipleAccountsInfoAndContext: async () => ({
+        context: { slot: 101 }, value: [mintAccountInfo()],
+      }),
+    };
+
+    await expect(svc.getTokenAllocationBreakdown(MINT)).rejects.toThrow('discovery did not match balance snapshot slot');
+  });
+
+  it('accepts an exact first discovery even when the confirming discovery advances a slot', async () => {
+    config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER });
+    const svc = new LaunchpadService();
+    (svc as any).getLaunchByBaseMint = async () => null;
+    let calls = 0;
+    (svc as any).connection = {
+      getTokenAccountsByOwner: async () => discovery([], 100 + calls++),
+      getMultipleAccountsInfoAndContext: async () => ({
+        context: { slot: 100 }, value: [mintAccountInfo()],
+      }),
+    };
+
+    expect((await svc.getTokenAllocationBreakdown(MINT)).balanceSnapshotSlot).toBe(100);
+    expect(calls).toBe(2);
+  });
+
+  for (const tokenProgram of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+    it(`treats SOL-prefunded derived token addresses as zero for ${tokenProgram}`, async () => {
+      const svc = new LaunchpadService();
+      (svc as any).connection = {
+        getMultipleAccountsInfoAndContext: async (addresses: PublicKey[]) => ({
+          context: { slot: 100 },
+          value: addresses.map(address => address.equals(MINT)
+            ? mintAccountInfo(1_000n, 0, tokenProgram)
+            : accountInfo(Buffer.alloc(0), SystemProgram.programId)),
+        }),
+      };
+
+      const snapshot = await (svc as any).getLiveBalanceSnapshot(MINT, ACCOUNT_A, ACCOUNT_B);
+      expect(snapshot.performancePackageAmount.isZero()).toBe(true);
+      expect(snapshot.daoTreasuryAmount.isZero()).toBe(true);
+    });
+  }
+
+  it('does not treat malformed or executable derived accounts as empty token accounts', async () => {
+    const ata = getAssociatedTokenAddressSync(MINT, HOLDER, true);
+    for (const invalidAccount of [
+      accountInfo(Buffer.alloc(1), SystemProgram.programId),
+      { ...accountInfo(Buffer.alloc(0), SystemProgram.programId), executable: true },
+      accountInfo(Buffer.alloc(0), HOLDER_2),
+      accountInfo(Buffer.alloc(0), TOKEN_PROGRAM_ID),
+    ]) {
+      const svc = new LaunchpadService();
+      (svc as any).connection = {
+        getMultipleAccountsInfoAndContext: async (addresses: PublicKey[]) => ({
+          context: { slot: 100 },
+          value: addresses.map(address => address.equals(MINT)
+            ? mintAccountInfo() : address.equals(ata) ? invalidAccount : null),
+        }),
+      };
+
+      await expect((svc as any).getLiveBalanceSnapshot(MINT, HOLDER)).rejects.toThrow();
+    }
+  });
+
+  it('still rejects a system-owned account returned by holder discovery', async () => {
+    config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER });
+    const invalidAccount = accountInfo(Buffer.alloc(0), SystemProgram.programId);
+    const svc = new LaunchpadService();
+    (svc as any).getLaunchByBaseMint = async () => null;
+    (svc as any).connection = {
+      getTokenAccountsByOwner: async () => discovery([{ pubkey: ACCOUNT_A, info: invalidAccount }]),
+      getMultipleAccountsInfoAndContext: async () => ({
+        context: { slot: 100 }, value: [mintAccountInfo(), invalidAccount],
+      }),
+    };
+
+    await expect(svc.getTokenAllocationBreakdown(MINT)).rejects.toThrow();
+  });
+
   for (const accountCount of [99, 100, 205]) {
     it(`serves a holder with ${accountCount} token accounts through the allocation path`, async () => {
       config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER });
@@ -215,7 +343,7 @@ describe('LaunchpadService allocation snapshots', () => {
       (svc as any).getLaunchByBaseMint = async () => null;
       const batches: number[] = [];
       (svc as any).connection = {
-        getTokenAccountsByOwner: async () => discovery(accounts),
+        getTokenAccountsByOwner: async () => discovery(accounts, 321),
         getMultipleAccountsInfoAndContext: async (addresses: PublicKey[]) => {
           batches.push(addresses.length);
           expect(addresses.length).toBeLessThanOrEqual(100);
@@ -247,7 +375,8 @@ describe('LaunchpadService allocation snapshots', () => {
       (svc as any).getLaunchByBaseMint = async () => null;
       let calls = 0;
       (svc as any).connection = {
-        getTokenAccountsByOwner: async () => discovery(accounts),
+        getTokenAccountsByOwner: async (_owner: PublicKey, _filter: unknown, options: { minContextSlot?: number }) =>
+          discovery(accounts, options.minContextSlot ?? 100),
         getMultipleAccountsInfoAndContext: async (addresses: PublicKey[], options: { minContextSlot: number }) => {
           const call = calls++;
           expect(options.minContextSlot).toBe(100);
@@ -315,7 +444,7 @@ describe('LaunchpadService allocation snapshots', () => {
     const svc = new LaunchpadService();
     let batchCalls = 0;
     (svc as any).connection = {
-      getTokenAccountsByOwner: async () => discovery(accounts),
+      getTokenAccountsByOwner: async () => discovery(accounts, 321),
       getMultipleAccountsInfoAndContext: async (addresses: PublicKey[]) => {
         batchCalls++;
         return {
@@ -387,10 +516,9 @@ describe('LaunchpadService allocation snapshots', () => {
     const accounts = [{ pubkey: ACCOUNT_A, info: tokenAccountInfo(HOLDER, 200n) }];
     const svc = new LaunchpadService();
     (svc as any).getLaunchByBaseMint = async () => null;
-    let discoveries = 0;
     let snapshotOwner = HOLDER_2;
     (svc as any).connection = {
-      getTokenAccountsByOwner: async () => discovery(accounts, discoveries++ % 2 === 0 ? 100 : 102),
+      getTokenAccountsByOwner: async () => discovery(accounts, 101),
       getMultipleAccountsInfoAndContext: async () => ({
         context: { slot: 101 },
         value: [mintAccountInfo(1_000n, 0), tokenAccountInfo(snapshotOwner, 200n)],
@@ -436,8 +564,10 @@ describe('LaunchpadService allocation snapshots', () => {
     let discoveryCalls = 0;
     let batchCalls = 0;
     (svc as any).connection = {
-      getTokenAccountsByOwner: async () =>
-        discovery(discoveries[discoveryCalls++] ?? accountB, 100 + discoveryCalls),
+      getTokenAccountsByOwner: async () => {
+        const call = discoveryCalls++;
+        return discovery(discoveries[call] ?? accountB, [200, 201, 202, 202][call] ?? 202);
+      },
       getMultipleAccountsInfoAndContext: async (addresses: PublicKey[]) => {
         batchCalls++;
         return {
@@ -835,7 +965,7 @@ describe('LaunchpadService batched allocation reads', () => {
         const holderAccounts = [{ pubkey: ACCOUNT_A, info: tokenAccountInfo(RECIPIENT, amount) }];
         (svc as any).futarchyClient = { fetchDao: async () => ({ amm: {} }) };
         (svc as any).connection = {
-          getTokenAccountsByOwner: async () => discovery(holderAccounts),
+          getTokenAccountsByOwner: async () => discovery(holderAccounts, 321),
           getMultipleAccountsInfoAndContext: async (keys: PublicKey[]) => ({
             context: { slot: 321 },
             value: keys.map(key => {
@@ -876,7 +1006,7 @@ describe('LaunchpadService batched allocation reads', () => {
         const accounts = [{ pubkey: escrow, info: tokenAccountInfo(launchSigner, 100n) }];
         (svc as any).futarchyClient = { fetchDao: async () => ({ amm: {} }) };
         (svc as any).connection = {
-          getTokenAccountsByOwner: async () => discovery(accounts),
+          getTokenAccountsByOwner: async () => discovery(accounts, 321),
           getMultipleAccountsInfoAndContext: async (keys: PublicKey[]) => ({
             context: { slot: 321 },
             value: keys.map(key => {

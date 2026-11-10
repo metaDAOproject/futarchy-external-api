@@ -1,4 +1,4 @@
-import { Connection, PublicKey, Keypair } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair, SystemProgram } from '@solana/web3.js';
 import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
 import {
   LaunchpadClient as LaunchpadClientV06,
@@ -351,8 +351,9 @@ export class LaunchpadService {
   /**
    * Discover every configured holder's token accounts, then read the mint and all
    * relevant token accounts in contextual getMultipleAccounts batches at the same
-   * confirmed slot. Account discovery is repeated after the snapshot; if the address set changed around
-   * the snapshot, the whole operation is retried.
+   * confirmed slot. Every holder needs a complete account enumeration at that
+   * slot; equal address sets from earlier/later slots alone can miss temporary
+   * accounts. Retry if slots or account sets do not agree.
    */
   private async getLiveBalanceSnapshot(
     baseMint: PublicKey,
@@ -471,6 +472,20 @@ export class LaunchpadService {
         );
       }
 
+      const discoveryMatchesSnapshot = firstDiscovery.every((response, index) =>
+        response.context.slot === snapshot.context.slot ||
+        secondDiscovery[index]!.context.slot === snapshot.context.slot,
+      );
+      if (!discoveryMatchesSnapshot) {
+        logger.warn('[Launchpad] Holder discovery did not match balance snapshot slot', {
+          mint,
+          attempt,
+          snapshotSlot: snapshot.context.slot,
+        });
+        if (attempt < maxAttempts) continue;
+        throw new Error(`[Launchpad] Holder discovery did not match balance snapshot slot for ${mint} after ${maxAttempts} attempts`);
+      }
+
       const accountsByAddress = new Map(
         addresses.map((address, index) => [
           address.toString(),
@@ -509,6 +524,11 @@ export class LaunchpadService {
         if (!accountInfo) {
           if (absentIsZero) return new BN(0);
           throw new Error(`[Launchpad] ${description} was absent from balance snapshot`);
+        }
+        // Anyone can transfer SOL to an ATA before the token program creates it.
+        if (absentIsZero && accountInfo.owner.equals(SystemProgram.programId) &&
+            accountInfo.data.length === 0 && !accountInfo.executable) {
+          return new BN(0);
         }
         const tokenAccount = unpackAccount(address, accountInfo, tokenProgramId);
         if (!tokenAccount.mint.equals(baseMint)) {
