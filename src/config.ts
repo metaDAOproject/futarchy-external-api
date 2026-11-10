@@ -1,5 +1,69 @@
 import { PublicKey } from '@solana/web3.js';
 
+/**
+ * A wallet whose live on-chain balance of a specific mint is treated as
+ * non-circulating (external/vesting/encumbered/protocol-owned holdings that are
+ * NOT "in the hands of others"). Scoped per-mint so we only ever exclude a
+ * balance an operator has explicitly vetted as encumbered.
+ */
+export interface ExcludedHolder {
+  /** Base mint whose balance held by `wallet` is excluded from circulating supply. */
+  mint: string;
+  /** Wallet (owner) address that holds the encumbered tokens. */
+  wallet: PublicKey;
+  /** Optional human-readable tag surfaced in the supply allocation response. */
+  label?: string;
+}
+
+/**
+ * Parse the `EXCLUDED_CIRCULATING_WALLETS` env value into structured holders.
+ *
+ * Format: comma-separated entries, each `<mint>:<wallet>` or
+ * `<mint>:<wallet>:<label>`. Whitespace is trimmed and blank entries (e.g. a
+ * trailing comma) are ignored. The label may contain anything except a comma
+ * (which delimits entries).
+ *
+ * A malformed NON-blank entry (missing mint/wallet, invalid base58 pubkey)
+ * THROWS. This is a financial serving path: silently dropping a typo'd exclusion
+ * would overstate circulating supply, so we fail fast at startup instead — the
+ * same fail-loud-not-quietly-wrong contract the rest of the supply path follows.
+ */
+export function parseExcludedHolders(raw: string): ExcludedHolder[] {
+  const holders: ExcludedHolder[] = [];
+  // Dedupe by mint:wallet — a duplicated env entry (copy/paste) would otherwise be
+  // resolved and subtracted twice, double-counting the same live balance and
+  // understating circulating supply.
+  const seen = new Set<string>();
+  for (const entry of raw.split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue; // blank entry / trailing comma — not an error
+    const [mintPart = '', walletPart = '', ...labelParts] = trimmed.split(':');
+    const mint = mintPart.trim();
+    const wallet = walletPart.trim();
+    const label = labelParts.join(':').trim() || undefined;
+    if (!mint || !wallet) {
+      throw new Error(
+        `Invalid EXCLUDED_CIRCULATING_WALLETS entry "${trimmed}" — expected "<mint>:<wallet>" or "<mint>:<wallet>:<label>"`,
+      );
+    }
+    try {
+      // Validate both are real pubkeys; keep `mint` as string (matches how the
+      // supply path compares mints) and `wallet` as a PublicKey for lookups.
+      new PublicKey(mint);
+      const walletKey = new PublicKey(wallet); // throws if invalid
+      const dedupeKey = `${mint}:${wallet}`;
+      if (seen.has(dedupeKey)) continue; // drop exact duplicate (keep first occurrence)
+      seen.add(dedupeKey);
+      holders.push({ mint, wallet: walletKey, label });
+    } catch {
+      throw new Error(
+        `Invalid EXCLUDED_CIRCULATING_WALLETS entry "${trimmed}" — mint and wallet must be valid base58 pubkeys`,
+      );
+    }
+  }
+  return holders;
+}
+
 // Numeric env vars are validated at startup: a typo (e.g. "30s") must fail
 // fast, not become NaN — a NaN TTL silently disables caching, a NaN port or
 // rate limit breaks serving.
@@ -108,6 +172,12 @@ export const config = {
     // leap year). Bounds the response size and the served-DB scan per request;
     // longer histories are fetched in several ranges. 0 disables the cap.
     maxRangeDays: intEnv('MARKET_DATA_MAX_RANGE_DAYS', 366),
+  },
+  circulating: {
+    // Operator-vetted wallets whose live balance of a given mint is NON-circulating
+    // (external/vesting/encumbered/protocol-owned holdings). Subtracted from the
+    // circulating supply of the matching mint. See parseExcludedHolders for format.
+    excludedHolders: parseExcludedHolders(process.env.EXCLUDED_CIRCULATING_WALLETS || ''),
   },
   coinmarketcap: {
     // Optional allowlist of base-mint addresses exposed on the CoinMarketCap

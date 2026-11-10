@@ -304,7 +304,7 @@ export const openApiSpec = {
       get: {
         operationId: 'getCirculatingSupply',
         summary: 'Circulating supply',
-        description: 'Circulating supply = total supply minus the team performance package, unclaimed additional token allocation and DAO treasury tokens. AMM and Meteora liquidity IS circulating. `allocation` is present only for launchpad tokens with a non-trivial breakdown.',
+        description: 'Circulating supply = total supply minus the team performance package, unclaimed additional token allocation, DAO treasury tokens and configured excluded-holder balances. AMM and Meteora liquidity IS circulating. `allocation` is present for a non-trivial breakdown, including configured holders of tokens without a launch.',
         tags: ['Supply'],
         security: OPTIONAL_API_KEY,
         parameters: [paramRef('MintAddress')],
@@ -469,7 +469,7 @@ export const openApiSpec = {
       get: {
         operationId: 'getDexScreenerAsset',
         summary: 'Asset metadata',
-        description: 'Token name, symbol, decimals and supply. Cached server-side for 5 minutes. If supply cannot be loaded (RPC failure) the request fails with a 5xx rather than returning the asset without it.',
+        description: 'Token name, symbol, decimals and supply. Cached server-side for CACHE_TICKERS_TTL (55 seconds by default). If supply cannot be verified, the request returns 503 SUPPLY_UNAVAILABLE.',
         tags: ['DexScreener'],
         security: OPTIONAL_API_KEY,
         parameters: [
@@ -945,7 +945,7 @@ export const openApiSpec = {
       // -------------------------------------------------------------- Supply
       SupplyAllocation: {
         type: 'object',
-        description: 'Non-circulating / liquidity breakdown for launchpad tokens. Amounts are decimal strings in human units; zero-amount entries are omitted.',
+        description: 'Non-circulating / liquidity breakdown. Amounts are decimal strings in human units; configured excluded holders include zero balances.',
         properties: {
           teamPerformancePackage: {
             type: 'object',
@@ -965,6 +965,8 @@ export const openApiSpec = {
           additionalTokenAllocation: ref('AdditionalTokenAllocation'),
           initialTokenAllocation: ref('InitialTokenAllocation'),
           daoTreasuryTokens: ref('DaoTreasuryTokens'),
+          excludedHolders: { type: 'array', items: ref('ExcludedHolderBalance') },
+          balanceSnapshotSlot: { type: 'integer', description: 'Confirmed slot shared by live balance, mint supply and claim-state reads.' },
           daoAddress: solanaAddress,
           launchAddress: solanaAddress,
           version: { type: 'string', examples: ['v0.6', 'v0.7'] },
@@ -979,6 +981,15 @@ export const openApiSpec = {
           recipient: solanaAddress,
           claimed: { type: 'boolean' },
           tokenAccountAddress: solanaAddress,
+        },
+      },
+      ExcludedHolderBalance: {
+        type: 'object',
+        required: ['amount', 'address'],
+        properties: {
+          amount: decimalString('Non-circulating balance in human units.'),
+          address: solanaAddress,
+          label: { type: 'string' },
         },
       },
       InitialTokenAllocation: {
@@ -1025,7 +1036,7 @@ export const openApiSpec = {
           result: decimalString('Circulating supply.'),
           allocation: {
             type: 'object',
-            description: 'Present only for launchpad tokens with allocation details.',
+            description: 'Present when launchpad allocations or configured excluded holders supply allocation details.',
             properties: {
               teamPerformancePackageAddress: solanaAddress,
               futarchyAmmVaultAddress: solanaAddress,
@@ -1034,6 +1045,8 @@ export const openApiSpec = {
               additionalTokenAllocation: ref('AdditionalTokenAllocation'),
               initialTokenAllocation: ref('InitialTokenAllocation'),
               daoTreasuryTokens: ref('DaoTreasuryTokens'),
+              excludedHolders: { type: 'array', items: ref('ExcludedHolderBalance') },
+              balanceSnapshotSlot: { type: 'integer', description: 'Confirmed slot shared by live balance, mint supply and claim-state reads.' },
               daoAddress: solanaAddress,
               launchAddress: solanaAddress,
               version: { type: 'string', examples: ['v0.6', 'v0.7'] },

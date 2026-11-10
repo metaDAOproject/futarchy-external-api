@@ -4,6 +4,14 @@ import type { ServiceGetters } from './types.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 import { getSupplyInfoWithLaunchpadAllocation } from '../services/supplyWithLaunchpadAllocation.js';
 
+function parseFiniteSupply(value: string): number {
+  const supply = Number(value);
+  if (!Number.isFinite(supply)) {
+    throw new Error('Supply response was not a finite number');
+  }
+  return supply;
+}
+
 export function createSupplyRouter(services: ServiceGetters): Router {
   const router = Router();
   const { getSolanaService, getLaunchpadService } = services;
@@ -51,8 +59,8 @@ export function createSupplyRouter(services: ServiceGetters): Router {
       launchpadService,
     );
 
-    const response: { 
-      result: string; 
+    const response: {
+      result: string;
       allocation?: {
         teamPerformancePackageAddress?: string;
         futarchyAmmVaultAddress?: string;
@@ -71,6 +79,12 @@ export function createSupplyRouter(services: ServiceGetters): Router {
           amount: string;
           vaultAddress?: string;
         };
+        excludedHolders?: Array<{
+          amount: string;
+          address: string;
+          label?: string;
+        }>;
+        balanceSnapshotSlot?: number;
         daoAddress?: string;
         launchAddress?: string;
         version?: string;
@@ -79,11 +93,12 @@ export function createSupplyRouter(services: ServiceGetters): Router {
       result: supplyInfo.circulatingSupply,
     };
     
-    if (allocation.teamPerformancePackage.address || 
-        allocation.futarchyAmmLiquidity.vaultAddress || 
+    if (allocation.teamPerformancePackage.address ||
+        allocation.futarchyAmmLiquidity.vaultAddress ||
         allocation.meteoraLpLiquidity.poolAddress ||
         allocation.additionalTokenAllocation ||
-        !allocation.daoTreasuryTokens.amount.isZero()) {
+        !allocation.daoTreasuryTokens.amount.isZero() ||
+        (allocation.excludedHolders?.length ?? 0) > 0) {
       response.allocation = {
         teamPerformancePackageAddress: allocation.teamPerformancePackage.address?.toString(),
         futarchyAmmVaultAddress: allocation.futarchyAmmLiquidity.vaultAddress?.toString(),
@@ -92,6 +107,8 @@ export function createSupplyRouter(services: ServiceGetters): Router {
         additionalTokenAllocation: supplyInfo.allocation?.additionalTokenAllocation,
         initialTokenAllocation: supplyInfo.allocation?.initialTokenAllocation,
         daoTreasuryTokens: supplyInfo.allocation?.daoTreasuryTokens,
+        excludedHolders: supplyInfo.allocation?.excludedHolders,
+        balanceSnapshotSlot: supplyInfo.allocation?.balanceSnapshotSlot,
         daoAddress: allocation.daoAddress?.toString(),
         launchAddress: allocation.launchAddress?.toString(),
         version: allocation.version,
@@ -114,7 +131,7 @@ export function createSupplyRouter(services: ServiceGetters): Router {
       launchpadService,
     );
 
-    res.json({ circulatingSupply: parseFloat(supplyInfo.circulatingSupply) });
+    res.json({ circulatingSupply: parseFiniteSupply(supplyInfo.circulatingSupply) });
   }));
 
   // Jupiter-compatible total supply
@@ -124,7 +141,7 @@ export function createSupplyRouter(services: ServiceGetters): Router {
     const solanaService = getSolanaService();
     const supplyInfo = await solanaService.getSupplyInfo(mintAddress);
 
-    res.json({ totalSupply: parseFloat(supplyInfo.totalSupply) });
+    res.json({ totalSupply: parseFiniteSupply(supplyInfo.totalSupply) });
   }));
 
   return router;

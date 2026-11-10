@@ -1,9 +1,13 @@
 import { Connection, PublicKey } from '@solana/web3.js';
-import { getMint } from '@solana/spl-token';
+import {
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  unpackMint,
+} from '@solana/spl-token';
 import { config } from '../config.js';
+import BN from 'bn.js';
 import { createSolanaConnection } from '../utils/solanaConnection.js';
 import { TtlCache } from '../utils/ttlCache.js';
-import BN from 'bn.js';
 import { retry, isTransientError, createRetryLogger } from '../utils/resilience.js';
 import { logger } from '../utils/logger.js';
 
@@ -48,6 +52,14 @@ export interface TokenSupplyInfo {
       amount: string;
       vaultAddress?: string;
     };
+    // Operator-configured non-circulating holders (external/vesting/encumbered)
+    excludedHolders?: Array<{
+      amount: string;
+      address: string;
+      label?: string;
+    }>;
+    // Confirmed slot shared by live non-circulating balance reads.
+    balanceSnapshotSlot?: number;
     // DAO address
     daoAddress?: string;
     // Launch address
@@ -83,6 +95,17 @@ export interface TokenAllocationInput {
     amount: BN;
     vaultAddress?: string;
   };
+  // Operator-configured non-circulating holders (external/vesting/encumbered)
+  excludedHolders?: Array<{
+    amount: BN;
+    address: string;
+    label?: string;
+  }>;
+  balanceSnapshotSlot?: number;
+  mintSupplySnapshot?: {
+    amount: BN;
+    decimals: number;
+  };
   daoAddress?: string;
   launchAddress?: string;
   version?: string;
@@ -90,24 +113,52 @@ export interface TokenAllocationInput {
 
 export class SolanaService {
   private connection: Connection;
-  // Keyed by caller-supplied mints, so bounded.
   private cache = new TtlCache(10_000);
 
   constructor() {
     this.connection = createSolanaConnection();
   }
 
-  /**
-   * The mint's supply and decimals, cached per mint for `tickersTTL`.
-   * Concurrent requests for one mint share a single RPC read. Supply figures
-   * are derived from this on every call (cheap arithmetic), so nothing is
-   * cached under keys that change whenever balances move.
-   */
-  private getMintInfo(mintAddress: string): Promise<{ supply: bigint; decimals: number }> {
-    return this.cache.getOrLoad(`mint_${mintAddress}`, config.cache.tickersTTL, async () => {
-      const mint = await this.withRetry(() => getMint(this.connection, new PublicKey(mintAddress)));
-      return { supply: mint.supply, decimals: mint.decimals };
-    });
+  private assertNonOverlappingAllocations(allocation: TokenAllocationInput): void {
+    const occupiedOwners = new Map<string, string>();
+    const addOccupiedOwner = (address: string | undefined, category: string, amount: BN): void => {
+      if (address && amount.gt(new BN(0))) {
+        const existingCategory = occupiedOwners.get(address);
+        if (existingCategory) {
+          throw new Error(
+            `Allocation owner ${address} overlaps the ${existingCategory} and ${category} allocations`,
+          );
+        }
+        occupiedOwners.set(address, category);
+      }
+    };
+
+    addOccupiedOwner(
+      allocation.teamPerformancePackage.address,
+      'team performance package',
+      allocation.teamPerformancePackage.amount,
+    );
+    addOccupiedOwner(
+      allocation.daoTreasuryTokens?.vaultAddress,
+      'DAO treasury',
+      allocation.daoTreasuryTokens?.amount ?? new BN(0),
+    );
+    const seenExcludedOwners = new Set<string>();
+    for (const holder of allocation.excludedHolders ?? []) {
+      if (seenExcludedOwners.has(holder.address)) {
+        throw new Error(
+          `Excluded holder ${holder.address} is configured more than once`,
+        );
+      }
+      seenExcludedOwners.add(holder.address);
+
+      const overlappingCategory = occupiedOwners.get(holder.address);
+      if (overlappingCategory && holder.amount.gt(new BN(0))) {
+        throw new Error(
+          `Excluded holder ${holder.address} overlaps the ${overlappingCategory} allocation`,
+        );
+      }
+    }
   }
 
   /**
@@ -121,6 +172,19 @@ export class SolanaService {
       isRetryable: isTransientError,
       onRetry: createRetryLogger('[Solana]'),
     });
+  }
+
+  private getMintInfo(mintAddress: string): Promise<{ supply: bigint; decimals: number }> {
+    return this.cache.getOrLoad(`mint_${mintAddress}`, config.cache.tickersTTL, () => this.withRetry(async () => {
+      const mintPubkey = new PublicKey(mintAddress);
+      const accountInfo = await this.connection.getAccountInfo(mintPubkey, 'confirmed');
+      if (!accountInfo) throw new Error(`Mint account ${mintAddress} was not found`);
+      if (!accountInfo.owner.equals(TOKEN_PROGRAM_ID) && !accountInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+        throw new Error(`Mint ${mintAddress} is not owned by a supported token program`);
+      }
+      const mint = unpackMint(mintPubkey, accountInfo, accountInfo.owner);
+      return { supply: mint.supply, decimals: mint.decimals };
+    }));
   }
 
   /**
@@ -161,11 +225,30 @@ export class SolanaService {
    * @returns Promise<TokenSupplyInfo> - Complete supply information with allocation details
    */
   async getSupplyInfo(mintAddress: string, allocation?: TokenAllocationInput): Promise<TokenSupplyInfo> {
+    if (allocation) {
+      this.assertNonOverlappingAllocations(allocation);
+    }
+
+    const excludedHolders = allocation?.excludedHolders || [];
+    const excludedHoldersTotal = excludedHolders.reduce(
+      (sum, h) => sum.add(h.amount),
+      new BN(0),
+    );
     try {
-      const mintInfo = await this.getMintInfo(mintAddress);
-      const rawSupply = mintInfo.supply.toString();
-      const totalSupplyBN = new BN(mintInfo.supply.toString());
-      const decimals = mintInfo.decimals;
+      let totalSupplyBN: BN;
+      let decimals: number;
+      if (allocation?.mintSupplySnapshot) {
+        totalSupplyBN = allocation.mintSupplySnapshot.amount;
+        decimals = allocation.mintSupplySnapshot.decimals;
+      } else {
+        const mintInfo = await this.getMintInfo(mintAddress);
+        totalSupplyBN = new BN(mintInfo.supply.toString());
+        decimals = mintInfo.decimals;
+      }
+      if (!Number.isInteger(decimals) || decimals < 0) {
+        throw new Error(`Invalid mint decimals for ${mintAddress}`);
+      }
+      const rawSupply = totalSupplyBN.toString();
       const divisor = Math.pow(10, decimals);
 
       const totalSupplyWithDecimals = Number(totalSupplyBN.toString()) / divisor;
@@ -184,17 +267,25 @@ export class SolanaService {
           circulatingSupplyBN = circulatingSupplyBN.sub(teamAmount);
         }
 
-        // Subtract additional token allocation from circulating supply (v0.7+ only)
-        // These tokens go to a specific recipient, not into general circulation
+        // Subtract additional token allocation only while it is unclaimed (v0.7+ only).
+        // Once claimed, those tokens are in the recipient's control and circulating
+        // unless the recipient is explicitly listed as an excluded holder.
         if (allocation.additionalTokenAllocation && 
+            !allocation.additionalTokenAllocation.claimed &&
             allocation.additionalTokenAllocation.amount.gt(new BN(0))) {
           circulatingSupplyBN = circulatingSupplyBN.sub(allocation.additionalTokenAllocation.amount);
         }
 
         // Subtract DAO treasury tokens (held in squads vault, protocol-controlled)
-        if (allocation.daoTreasuryTokens && 
+        if (allocation.daoTreasuryTokens &&
             allocation.daoTreasuryTokens.amount.gt(new BN(0))) {
           circulatingSupplyBN = circulatingSupplyBN.sub(allocation.daoTreasuryTokens.amount);
+        }
+
+        // Subtract configured excluded holders (external/vesting/encumbered wallets,
+        // e.g. Laso's external wallet — tokens not "in the hands of others")
+        if (excludedHoldersTotal.gt(new BN(0))) {
+          circulatingSupplyBN = circulatingSupplyBN.sub(excludedHoldersTotal);
         }
 
         // Special case: RNGR token has an initial token allocation that IS in circulation
@@ -203,7 +294,15 @@ export class SolanaService {
         const RNGR_INITIAL_ALLOCATION = new BN(192187500000); // 192,187.5 tokens with 6 decimals
         let initialTokenAllocationDetails: { amount: string; claimed: boolean } | undefined;
         
-        if (mintAddress === RNGR_MINT) {
+        // Add the known claimed tranche back only while the full additional
+        // allocation is still being subtracted. Once the launch reports the
+        // allocation fully claimed, none of it is subtracted and adding this
+        // tranche again would make circulating supply exceed total supply.
+        if (
+          mintAddress === RNGR_MINT &&
+          allocation.additionalTokenAllocation &&
+          !allocation.additionalTokenAllocation.claimed
+        ) {
           circulatingSupplyBN = circulatingSupplyBN.add(RNGR_INITIAL_ALLOCATION);
           initialTokenAllocationDetails = {
             amount: (Number(RNGR_INITIAL_ALLOCATION.toString()) / divisor).toString(),
@@ -211,9 +310,12 @@ export class SolanaService {
           };
         }
 
-        // Ensure we don't go negative
+        // A negative result means categories overlap or configuration is invalid.
+        // Returning a clamped 0 would hide a financial-accounting error.
         if (circulatingSupplyBN.isNeg()) {
-          circulatingSupplyBN = new BN(0);
+          throw new Error(
+            `Non-circulating allocations exceed total supply for ${mintAddress}`,
+          );
         }
 
         // Build allocation details for response (include all for transparency)
@@ -245,6 +347,17 @@ export class SolanaService {
             amount: (Number(allocation.daoTreasuryTokens.amount.toString()) / divisor).toString(),
             vaultAddress: allocation.daoTreasuryTokens.vaultAddress,
           } : undefined,
+          // Include every configured holder, including zero balances, so operators
+          // can distinguish an empty wallet from a missing configuration entry.
+          excludedHolders: allocation.excludedHolders && allocation.excludedHolders.length > 0
+            ? allocation.excludedHolders
+                .map(h => ({
+                  amount: (Number(h.amount.toString()) / divisor).toString(),
+                  address: h.address,
+                  label: h.label,
+                }))
+            : undefined,
+          balanceSnapshotSlot: allocation.balanceSnapshotSlot,
           daoAddress: allocation.daoAddress,
           launchAddress: allocation.launchAddress,
           version: allocation.version,
@@ -265,7 +378,9 @@ export class SolanaService {
       return result;
     } catch (error) {
       logger.error(`Error fetching supply info for ${mintAddress}:`, error);
-      throw new Error(`Failed to fetch supply info for token: ${mintAddress}`);
+      throw error instanceof Error
+        ? error
+        : new Error(`Failed to fetch supply info for token: ${mintAddress}`);
     }
   }
 }

@@ -25,6 +25,22 @@ function failingExtDb(overrides: Partial<ExternalDatabaseService>): ExternalData
 }
 
 describe('Financial endpoint failure paths (infra failure → 5xx, never fake data)', () => {
+  describe('/api/supply/:mint', () => {
+    it('returns 500 when the allocation snapshot fails', async () => {
+      const launchpadService = {
+        getTokenAllocationBreakdown: async () => {
+          throw new Error('RPC connection refused');
+        },
+      } as unknown as LaunchpadService;
+      const app = createTestApp({ launchpadService });
+
+      const res = await request(app).get(`/api/supply/${VALID_MINT}`);
+
+      expect(res.status).toBe(500);
+      expect(res.body).not.toHaveProperty('data');
+    });
+  });
+
   describe('/api/supply/:mint/circulating', () => {
     it('returns 500 when the allocation breakdown fails (RPC outage), not circulating=total', async () => {
       const launchpadService = {
@@ -70,6 +86,24 @@ describe('Financial endpoint failure paths (infra failure → 5xx, never fake da
 
       expect(res.status).toBe(500);
       expect(res.body).not.toHaveProperty('result');
+    });
+  });
+
+  describe('/api/supply/:mint/jupiter/circulating', () => {
+    it('returns 500 when the allocation snapshot fails', async () => {
+      const launchpadService = {
+        getTokenAllocationBreakdown: async () => {
+          throw new Error('RPC connection refused');
+        },
+      } as unknown as LaunchpadService;
+      const app = createTestApp({ launchpadService });
+
+      const res = await request(app).get(
+        `/api/supply/${VALID_MINT}/jupiter/circulating`,
+      );
+
+      expect(res.status).toBe(500);
+      expect(res.body).not.toHaveProperty('circulatingSupply');
     });
   });
 

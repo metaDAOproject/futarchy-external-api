@@ -27,7 +27,8 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
   // valid pubkeys would grow these maps (and burn RPC per miss) without limit.
   const assetCache = new Map<string, { data: DexScreenerAssetResponse; expiresAt: number }>();
   const pairCache = new Map<string, { data: DexScreenerPairResponse; expiresAt: number }>();
-  const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  const ASSET_CACHE_TTL_MS = config.cache.tickersTTL;
+  const PAIR_CACHE_TTL_MS = 5 * 60 * 1000;
   const CACHE_MAX_ENTRIES = 1000;
 
   function requireServedDb() {
@@ -93,13 +94,35 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
 
     const mintPubkey = new PublicKey(id);
 
-    // Supply failures (RPC) propagate as a 5xx like every other financial path:
-    // a 200 without supply would be cached here for CACHE_TTL_MS and by
-    // DexScreener, hiding the market cap until both caches expire.
-    const [metadata, decimals, { supplyInfo }] = await Promise.all([
+    let totalSupply: number;
+    let circulatingSupply: number;
+    try {
+      const { supplyInfo } = await getSupplyInfoWithLaunchpadAllocation(
+        id,
+        solanaService,
+        launchpadService,
+      );
+      const total = Number(supplyInfo.totalSupply);
+      const circ = Number(supplyInfo.circulatingSupply);
+      if (!Number.isFinite(total) || !Number.isFinite(circ)) {
+        throw new Error('Supply response was not a finite number');
+      }
+      totalSupply = total;
+      circulatingSupply = circ;
+    } catch (err) {
+      logger.warn('[DexScreener] /asset could not load supply', {
+        mint: id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw AppError.serviceUnavailable(
+        'Supply data temporarily unavailable',
+        'SUPPLY_UNAVAILABLE',
+      );
+    }
+
+    const [metadata, decimals] = await Promise.all([
       futarchyService.getTokenMetadata(mintPubkey),
       futarchyService.getTokenDecimals(mintPubkey),
-      getSupplyInfoWithLaunchpadAllocation(id, solanaService, launchpadService),
     ]);
 
     const response: DexScreenerAssetResponse = {
@@ -107,15 +130,18 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
         id,
         name: metadata?.name || id.slice(0, 8),
         symbol: metadata?.symbol || id.slice(0, 8),
-        totalSupply: Number(supplyInfo.totalSupply),
-        circulatingSupply: Number(supplyInfo.circulatingSupply),
+        totalSupply,
+        circulatingSupply,
         metadata: {
           decimals: String(decimals),
         },
       },
     };
 
-    cachePut(assetCache, id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
+    cachePut(assetCache, id, {
+      data: response,
+      expiresAt: Date.now() + ASSET_CACHE_TTL_MS,
+    });
     res.json(response);
   }));
 
@@ -168,7 +194,10 @@ export function createDexScreenerRouter(services: ServiceGetters): Router {
       },
     };
 
-    cachePut(pairCache, id, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
+    cachePut(pairCache, id, {
+      data: response,
+      expiresAt: Date.now() + PAIR_CACHE_TTL_MS,
+    });
     res.json(response);
   }));
 

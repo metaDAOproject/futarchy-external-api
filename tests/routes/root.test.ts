@@ -44,6 +44,8 @@ describe('Root Routes', () => {
       expect(response.body).toHaveProperty('supplyBreakdown');
       expect(response.body.supplyBreakdown).toHaveProperty('description');
       expect(response.body.supplyBreakdown).toHaveProperty('circulatingSupply');
+      expect(response.body.supplyBreakdown).toHaveProperty('excludedHolders');
+      expect(response.body.supplyBreakdown.excludedHolders).toContain('direct SPL token holder balances');
     });
 
     it('describes itself as a read-only, Dune-free API', async () => {
