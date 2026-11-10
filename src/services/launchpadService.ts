@@ -502,6 +502,7 @@ export class LaunchpadService {
         address: PublicKey | undefined,
         description: string,
         absentIsZero: boolean,
+        expectedOwner?: PublicKey,
       ): BN => {
         if (!address) return new BN(0);
         const accountInfo = accountsByAddress.get(address.toString());
@@ -512,6 +513,10 @@ export class LaunchpadService {
         const tokenAccount = unpackAccount(address, accountInfo, tokenProgramId);
         if (!tokenAccount.mint.equals(baseMint)) {
           throw new Error(`[Launchpad] ${description} belongs to an unexpected mint`);
+        }
+        // Token authority can change without changing the account address.
+        if (expectedOwner && !tokenAccount.owner.equals(expectedOwner)) {
+          throw new Error(`[Launchpad] ${description} belongs to an unexpected owner`);
         }
         return new BN(tokenAccount.amount.toString());
       };
@@ -524,6 +529,7 @@ export class LaunchpadService {
               address,
               `excluded holder account ${address.toString()}`,
               false,
+              holder.wallet,
             )),
           new BN(0),
         );
@@ -547,11 +553,13 @@ export class LaunchpadService {
           performancePackageAta,
           `performance package ATA ${performancePackageAta?.toString()}`,
           true,
+          performancePackageOwner,
         ),
         daoTreasuryAmount: readTokenAmount(
           daoTreasuryAta,
           `DAO treasury ATA ${daoTreasuryAta?.toString()}`,
           true,
+          daoTreasuryOwner,
         ),
         futarchyAmmAmount: additionalAccounts.futarchyAmm && accountsByAddress.get(additionalAccounts.futarchyAmm.toString())
           ? readTokenAmount(additionalAccounts.futarchyAmm, 'Futarchy AMM vault', true) : null,
@@ -686,6 +694,13 @@ export class LaunchpadService {
       // Claim state and recipient balances must agree even if launch discovery
       // was cached before the claim transferred tokens into the recipient's wallet.
       additionalTokenAllocation.claimed = snapshot.additionalTokensClaimed!;
+      if (!additionalTokenAllocation.claimed && additionalTokenAllocation.amount.gt(new BN(0))) {
+        // The unclaimed allocation is held by the launch signer, not its recipient.
+        const launchSigner = this.clientV07.getLaunchSignerAddress({ launch: launch.launchAddress });
+        if (snapshot.excludedHolders.some(holder => holder.wallet.equals(launchSigner) && !holder.amount.isZero())) {
+          throw new Error(`[Launchpad] Excluded holder ${launchSigner.toString()} overlaps the unclaimed additional-token escrow`);
+        }
+      }
       additionalTokenAllocation.tokenAccountAddress = await getAssociatedTokenAddress(
         baseMint,
         additionalTokenAllocation.recipient,

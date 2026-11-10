@@ -382,6 +382,29 @@ describe('LaunchpadService allocation snapshots', () => {
     );
   });
 
+  it('rejects a changed token authority even when discovery returns the same addresses', async () => {
+    config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: HOLDER });
+    const accounts = [{ pubkey: ACCOUNT_A, info: tokenAccountInfo(HOLDER, 200n) }];
+    const svc = new LaunchpadService();
+    (svc as any).getLaunchByBaseMint = async () => null;
+    let discoveries = 0;
+    let snapshotOwner = HOLDER_2;
+    (svc as any).connection = {
+      getTokenAccountsByOwner: async () => discovery(accounts, discoveries++ % 2 === 0 ? 100 : 102),
+      getMultipleAccountsInfoAndContext: async () => ({
+        context: { slot: 101 },
+        value: [mintAccountInfo(1_000n, 0), tokenAccountInfo(snapshotOwner, 200n)],
+      }),
+    };
+
+    await expect(svc.getTokenAllocationBreakdown(MINT)).rejects.toThrow('unexpected owner');
+    expect((svc as any).cache.get(`allocation_${MINT}`, config.cache.tickersTTL)).toBeUndefined();
+
+    snapshotOwner = HOLDER;
+    const { supplyInfo } = await getSupplyInfoWithLaunchpadAllocation(MINT.toString(), new SolanaService(), svc);
+    expect(supplyInfo.circulatingSupply).toBe('800');
+  });
+
   it('ignores holders configured for another mint on the allocation path', async () => {
     config.circulating.excludedHolders.push({ mint: OTHER_MINT, wallet: HOLDER });
     const svc = new LaunchpadService();
@@ -457,8 +480,8 @@ describe('LaunchpadService allocation snapshots', () => {
           context: { apiVersion: 'test', slot: 444 },
           value: addresses.map(address => {
             if (address.equals(MINT)) return mintAccountInfo(9_000_000n);
-            if (address.equals(performanceAta)) return tokenAccountInfo(HOLDER, 75n);
-            if (address.equals(treasuryAta)) return tokenAccountInfo(HOLDER, 25n);
+            if (address.equals(performanceAta)) return tokenAccountInfo(ACCOUNT_A, 75n);
+            if (address.equals(treasuryAta)) return tokenAccountInfo(ACCOUNT_B, 25n);
             return null;
           }),
         };
@@ -499,7 +522,7 @@ describe('LaunchpadService allocation snapshots', () => {
           }
           if (address.equals(performanceAta)) {
             return tokenAccountInfo(
-              HOLDER,
+              ACCOUNT_A,
               80n,
               MINT,
               TOKEN_2022_PROGRAM_ID,
@@ -507,7 +530,7 @@ describe('LaunchpadService allocation snapshots', () => {
           }
           if (address.equals(treasuryAta)) {
             return tokenAccountInfo(
-              HOLDER,
+              ACCOUNT_B,
               20n,
               MINT,
               TOKEN_2022_PROGRAM_ID,
@@ -832,6 +855,44 @@ describe('LaunchpadService batched allocation reads', () => {
           expect(supplyInfo.allocation?.balanceSnapshotSlot).toBe(321);
         } else {
           await expect(result).rejects.toThrow();
+          expect((svc as any).cache.get(`allocation_${MINT}`, config.cache.tickersTTL)).toBeUndefined();
+        }
+      });
+    }
+
+    for (const claimed of [false, true]) {
+      it(`${claimed ? 'allows' : 'rejects'} an excluded launch signer with claimed=${claimed}`, async () => {
+        const svc = new LaunchpadService();
+        const launchAddress = svc.getLaunchAddressV07(MINT);
+        const launchSigner = (svc as any).clientV07.getLaunchSignerAddress({ launch: launchAddress });
+        const launch = await launchAccount(svc, 'v0.7', {
+          baseMint: MINT, dao: DAO, performancePackageTokenAmount: new BN(0),
+          additionalTokensAmount: new BN(100), additionalTokensRecipient: RECIPIENT,
+          additionalTokensClaimed: claimed, state: { complete: {} },
+        });
+        await lookup(svc, launch, null);
+        config.circulating.excludedHolders.push({ mint: MINT.toString(), wallet: launchSigner });
+        const escrow = getAssociatedTokenAddressSync(MINT, launchSigner, true);
+        const accounts = [{ pubkey: escrow, info: tokenAccountInfo(launchSigner, 100n) }];
+        (svc as any).futarchyClient = { fetchDao: async () => ({ amm: {} }) };
+        (svc as any).connection = {
+          getTokenAccountsByOwner: async () => discovery(accounts),
+          getMultipleAccountsInfoAndContext: async (keys: PublicKey[]) => ({
+            context: { slot: 321 },
+            value: keys.map(key => {
+              if (key.equals(MINT)) return mintAccountInfo(1_000n, 0);
+              if (key.equals(launchAddress)) return launch;
+              if (key.equals(escrow)) return accounts[0]!.info;
+              return null;
+            }),
+          }),
+        };
+
+        const result = getSupplyInfoWithLaunchpadAllocation(MINT.toString(), new SolanaService(), svc);
+        if (claimed) {
+          expect((await result).supplyInfo.circulatingSupply).toBe('900');
+        } else {
+          await expect(result).rejects.toThrow('overlaps the unclaimed additional-token escrow');
           expect((svc as any).cache.get(`allocation_${MINT}`, config.cache.tickersTTL)).toBeUndefined();
         }
       });
